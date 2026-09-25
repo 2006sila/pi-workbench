@@ -1,0 +1,14 @@
+# 文本文件统一 LF 存储
+* text=auto eol=lf
+
+# PowerShell / 批处理：UTF-8 带 BOM（BOM 是 PowerShell 5.1 识别中文的关键），
+# 且换行不统一（inject.ps1 为 LF，包装脚本与 build.cmd 为 CRLF）。
+# 这两条必须放在通配规则之后才生效（gitattributes 是「后面的规则覆盖前面的」），
+# 用 -text 禁止 git 做任何转换。
+*.ps1 -text
+*.cmd -text
+
+# 二进制资源
+*.ico binary
+*.png binary
+*.exe binary
