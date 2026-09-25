@@ -660,8 +660,8 @@ $promptBody = ''
 if ($SkillsOnly) {
     Say 'INFO' ('跳过指令集写入（SkillsOnly）。PromptTarget 保持现状: ' + $PromptTarget)
     if (-not (Test-Path -LiteralPath $PromptTarget)) {
-        # 连指令集文件都没有（从未注入过破甲）——SkillsOnly 无意义，报错退出
-        Fail ('SkillsOnly 需要先注入一次破甲模板（未找到 ' + $PromptTarget + '）')
+        # 连指令集文件都没有（从未注入过模板）——SkillsOnly 无意义，报错退出
+        Fail ('SkillsOnly 需要先注入一次指令集模板（未找到 ' + $PromptTarget + '）')
     }
 } else {
 $baseText    = Strip-MarkerBlock $currentText

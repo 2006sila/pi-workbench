@@ -28,8 +28,8 @@ from PySide6.QtWidgets import (
 
 APP_NAME = 'pi用学习工作台'
 APP_SUBTITLE = 'PiDeck / DeepSeek Harness 一键部署 · 注入即用 · 卸载即还原'
-APP_VERSION = 'V1.1'
-APP_BUILD = '2026-09-24 · 审计修复 + 附加包状态'
+APP_VERSION = 'V1.1.1'
+APP_BUILD = '2026-09-25 · v1.1.1 文案清理'
 
 _ACTIVE_WINDOW = None
 _THEME_FILTER = None      # 系统主题监听器：必须持引用，否则可能被 GC 后悬垂
@@ -400,7 +400,7 @@ RETIRED_VERSIONS = {
 
 # ------------------------------------------------------------------ 附加模板（独立技能包）
 
-# 附加模板：可单独部署、也可与破甲模板一起部署的技能包。
+# 附加模板：可单独部署、也可与指令集模板一起部署的技能包。
 #   skill_dir  = 源目录（相对随包根；inject.ps1 -SkillsSource 用，可分号分隔多源）
 #   skill_name = 目标端 skills/ 下的目录名（inject.ps1 -RemoveAddons 用）
 # 两者必须分开：旧版只用一个字段，导致移除时把源路径当目标名拼、部署时又把
@@ -1546,7 +1546,7 @@ class TemplatePage(Page):
         self._addon_btn.setChecked(True)
         for b in self._group_btns:
             b.setChecked(False)
-        self._note.setText('『附加模板』独立技能包：可与破甲模板一起部署，也可单独部署（需先注入过任一破甲模板）。')
+        self._note.setText('『附加模板』独立技能包：可与指令集模板一起部署，也可单独部署（需先注入过任一模板）。')
         while self._cards_area.count():
             it = self._cards_area.takeAt(0)
             w = it.widget()
@@ -1608,7 +1608,7 @@ class TemplatePage(Page):
 
         self._cards_area.addWidget(ops)
 
-        tip = QLabel('提示：与破甲模板一起打 → 勾选后在左侧选模型分组，点破甲卡上的端按钮。')
+        tip = QLabel('提示：与指令集模板一起打 → 勾选后在左侧选模型分组，点模板卡上的端按钮。')
         tip.setWordWrap(True)
         _set_px_font(tip, 11)
         tip.setStyleSheet('color: ' + C['TEXT_MUTED'] + '; padding: 2px 2px;')
@@ -2897,7 +2897,7 @@ class MainWindow(FramelessWindow):
         if no_skills:
             args.append('-NoSkills')
         elif addon_keys:
-            # 破甲模板 + 附加技能包：主库 + 附加包目录一起部署
+            # 指令集模板 + 附加技能包：主库 + 附加包目录一起部署
             dirs = ['skills-v4']
             dirs += [a['skill_dir'] for a in ADDONS if a['key'] in addon_keys]
             args += ['-SkillsSource', ';'.join(dirs)]
@@ -2929,7 +2929,7 @@ class MainWindow(FramelessWindow):
                       kind='卸载', target_card=target['card'])
 
     def _run_skills_only(self, target, skills_dirs, names):
-        """只部署附加技能包，不动指令集（需先注入过任一破甲模板）。"""
+        """只部署附加技能包，不动指令集（需先注入过任一指令集模板）。"""
         args = ['-Target', target['key'], '-SkillsOnly', '-SkillsSource', skills_dirs]
 
         def done(code, tail):
