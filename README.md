@@ -130,13 +130,14 @@ Agent Skills 标准：每个技能是 `<name>/SKILL.md`，Pi 递归扫描发现�
 
 ### 方式一：用打包好的单文件 exe
 
-从 Releases 下载 `pi用学习工作台.exe`，双击即用（无需 Python 环境）。
+从 [Releases](https://github.com/2006sila/pi-workbench/releases) 下载 `pi-workbench-v1.1.exe`，双击即用（无需 Python 环境）。
+本地自己构建的产物名是 `pi用学习工作台.exe`，功能相同。
 首次启动会解压内置资源到临时目录，约 2~4 秒。
 
 ### 方式二：从源码构建
 
 ```powershell
-git clone <this-repo>
+git clone https://github.com/2006sila/pi-workbench.git
 cd pi-workbench
 python -m venv .venv
 .venv\Scripts\python -m pip install -r requirements.txt
