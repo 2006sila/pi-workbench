@@ -339,7 +339,13 @@ function New-SkillMenu {
         [void]$lines.Add('|---|---|')
         foreach ($h in $rest) { [void]$lines.Add('| `' + $h + '` | ' + $one[$h] + ' |') }
     }
-    $desc = '技能菜单与路由。任务需要专业技能时先读本文件，按类目定位到模块 id，再读该模块的 SKILL.md 全文后执行。触发：需要专业技能、找技能、技能菜单。'
+    $domains = @()
+    foreach ($c in $cats) { if ($c.name) { $domains += [string]$c.name } }
+    $domText = if ($domains.Count -gt 0) { ($domains -join '、') } else { '专业技能' }
+    # 描述里的触发词必须是**领域词**（逆向/渗透/游戏…），不能是「需要技能」这种元意图词：
+    # 模型要先认出「这属于某领域」才会来读菜单。领域列表从类目表现取，增删技能自动同步。
+    $desc = '技能菜单与路由（' + $one.Count + ' 个专业模块的入口）。用于：' + $domText
+    $desc += ' 等任务。接到这类任务时先读本文件，按类目定位到模块 id，再读该模块的 SKILL.md 全文后执行。'
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.Append("---`r`n")
     [void]$sb.Append('name: ' + $MenuName + "`r`n")
