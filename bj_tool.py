@@ -3067,6 +3067,7 @@ class MainWindow(FramelessWindow):
                 dirs += [a['skill_dir'] for a in ADDONS if a['key'] in addon_keys]
                 args += ['-SkillsSource', ';'.join(dirs)]
             args += ['-SkillMode', skill_mode]
+            args += ['-MenuKeepAdvertised', ';'.join(a['skill_name'] for a in ADDONS)]
             mode_note = ' · ' + ('极简模式' if skill_mode == 'menu' else '完整模式')
 
         def done(code, tail):
@@ -3099,7 +3100,9 @@ class MainWindow(FramelessWindow):
         """只部署附加技能包，不动指令集（需先注入过任一指令集模板）。
         skill_mode=auto 时沿用目标端上次记录的模式。"""
         args = ['-Target', target['key'], '-SkillsOnly', '-SkillsSource', skills_dirs,
-                '-SkillMode', skill_mode]
+                '-SkillMode', skill_mode,
+                # 附属包是纪律型技能，极简模式下也要保持进提示词（靠描述自动触发才有意义）
+                '-MenuKeepAdvertised', ';'.join(a['skill_name'] for a in ADDONS)]
 
         def done(code, tail):
             if code == 0:

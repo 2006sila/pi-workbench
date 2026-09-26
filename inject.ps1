@@ -18,7 +18,12 @@ param(
     #   full（默认）= 65 个模块全部进系统提示词，AI 按描述自选
     #   menu         = 只留一个菜单技能进提示词，模块加 disable-model-invocation，按需 read
     [ValidateSet('full', 'menu', 'auto')]
-    [string]$SkillMode = 'auto'
+    [string]$SkillMode = 'auto',
+
+    # menu 模式下仍要保持「进提示词」的技能（分号分隔）。
+    # 用于附属模板这类**行为纪律型**技能：它们靠描述自动触发才有意义，
+    # 藏进菜单后就只能「被想起来才用」。
+    [string]$MenuKeepAdvertised
 )
 
 Set-StrictMode -Off
@@ -283,6 +288,18 @@ function Test-DisableModelInvocation([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path)) { return $false }
     $t = (Read-TextKeepBom $Path)[0]
     return [bool]([regex]::IsMatch($t, '(?m)^disable-model-invocation[ \t]*:[ \t]*true'))
+}
+
+function Remove-DisableModelInvocation([string]$Path) {
+    # 去掉之前注入的那一行（幂等：反复调用安全）。保行尾与 BOM。
+    if (-not (Test-Path -LiteralPath $Path)) { return $false }
+    $p = Read-TextKeepBom $Path
+    $text = $p[0]; $hasBom = $p[1]
+    if (-not [regex]::IsMatch($text, '(?m)^disable-model-invocation[ \t]*:')) { return $false }
+    $new = [regex]::Replace($text, '(?m)^disable-model-invocation[ \t]*:[^\r\n]*\r?\n', '')
+    $enc = if ($hasBom) { New-Object System.Text.UTF8Encoding($true) } else { $Utf8NoBom }
+    [System.IO.File]::WriteAllText($Path, $new, $enc)
+    return $true
 }
 
 function Shorten-Desc([string]$Desc) {
@@ -561,16 +578,27 @@ if ($Check) {
             $l1ok = $false
         }
         $unflagged = @()
+        $keptAdvertised = @()
+        # 例外清单优先从状态清单读（那是上次部署的真实口径），参数只是兼底
+        $keepSrc = $MenuKeepAdvertised
+        if ($state -and $state.menuKeepAdvertised) { $keepSrc = [string]$state.menuKeepAdvertised }
+        foreach ($k in ($keepSrc -split '[;]')) {
+            $k = $k.Trim()
+            if ($k) { $keptAdvertised += $k }
+        }
         $checkedMods = 0
         foreach ($n in @($state.installedSkills)) {
             if ($n -eq $mName) { continue }
             $p = Join-Path $SkillsTarget ($n + '\SKILL.md')
             if (-not (Test-Path -LiteralPath $p)) { continue }
             $checkedMods++
+            if ($keptAdvertised -contains $n) { continue }   # 例外项本来就不该有标记
             if (-not (Test-DisableModelInvocation $p)) { $unflagged += $n }
         }
         if ($unflagged.Count -eq 0) {
-            Say 'L1' ('极简模式：' + $checkedMods + ' 个模块均不进系统提示词（占位符校验通过）')
+            $hiddenN = $checkedMods - $keptAdvertised.Count
+            $keepNote = if ($keptAdvertised.Count -gt 0) { '（其中 ' + $keptAdvertised.Count + ' 个纪律型技能保持进提示词）' } else { '' }
+            Say 'L1' ('极简模式：' + $hiddenN + ' 个模块不进系统提示词' + $keepNote)
         } else {
             Say 'WARN' ('极简模式：' + $unflagged.Count + ' 个模块未标记，仍会进系统提示词: ' + (($unflagged | Select-Object -First 5) -join ', '))
             $l1ok = $false
@@ -1041,10 +1069,21 @@ $MenuModules   = 0
 if (-not $NoSkills) {
     if ($SkillMode -eq 'menu') {
         $menuable = @($installedSkills | Where-Object { $_ -ne $MenuSkillName })
+        $keep = @()
+        foreach ($k in ($MenuKeepAdvertised -split '[;]')) {
+            $k = $k.Trim()
+            if ($k) { $keep += $k }
+        }
         $flagged = 0
+        $unflagged = 0
         foreach ($n in $menuable) {
             $p = Join-Path (Join-Path $SkillsTarget $n) 'SKILL.md'
             if (-not (Test-Path -LiteralPath $p)) { continue }
+            if ($keep -contains $n) {
+                # 例外：去掉可能残留的标记，保持进提示词
+                if (Remove-DisableModelInvocation $p) { $unflagged++ }
+                continue
+            }
             if (Add-DisableModelInvocation $p) { $flagged++ }
             else { Say 'WARN' ('frontmatter 异常，未能注入标记: ' + $n) }
         }
@@ -1064,7 +1103,8 @@ if (-not $NoSkills) {
         $MenuModules = New-SkillMenu -Target $SkillsTarget -ModuleIds $menuable -CatFile (Join-Path $Base 'skill-categories.json') -MenuName $MenuSkillName
         if ($MenuModules -gt 0) {
             if ($installedSkills -notcontains $MenuSkillName) { $installedSkills += $MenuSkillName }
-            Say 'INFO' ('极简模式：已生成菜单技能 ' + $MenuSkillName + '（列 ' + $MenuModules + ' 个模块），' + $flagged + ' 个模块已标记不进提示词')
+            $keepNote = if ($keep.Count -gt 0) { '，' + $keep.Count + ' 个保持进提示词' } else { '' }
+            Say 'INFO' ('极简模式：已生成菜单技能 ' + $MenuSkillName + '（列 ' + $MenuModules + ' 个模块），' + $flagged + ' 个模块已标记不进提示词' + $keepNote)
         } else {
             Say 'WARN' '极简模式：没有可列出的模块，菜单未生成，本次按完整模式呈现'
             $SkillMode = 'full'
@@ -1102,6 +1142,7 @@ $state = [ordered]@{
     skillsOnly          = $SkillsOnlyFlag
     skillMode           = $SkillMode
     menuSkill           = $(if ($SkillMode -eq 'menu') { $MenuSkillName } else { $null })
+    menuKeepAdvertised  = $(if ($SkillMode -eq 'menu') { ($keep -join ';') } else { $null })
     skillsTarget        = $SkillsTarget
     hadSkillsDir        = $origSkillsDir
     patchFile           = $patchFileRel
