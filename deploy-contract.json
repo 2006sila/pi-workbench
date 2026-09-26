@@ -1,0 +1,87 @@
+{
+  "schema": 1,
+  "version": "1.2.0",
+  "title": "pi-workbench 部署契约",
+  "note": "这份文件是给 `py -X utf8 skill_tool.py contract --check` 用的，不是给人读的文档。里面每一条都能被脚本核对：加模板 / 加技能库 / 改标记块 / 改退出码时改这里，check 会指出哪一处忘了同步（打包资源、bj_tool.spec、README 溯源）。",
+
+  "targets": [
+    {
+      "key": "pideck",
+      "label": "PiDeck",
+      "agentDir": ["~", ".pi", "agent"],
+      "promptName": "APPEND_SYSTEM.md",
+      "markerBegin": "<!-- BEGIN pi-workbench v4 -->",
+      "markerEnd": "<!-- END pi-workbench v4 -->",
+      "patchName": null,
+      "probeCli": ["pi.cmd", "pi"]
+    },
+    {
+      "key": "dsh",
+      "label": "DeepSeek Harness",
+      "agentDir": ["$DSH_HOME", "~", ".dsh"],
+      "promptName": "AGENTS.md",
+      "markerBegin": "<!-- BEGIN pi-workbench v4 -->",
+      "markerEnd": "<!-- END pi-workbench v4 -->",
+      "patchName": "cordis.patch.yml",
+      "probeCli": ["dsh.cmd", "dsh"]
+    }
+  ],
+
+  "exitCodes": {
+    "0": "成功",
+    "1": "失败 / 自检有未通过项",
+    "3": "需人工确认：目标文件在部署后被外部改动，本次没有写入任何文件（加 -Force 才继续）"
+  },
+
+  "resources": [
+    "deploy-contract.json",
+    "inject.ps1",
+    "inject-pideck.ps1",
+    "inject-dsh.ps1",
+    "app.ico",
+    "skill-categories.json",
+    "prompts/_sandbox-v5-header.md",
+    "prompts/_v51b-header.md",
+    "prompts/_v52c-header.md",
+    "prompts/_gpt6-astra-header.md",
+    "prompts/_gpt56sol-header.md",
+    "prompts/_glm-neutral-header.md",
+    "prompts/_glm53f-kovak.md",
+    "prompts/v5-body.md",
+    "prompts/_ext-auth.md",
+    "prompts/_ext-subst.md",
+    "prompts/_ext-deliver.md"
+  ],
+
+  "addons": ["code-quality-gate", "task-boundary"],
+
+  "skillLibrary": {
+    "root": "skills-v4",
+    "minSkills": 65,
+    "categoriesFile": "skill-categories.json",
+    "categories": 13,
+    "classField": "metadata.x-pj-class"
+  },
+
+  "cleanroom": {
+    "alice_skill": {
+      "repo": "https://github.com/alicewe1/alice_skill",
+      "commit": "802bf17895fc9f0cb2dc0558d13af452d50a6bd8",
+      "license": "GPL-3.0",
+      "method": "clean-room：只取机制与结构，不取文本。本仓库为 MIT，未复制其代码或技能正文；重写为自己的实现与措辞。",
+      "read_at": "2026-09-26",
+      "files_seen": 2399,
+      "skills_seen": 424,
+      "borrowed": [
+        "类目索引生成器：技能自报类目（frontmatter）→ 脚本机械生成索引，迁移=重跑生成器",
+        "路由词/触发词与对象词表交叉校验（避免同一词在两处语义冲突）",
+        "技能完整性基线：目录 → {sha256,size} 指纹，写下来还要有消费方",
+        "退出码分级：3 = 不确定/需人工确认，而不是失败",
+        "只替换锚定节 + --check 只读比对生成物是否过期",
+        "证据记录八字段：object / action / baseline_sha256 / verification / rollback",
+        "生成物沙箱演练：CODEX_HOME=<临时目录>，主库零污染",
+        "打包清单 + SHA-256 清单（未做封印/加密：与本仓库 MIT + 暂不发布定位冲突）"
+      ]
+    }
+  }
+}

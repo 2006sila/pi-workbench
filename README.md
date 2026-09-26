@@ -236,6 +236,13 @@ py -X utf8 skill_tool.py remove my-old-skill --yes
 # add / register 会自动写入声明，gen 按声明重排类目表（加技能时不会漏登记）：
 py -X utf8 skill_tool.py gen --check     # 只读校验三方一致（frontmatter × 类目表 × 磁盘），不一致退出码 1
 py -X utf8 skill_tool.py gen             # 缺声明的从类目表回填，再按声明重排（已有顺序保留，新技能追加末尾）
+
+# 部署契约：随包资源 ↔ bj_tool.spec ↔ 标记块 ↔ 退出码 ↔ 溯源（README）三方对齐
+py -X utf8 skill_tool.py contract
+
+# 技能库打包（含 SHA-256 清单，同样的输入打出同样的字节）/ 校验一个包
+py -X utf8 skill_tool.py pack --out build\skill-library.zip
+py -X utf8 skill_tool.py pack --verify build\skill-library.zip
 ```
 
 `gen` 不做语义猜测：技能没声明类目、声明的类目不存在、或类目表登记了磁盘上却没有的技能，
@@ -354,6 +361,13 @@ powershell -ExecutionPolicy Bypass -File inject.ps1 -Target pideck `
 
 # 退出码：0 成功 ｜ 1 失败 / 自检有未通过项 ｜ 3 需人工确认（未写入任何文件）
 
+# 通道体检：文件写对了不代表客户端真的读了。
+# 加载层不联网；通道层会真跑一次客户端 CLI 问模型「你现在能看见哪些技能」（一次模型调用）。
+# 结论写进 state.evidence.channelProbe，并追加到 logs\operations.log。
+# 桌面端跑不了无头，所以拿 CLI 当探针（CLI 读的是同一个配置根）；装到别处用 -ProbeCli 指定。
+powershell -ExecutionPolicy Bypass -File inject.ps1 -Target pideck -Probe
+powershell -ExecutionPolicy Bypass -File inject.ps1 -Target pideck -Probe -ProbeCli D:\tools\pi.cmd -ProbeTimeout 120
+
 # 自定义配置根（沙箱测试用）
 powershell -ExecutionPolicy Bypass -File inject.ps1 -Target pideck -AgentDir D:\tmp\sandbox
 ```
@@ -377,8 +391,9 @@ pi-workbench/
 ├── build.cmd                  一键构建
 ├── requirements.txt
 ├── app.ico                    应用图标（7 尺寸）
-├── skill_tool.py               技能库维护工具（加技能 / 移除 / 登记类目 / 体检）
-├── skill-categories.json      技能类目表（极简模式的菜单按此分类生成）
+├── skill_tool.py               技能库维护工具（加技能 / 移除 / 登记类目 / gen / contract / pack / 体检）
+├── skill-categories.json      技能类目表（生成物：真源在技能自己的 frontmatter，见 gen）
+├── deploy-contract.json       部署契约（随包资源 / 标记块 / 退出码 / 溯源；contract --check 核它）
 ├── inject.ps1                 注入器核心（双目标：安装 / 卸载 / 自检 / 附加包）
 ├── inject-pideck.ps1          PiDeck 便捷入口
 ├── inject-dsh.ps1             DeepSeek Harness 便捷入口
@@ -448,6 +463,32 @@ pi-workbench/
 ## 更新记录
 
 **V1.2 · 2026-09-26**
+
+- **通道体检（`-Probe`）—— 回答「部署到底生效了没有」**：
+  - 加载层（不联网）：逐个查已装技能的 frontmatter 与 description（**缺 description = Pi 直接不加载**，
+    文件写对了不等于客户端会读），菜单技能不能带 `disable-model-invocation`（带了整个路由失效）
+  - 通道层：真跑一次客户端 CLI，问模型「你现在能看见哪些技能」，按回复分
+    `pass / fail / mismatch / unclear`；`mismatch` = 模型列出了本该隐藏的模块（隐藏标记没生效）
+  - 桌面端跑不了无头，拿 CLI 当探针（读同一个配置根）；`-ProbeCli` 可指定路径，`-ProbeTimeout` 默认 180s
+  - 结论写进 `state.evidence.channelProbe`；GUI 每张目标卡多了「体检」按钮（会弹窗提醒是一次真实模型调用）
+- **`-Check` 新增两段**：
+  - 加载层：抽检已装技能能不能被客户端发现
+  - 生成物一致性：菜单技能与当前技能库/类目表只读比对，不一致就报「已过期，重注入即可刷新」
+    （生成逻辑拆成 `Get-SkillMenuText`（只生成）+ `New-SkillMenu`（生成+落盘），前者不写文件）
+- **部署契约 `deploy-contract.json` + `skill_tool.py contract`**：
+  随包资源清单 ↔ 磁盘 ↔ `bj_tool.spec` 的 DATAS ↔ 标记块字符串 ↔ 退出码 ↔ README 溯源，六处互相核；
+  新增模板忘了进包 / 改了标记块没同步 / README 没写清 commit，都会在这里报错
+  - `bundle_check()` 改为从契约读资源清单（旧写法清单写两处，增模板时只改一处不报错）
+- **操作留痕 `logs\operations.log`**：一行一次操作（时间 / 目标 / 动作 / 状态 / 退出码 / 技能数 / 模式 / 漂移数 / 冲突数），
+  追加式永不重写；日志页新增「操作记录」按钮直接打开
+- **技能库打包 `skill_tool.py pack`**：zip + 内嵌 `MANIFEST.sha256`，时间戳写死所以**同样输入打出同样字节**；
+  `--verify` 重算摘要，能查改过 / 丢过 / 多出来的文件
+- **界面健壮性**（对应 alice 的 breaker/watchdog）：
+  - 单任务输出超 20000 行就只读不显示（子进程 stdout 继续排空，否则它写满管道会卡死）
+  - 日志页块数上限 5000（自动丢最旧的）；文件日志仍是全量
+  - 单任务超 30 分钟未结束 → 杀整棵进程树并报「已终止（防界面卡死）」
+- **README 溯源升级**：不再只写一句「参考了…」，写明仓库 / 许可证 / commit / 读到的规模 / 借了哪些机制 /
+  哪些不抄，并声明与 `deploy-contract.json` 的 `cleanroom` 段互相核对
 
 - **类目声明链路**（修「新增技能忘了登记 → 极简模式下落进『其他』」）：
   - 类目表从「手维护」改成「生成物」：真源是每个技能 `SKILL.md` 的 `metadata.x-pj-class`
@@ -531,9 +572,19 @@ pi-workbench/
 
 ## 致谢与参考
 
-- **路由 / 菜单式技能组织**（总菜单 → 类目 → 模块、按需 `read`、顺序与上限纪律、报名机制）
-  参考了 [alicewe1/alice_skill](https://github.com/alicewe1/alice_skill)（GPL-3.0）的公开设计。
-  **仅借鉴设计思路，未使用其代码**，本仓库以自己的实现与措辞重写（本仓库为 MIT）。
+- **路由 / 菜单式技能组织与若干工程机制** 参考了
+  [alicewe1/alice_skill](https://github.com/alicewe1/alice_skill)（GPL-3.0），
+  读的是 `802bf17895fc9f0cb2dc0558d13af452d50a6bd8`（整仓 2399 个文件 / 424 个技能）。
+  **仅借鉴设计思路与结构，未使用其代码、也未搬其技能正文**（clean-room：本仓库 MIT，
+  以自己的实现与措辞重写）。可核对的机器可读记录在
+  [deploy-contract.json](deploy-contract.json) 的 `cleanroom` 段，`skill_tool.py contract`
+  会核对 README 这里写的仓库 / 许可证 / commit 是否与契约一致 —— 口头致谢不算溯源。
+
+  借鉴到的机制：类目索引生成器（技能自报类目 → 脚本机械生成索引）、
+  只替换锚定节 + `--check` 只读比对生成物是否过期、技能指纹基线与消费方、
+  退出码分级（3 = 需人工确认而不是失败）、证据记录字段、沙箱演练不污染主库、
+  触发词交叉校验。没有抄的部分：越狱话术与话术替换表、封印/加密/水印、
+  技能正文（GPL 内容不进 MIT 仓库）。
 - 技能库内含第三方收集内容，署名与许可见 [NOTICE.md](NOTICE.md)。
 
 ---

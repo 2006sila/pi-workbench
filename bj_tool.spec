@@ -13,6 +13,7 @@ import os
 ROOT = os.path.abspath(SPECPATH)  # noqa: F821  (PyInstaller 注入)
 
 DATAS = [
+    ('deploy-contract.json', '.'),
     ('inject.ps1', '.'),
     ('inject-pideck.ps1', '.'),
     ('inject-dsh.ps1', '.'),

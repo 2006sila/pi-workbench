@@ -37,6 +37,10 @@ _THEME_FILTER = None      # 系统主题监听器：必须持引用，否则可�
 IS_WINDOWS = os.name == 'nt'
 CREATE_NO_WINDOW = 0x08000000 if IS_WINDOWS else 0
 
+# 单任务超时上限（秒）。注入 65 个技能实测不到 1 分钟；体检要跑一次模型调用，
+# 所以给得宽。卡死的任务由它兜底杀整棵进程树，不再拖住界面。
+TASK_TIMEOUT_SEC = 1800
+
 # ------------------------------------------------------------------ 主题
 # 设计语言参考：PyQt-Fluent-Widgets + PyQtDarkTheme
 # 深色：Fluent 分层 #191919 < #242424 < #2B2B2B；浅色：Fluent 浅色分层
@@ -655,12 +659,17 @@ class Runner(QThread):
     done = Signal(int)
 
     MAX_TAIL = 400
+    # 单任务输出行数上限：超了就只记不显示（子进程的 stdout 还得继续读，
+    # 否则它写满管道会阻塞在原地）。防的是「某个环节卡在循环里往外刷」把界面刷死。
+    STORM_LIMIT = 20000
 
     def __init__(self, argv, parent=None):
         super().__init__(parent)
         self._argv = argv
         self._proc = None
         self._tail = []
+        self._lines = 0
+        self._stormed = False
 
     def run(self):
         dec = codecs.getincrementaldecoder('utf-8')('replace')
@@ -704,6 +713,13 @@ class Runner(QThread):
             self._tail.append(text)
             if len(self._tail) > self.MAX_TAIL:
                 del self._tail[:len(self._tail) - self.MAX_TAIL]
+            self._lines += 1
+            if self._lines > self.STORM_LIMIT:
+                if not self._stormed:
+                    self._stormed = True
+                    self.line.emit('[WARN] 输出行数超过 ' + str(self.STORM_LIMIT)
+                                   + '，后续只读不显示（防界面被刷死）；文件日志不受影响')
+                return
             self.line.emit(text)
 
     def tail(self):
@@ -1303,6 +1319,11 @@ class TargetCard(QFrame):
         self.btn_uninstall.setStyleSheet(_btn_style('danger'))
         self.btn_uninstall.setFixedHeight(36)
         btns.addWidget(self.btn_uninstall, 1)
+        # 通道体检：确认部署到底生效了没有（会真跑一次模型调用，所以单列一个按钮）
+        self.btn_probe = QPushButton('体检')
+        self.btn_probe.setStyleSheet(_btn_style('ghost'))
+        self.btn_probe.setFixedHeight(36)
+        btns.addWidget(self.btn_probe, 1)
         lay.addLayout(btns)
         self._refresh_addons()
 
@@ -1426,6 +1447,7 @@ class HomePage(Page):
             card.btn_go.clicked.connect(lambda _=False, tg=target: self.main.go_deploy(tg))
             card.btn_restart.clicked.connect(lambda _=False, tg=target: self.main._restart(tg))
             card.btn_uninstall.clicked.connect(lambda _=False, tg=target: self.main._uninstall(tg))
+            card.btn_probe.clicked.connect(lambda _=False, tg=target: self.main._probe(tg))
             cards.addWidget(card, 1)
             self.cards[target['key']] = card
         lay.addLayout(cards, 1)
@@ -2234,9 +2256,18 @@ class LogPage(Page):
         b_clear.setFixedHeight(34)
         b_clear.clicked.connect(self.clear)
         hdr.addWidget(b_clear)
+        b_ops = QPushButton('操作记录')
+        b_ops.setStyleSheet(_btn_style('ghost'))
+        b_ops.setFixedHeight(34)
+        b_ops.setCursor(Qt.PointingHandCursor)
+        b_ops.clicked.connect(self._open_ops)
+        hdr.addWidget(b_ops)
         outer.addLayout(hdr)
 
         self._box = QTextBrowser()
+        # 界面侧环形上限：块数超了自动丢最旧的。
+        # 长任务（部署 65 个技能 + 日志）不会把界面越；文件日志仍是全量。
+        self._box.document().setMaximumBlockCount(5000)
         self._box.setOpenExternalLinks(False)
         self._box.setStyleSheet(
             'QTextBrowser { background: ' + C['LOG_BG'] + '; border: 1px solid ' + C['BORDER'] + ';'
@@ -2282,6 +2313,18 @@ class LogPage(Page):
 
     def clear(self):
         self._box.clear()
+
+    def _open_ops(self):
+        """打开操作记录（一行一次操作，追加式）。"""
+        p = os.path.join(work_root(), 'logs', 'operations.log')
+        if not os.path.exists(p):
+            self._status.setText('还没有操作记录：' + p)
+            return
+        try:
+            os.startfile(p)      # noqa: S606  Windows 关联程序打开
+            self._status.setText('已打开 ' + p)
+        except Exception as e:
+            self._status.setText('打不开（' + str(e) + '），路径：' + p)
 
     def _copy_all(self):
         QApplication.clipboard().setText(self._box.toPlainText())
@@ -3050,6 +3093,15 @@ class MainWindow(FramelessWindow):
         self._log_line('')
         self._log_line('> ' + ' '.join(argv))
 
+        # 看门狗：卡死的任务不能把界面拖住（alice 那套 breaker 的思路，
+        # 落到这里就是一个单任务超时 + 杀整棵进程树）。
+        self._task_started = time.time()
+        if not hasattr(self, '_watchdog'):
+            self._watchdog = QTimer(self)
+            self._watchdog.setSingleShot(True)
+            self._watchdog.timeout.connect(self._on_task_timeout)
+        self._watchdog.start(int(TASK_TIMEOUT_SEC * 1000))
+
         runner = Runner(argv, self)
         runner.line.connect(self._log_line)
         runner.done.connect(lambda code, r=runner: self._on_finished(code, r, label, on_done))
@@ -3057,8 +3109,22 @@ class MainWindow(FramelessWindow):
         self._runner = runner
         runner.start()
 
+    def _on_task_timeout(self):
+        r = self._runner
+        if r is None:
+            return
+        used = int(time.time() - getattr(self, '_task_started', time.time()))
+        self._log_line('[WARN] 任务已跑 ' + str(used) + ' 秒，超过上限 '
+                       + str(TASK_TIMEOUT_SEC) + ' 秒，已终止（防界面卡死）')
+        r.terminate_tree()
+
     def _recycle_runner(self, runner):
         """线程真正结束后再回收（finished 信号在 run() 返回后才发，此时删除才安全）。"""
+        try:
+            if hasattr(self, '_watchdog'):
+                self._watchdog.stop()
+        except Exception:
+            pass
         if self._runner is runner:
             self._runner = None
         runner.deleteLater()
@@ -3340,6 +3406,44 @@ class MainWindow(FramelessWindow):
                        '看是否第一行就给交付物（不出现「我不能/无法」类开场)')
         self.switch_page(3)
 
+    def _probe(self, target):
+        """通道体检：文件写对了不等于客户端真的读了。
+
+        先跑加载层（不联网），再真跑一次客户端 CLI 问模型「能看见哪些技能」。
+        真跑会花时间与额度，所以默认弹窗确认，并且只能一个目标一个目标地跑。
+        """
+        ans = QMessageBox.question(
+            self, APP_NAME,
+            '对 ' + target['card'] + ' 做通道体检？\n\n'
+            '· 加载层（不联网）：技能会不会被客户端发现（缺 description 会被静默跳过）\n'
+            '· 通道层：真跑一次客户端 CLI，问模型「能看见哪些技能」\n'
+            '  这是一次**真实模型调用**，会花时间与额度\n\n'
+            '答不出来通常意味着：prompt 没送达 / 没配 provider / 客户端没登录。',
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+        if ans != QMessageBox.Yes:
+            return
+
+        def done(code, tail):
+            st = read_json(state_path(target['key'])) or {}
+            cp = ((st.get('evidence') or {}).get('channelProbe') or {})
+            status = cp.get('status')
+            if status == 'pass':
+                self._set_status(target['card'] + ' 体检放行：模型能看到已部署技能', 'ok')
+            elif status == 'mismatch':
+                self._set_status(target['card'] + ' 体检异常：本该隐藏的模块被模型看到了', 'warn')
+            elif status == 'fail':
+                self._set_status(target['card'] + ' 体检未送达：模型看不到任何已部署技能', 'error')
+            elif status == 'timeout':
+                self._set_status(target['card'] + ' 体检超时（已终止子进程），见日志', 'warn')
+            elif status == 'unrun':
+                self._set_status(target['card'] + ' 体检未执行：找不到客户端 CLI，日志里有手动命令', 'warn')
+            else:
+                self._set_status(target['card'] + ' 体检完成（退出码 ' + str(code) + '），见日志', 'warn')
+            self.switch_page(3)
+
+        self._enqueue(['-Target', target['key'], '-Probe'], '通道体检 ' + target['card'], done,
+                      kind='自检', target_card=target['card'])
+
 
 # ------------------------------------------------------------------ 入口与全局样式
 
@@ -3414,28 +3518,31 @@ def _apply_ui_font_px(app, px=13):
 
 
 def bundle_check():
-    """打包自检：确认单文件 exe 内部的脚本与资源都可寻址。写结果到文件后退出。"""
-    need = [
-        'inject.ps1',
-        'inject-pideck.ps1',
-        'inject-dsh.ps1',
-        'app.ico',
-        'skill-categories.json',
-        os.path.join('prompts', '_sandbox-v5-header.md'),
-        os.path.join('prompts', '_v51b-header.md'),
-        os.path.join('prompts', '_v52c-header.md'),
-        os.path.join('prompts', '_gpt6-astra-header.md'),
-        os.path.join('prompts', '_gpt56sol-header.md'),
-        os.path.join('prompts', '_glm-neutral-header.md'),
-        os.path.join('prompts', '_glm53f-kovak.md'),
-        os.path.join('prompts', 'v5-body.md'),
-        os.path.join('prompts', '_ext-auth.md'),
-        os.path.join('prompts', '_ext-subst.md'),
-        os.path.join('prompts', '_ext-deliver.md'),
-    ]
+    """打包自检：确认单文件 exe 内部的脚本与资源都可寻址。写结果到文件后退出。
+
+    要查哪些资源不写死在这里 —— 从 deploy-contract.json 读。
+    原因：资源清单写两处就会漏（旧写法是这里一份、实际随包一份，
+    增模板时只改一处不会有人报错）。
+    """
     res = {'frozen': bool(getattr(sys, '_MEIPASS', None)), 'base': _res(), 'items': {}, 'ok': True}
+    cpath = _res('deploy-contract.json')
+    contract = None
+    try:
+        with open(cpath, encoding='utf-8') as fh:
+            contract = json.load(fh)
+    except Exception as e:
+        res['contract'] = '缺失或读不了: %s (%s)' % (e, cpath)
+        res['ok'] = False
+    if contract is None:
+        need, skills_min, addons = [], 0, []
+    else:
+        res['contract'] = contract.get('version')
+        need = list(contract.get('resources') or [])
+        lib = contract.get('skillLibrary') or {}
+        skills_min = int(lib.get('minSkills') or 0)
+        addons = list(contract.get('addons') or [])
     for rel in need:
-        p = _res(rel)
+        p = _res(rel.replace('/', os.sep))
         exists = os.path.exists(p)
         size = os.path.getsize(p) if exists else 0
         res['items'][rel] = {'exists': exists, 'size': size}
@@ -3448,12 +3555,11 @@ def bundle_check():
             if os.path.exists(os.path.join(skills_dir, name, 'SKILL.md')):
                 n += 1
     res['skills'] = n
-    # 阈值跟实际随包数量对齐（旧值 63 比实际 65 松，少两个技能也不会报警）。
-    # 增删技能库后记得同步这个数。
-    if n < 65:
+    res['skillsMin'] = skills_min
+    if n < skills_min:
         res['ok'] = False
-    # 两个附加包是后加的功能，单列出来查，缺了就一定失败
-    for addon in ('code-quality-gate', 'task-boundary'):
+    # 附加包单列出来查（它们是后加的功能，缺了就一定失败）
+    for addon in addons:
         ok_addon = os.path.exists(os.path.join(skills_dir, addon, 'SKILL.md'))
         res['items']['skills-v4/' + addon] = {'exists': ok_addon}
         if not ok_addon:

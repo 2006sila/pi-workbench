@@ -31,7 +31,14 @@ param(
 
     # 指令文件里出现重复/顺序颠倒的标记块时，默认报错退出（不猜、不静默改动用户文件）。
     # 加这个开关则自动只保留最后一对完整标记块。
-    [switch]$RepairMarker
+    [switch]$RepairMarker,
+
+    # 通道体检：文件写对了≠客户端真的读了。加这个开关会真跑一次客户端的 CLI，
+    # 问模型「你现在能看见哪些技能」（一次真实模型调用）—— 答得出才算通道通。
+    # 不加则只做加载层体检（不联网）。
+    [switch]$Probe,
+    [string]$ProbeCli = '',
+    [int]$ProbeTimeout = 180
 )
 
 Set-StrictMode -Off
@@ -76,6 +83,8 @@ $TARGETS = @{
             (Join-Path $env:LOCALAPPDATA 'Programs\PiDeck\PiDeck.exe'),
             (Join-Path $env:ProgramFiles 'PiDeck\PiDeck.exe')
         )
+        # 通道体检用的 CLI：PiDeck 桌面端不能跑无头，但 pi CLI 读的是同一个配置根。
+        ProbeCli    = @('pi.cmd', 'pi')
     }
     'dsh' = @{
         # DeepSeek Harness：用户全局指令插件的 dshHome 按 $DSH_HOME 再 ~/.dsh 解析，
@@ -94,10 +103,18 @@ $TARGETS = @{
             (Join-Path $env:ProgramFiles 'DeepSeek Harness\DeepSeek Harness.exe'),
             (Join-Path $env:LOCALAPPDATA 'Programs\dsh\dsh.exe')
         )
+        ProbeCli    = @('dsh.cmd', 'dsh')
     }
 }
 
 $T = $TARGETS[$Target]
+# 操作名（进 operations.log，一眼看出一行是干什么的）
+$Script:OpName = if ($Uninstall) { 'uninstall' }
+    elseif ($RemoveAddons) { 'remove-addons' }
+    elseif ($Probe) { 'probe' }
+    elseif ($Check) { 'check' }
+    elseif ($SkillsOnly) { 'skills-only' }
+    else { 'deploy' }
 if (-not [string]::IsNullOrWhiteSpace($AgentDir)) {
     $T.AgentDir = [System.IO.Path]::GetFullPath($AgentDir)
 } else {
@@ -112,6 +129,9 @@ $LogDir     = Join-Path $WorkRoot 'logs'
 $StatePath  = Join-Path $StateDir ($Target + '.json')
 $ResultPath = Join-Path $WorkRoot ('last-run-' + $Target + '.json')
 $LogPath    = Join-Path $LogDir ($Target + '.log')
+# 操作留痕：一行一次操作，附带退出码 / 技能数 / 模式 / 漂移数 / 冲突数。
+# 排障时先看这一行，再看 <目标>.log 全文。
+$OpLogPath  = Join-Path $LogDir 'operations.log'
 
 foreach ($d in @($WorkRoot, $StateDir, $BackupRoot, $LogDir)) {
     if (-not (Test-Path -LiteralPath $d)) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
@@ -122,6 +142,9 @@ $Script:PatchWarn = $null
 # 退出码：0 成功 · 1 失败/自检未过 · 3 需人工确认（没做任何写入）
 $Script:ExitCode = 0
 $Script:BaselineDrift = New-Object System.Collections.ArrayList
+# 操作留痕用的字段
+$Script:OpSkills = 0
+$Script:OpMode = ''
 
 function Say([string]$Level, [string]$Message) {
     $line = '[' + $Level + '] ' + $Message
@@ -181,6 +204,16 @@ function Finish([string]$Status) {
     } catch { }
     try {
         Add-Content -LiteralPath $LogPath -Value ((Get-Date).ToString('s') + ' ' + $Status + "`n" + ($Script:Report -join "`n")) -Encoding UTF8
+    } catch { }
+    # 一行一条操作记录（追加式，永不重写）
+    try {
+        $op = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss') + "`t" + $Target + "`t" + $Script:OpName + "`t" + $Status +
+              "`texit=" + $Script:ExitCode +
+              "`tskills=" + $Script:OpSkills +
+              "`tmode=" + $(if ($Script:OpMode) { $Script:OpMode } else { '-' }) +
+              "`tdrift=" + @($Script:BaselineDrift).Count +
+              "`tconflicts=" + @($Script:RollbackConflicts).Count
+        Add-Content -LiteralPath $OpLogPath -Value $op -Encoding UTF8
     } catch { }
     Write-Output ('RESULT: ' + $Status)
 }
@@ -628,8 +661,10 @@ function Shorten-Desc([string]$Desc) {
     return $d
 }
 
-function New-SkillMenu {
-    # 生成菜单技能：只列「有哪些模块 + 何时用」+ 取用纪律，正文按需读。
+function Get-SkillMenuText {
+    # 生成菜单技能的**文本**（不落盘）—— 落盘在 New-SkillMenu。
+    # 拆成两半步是为了让 -Check 能只读比对「已部署的菜单是不是与当前技能库/类目表一致」。
+    # 只列「有哪些模块 + 何时用」+ 取用纪律，正文按需读。
     # 以类目表（skill-categories.json）分类；未登记的模块归入「其他」。
     param([string]$Target, [string[]]$ModuleIds, [string]$CatFile, [string]$MenuName)
     $cats = @()
@@ -707,10 +742,17 @@ function New-SkillMenu {
     [void]$sb.Append("## 模块清单`r`n")
     [void]$sb.Append(($lines -join "`r`n"))
     [void]$sb.Append("`r`n")
+    return @($sb.ToString(), $one.Count)
+}
+
+function New-SkillMenu {
+    # 生成 + 落盘（生成逻辑在 Get-SkillMenuText，它自己不写文件，-Check 才能只读比对）。
+    param([string]$Target, [string[]]$ModuleIds, [string]$CatFile, [string]$MenuName)
+    $gen = Get-SkillMenuText -Target $Target -ModuleIds $ModuleIds -CatFile $CatFile -MenuName $MenuName
     $menuDir = Assert-Writable $Target $MenuName
     New-Item -ItemType Directory -Force -Path $menuDir | Out-Null
-    Write-AtomicText (Join-Path $menuDir 'SKILL.md') $sb.ToString() $Utf8NoBom
-    return $one.Count
+    Write-AtomicText (Join-Path $menuDir 'SKILL.md') ([string]$gen[0]) $Utf8NoBom
+    return [int]$gen[1]
 }
 
 function Get-ClientProcess {
@@ -727,6 +769,102 @@ function Find-ClientExe {
         if ($p -and (Test-Path -LiteralPath $p)) { return $p }
     }
     return $null
+}
+
+function Test-SkillLoadable([string]$Path) {
+    # 客户端到底会不会加载这个技能。Pi 的硬规则：
+    #   · 没有 description → 直接不加载（静默跳过，不报错）
+    #   · frontmatter 结构坏 → 同样不加载
+    # 文件写对了 ≠ 客户端会读它，所以这一步必须单独查。
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return '文件不存在' }
+    try { $text = Read-Utf8 $Path } catch { return ('读不了：' + $_.Exception.Message) }
+    if ($text -notmatch '(?s)^---\r?\n.*?\r?\n---') { return '没有 frontmatter 块' }
+    if ([string]::IsNullOrWhiteSpace((Get-FrontField $text 'description'))) { return '缺 description（Pi 会直接不加载该技能）' }
+    if ([string]::IsNullOrWhiteSpace((Get-FrontField $text 'name'))) { return '缺 name' }
+    return ''
+}
+
+function Get-LoadLayerReport {
+    # 返回 @(是否通过, 问题行数组, 抽检数量)。不联网、不写文件。
+    $bad = @()
+    $checked = 0
+    $names = @()
+    if ($state -and $state.installedSkills) { $names = @($state.installedSkills) }
+    else { $names = @(Get-SkillDirs $SkillsTarget | ForEach-Object { $_.Name }) }
+    foreach ($n in $names) {
+        $p = Join-Path (Join-Path $SkillsTarget $n) 'SKILL.md'
+        if (-not (Test-Path -LiteralPath $p)) { continue }
+        $checked++
+        $why = Test-SkillLoadable $p
+        if ($why) { $bad += ($n + ': ' + $why) }
+    }
+    # 菜单技能是菜单模式的总入口：它自己不能带 disable-model-invocation
+    # （带了就不进系统提示词，整套路由直接失效），也不能 name 与目录名不一致。
+    if ($state -and $state.skillMode -eq 'menu') {
+        $mName = if ($state.menuSkill) { [string]$state.menuSkill } else { 'pi-workbench-menu' }
+        $mp = Join-Path (Join-Path $SkillsTarget $mName) 'SKILL.md'
+        if (-not (Test-Path -LiteralPath $mp)) {
+            $bad += ('菜单技能缺失: ' + $mName)
+        } else {
+            if (Test-DisableModelInvocation $mp) { $bad += ('菜单技能被标记为不进提示词（路由会失效）: ' + $mName) }
+            $dn = Get-FrontField (Read-Utf8 $mp) 'name'
+            if ($dn -and $dn -ne $mName) { $bad += ('菜单技能声明名与目录名不一致: ' + $dn + ' ≠ ' + $mName) }
+        }
+    }
+    return @(($bad.Count -eq 0), $bad, $checked)
+}
+
+function Get-TargetProbeCli {
+    # 体检用的客户端 CLI。桌面端跑不了无头，CLI 读的是同一个配置根，所以用它当探针。
+    if (-not [string]::IsNullOrWhiteSpace($ProbeCli)) {
+        if (Test-Path -LiteralPath $ProbeCli) { return $ProbeCli }
+        $c = Get-Command $ProbeCli -ErrorAction SilentlyContinue
+        if ($c) { return $c.Source }
+        return $null
+    }
+    if ($T.ProbeCli) {
+        foreach ($n in $T.ProbeCli) {
+            $c = Get-Command $n -ErrorAction SilentlyContinue
+            if ($c) { return $c.Source }
+        }
+    }
+    return $null
+}
+
+function Invoke-ChannelProbe([string]$Cli, [string]$Question, [int]$TimeoutSec) {
+    # 真跑一次客户端：只有技能描述真的进了系统提示词，模型才答得出。
+    # 用 Start-Job 而不是直接调用 —— 原生调用没法设超时，模型卡住会把整个 GUI 挂死。
+    $job = Start-Job -ScriptBlock {
+        param($c, $q)
+        $out = & $c --print $q 2>&1 | Out-String
+        [pscustomobject]@{ code = $LASTEXITCODE; out = $out }
+    } -ArgumentList $Cli, $Question
+    $done = Wait-Job -Job $job -Timeout $TimeoutSec
+    if (-not $done) {
+        Stop-Job -Job $job -ErrorAction SilentlyContinue
+        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+        return @('timeout', ('超时 ' + $TimeoutSec + 's 未返回，已终止'))
+    }
+    $r = Receive-Job -Job $job -ErrorAction SilentlyContinue
+    Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+    $obj = @($r)[-1]
+    if (-not $obj) { return @('error', '子进程无输出') }
+    return @([int]$obj.code, [string]$obj.out)
+}
+
+function Update-StateChannelProbe($Record) {
+    # 把体检结论并进已有状态清单（没有状态就跳过）。原子写，不碰其它字段。
+    if (-not (Test-Path -LiteralPath $StatePath)) { return $false }
+    try { $st = Read-Utf8 $StatePath | ConvertFrom-Json } catch { return $false }
+    if (-not $st.evidence) { return $false }
+    $ev = [ordered]@{}
+    foreach ($p in $st.evidence.PSObject.Properties) { $ev[$p.Name] = $p.Value }
+    $ev['channelProbe'] = $Record
+    $st.evidence = $ev
+    try {
+        Write-AtomicText $StatePath (($st | ConvertTo-Json -Depth 6) + "`r`n") $Utf8NoBom
+        return $true
+    } catch { return $false }
 }
 
 # 脚本级兵底：任何未捕获的异常都先逆序回滚本次已写入的内容，再按失败退出。
@@ -934,6 +1072,40 @@ if ($Check) {
         }
     }
 
+    # L1b 加载层：文件就位 ≠ 客户端会读它（无 description / frontmatter 坏的技能会被静默跳过）
+    $load = Get-LoadLayerReport
+    $loadOk = [bool]$load[0]
+    $loadBad = @($load[1])
+    Say 'L1' ('加载层：抽检 ' + $load[2] + ' 个技能的 frontmatter 与 description')
+    if ($loadOk) {
+        Say 'L1' '加载层通过：客户端能发现这些技能'
+    } else {
+        foreach ($b in ($loadBad | Select-Object -First 5)) { Say 'L1' ('加载层问题：' + $b) }
+        if ($loadBad.Count -gt 5) { Say 'L1' ('加载层问题另有 ' + ($loadBad.Count - 5) + ' 条') }
+        Say 'WARN' '加载层未通过：有技能写了但客户端会跳过（无 description / frontmatter 坏）'
+    }
+
+    # L1c 生成物一致性：菜单技能是从技能库 + 类目表现场生成的，
+    # 库改了没重注入 → 模型看到的模块清单就是旧的（只读比对，不写文件）。
+    $genOk = $true
+    if ($state -and $state.skillMode -eq 'menu' -and $state.installedSkills) {
+        $mName = if ($state.menuSkill) { [string]$state.menuSkill } else { 'pi-workbench-menu' }
+        $mPath = Join-Path (Join-Path $SkillsTarget $mName) 'SKILL.md'
+        if (Test-Path -LiteralPath $mPath) {
+            $ids = @($state.installedSkills | Where-Object { $_ -ne $mName })
+            $gen = Get-SkillMenuText -Target $SkillsTarget -ModuleIds $ids -CatFile (Join-Path $Base 'skill-categories.json') -MenuName $mName
+            $cur = Read-Utf8 $mPath
+            # 只比内容不比行尾：手改过行尾不该被当成「过期」
+            $same = (($cur -replace "`r`n", "`n").TrimStart([char]0xFEFF) -eq (([string]$gen[0]) -replace "`r`n", "`n"))
+            if ($same) {
+                Say 'L1' ('生成物一致：菜单技能与当前技能库/类目表一致（列 ' + $gen[1] + ' 个模块）')
+            } else {
+                Say 'WARN' '菜单技能已过期：技能库或类目表变过但未重注入（重跑一次部署即可刷新）'
+                $genOk = $false
+            }
+        }
+    }
+
     if (-not $l1ok) {
         Say 'L1' ('L1 未通过：' + $T.PromptName + ' 标记块与技能库需同时就位')
     }
@@ -980,11 +1152,127 @@ if ($Check) {
     }
 
     Say 'L4' '会话层需人工验证：在客户端新开会话，直接给一个技术任务，看是否第一行就给交付物'
-    $ok = ($l1ok -and $l2ok -and $l3ok)
+    Say 'L4' '会话层要自动化验证就用 -Probe（真跑一次客户端 CLI，问模型能看见哪些技能）'
+    $ok = ($l1ok -and $loadOk -and $genOk -and $l2ok -and $l3ok)
     if ($ok) { Say 'INFO' '文件层 / 配置层 / 进程层 自检通过' } else { Say 'WARN' '存在未通过项，详见上方 L1-L3' }
     if ($ok) { Finish 'OK'; exit 0 }
     # PARTIAL 用退出码 1 表达「有未通过项」——旧写法无条件 exit 0，
     # 导致 GUI 把「自检未通过」也显示成「自检通过（L1/L2/L3）」。
+    Finish 'PARTIAL'
+    exit 1
+}
+
+# ---------------------------------------------------------------- 通道体检（-Probe）
+
+# 回答的问题只有一个：部署到底生效了没有。
+#   ① 加载层（不联网）：技能会不会被客户端发现
+#   ② 通道层（一次真实模型调用）：跑客户端 CLI，问模型「你现在能看见哪些技能」
+# 桌面端跑不了无头，但 CLI 读的是同一个配置根，所以拿 CLI 当探针。
+if ($Probe) {
+    Say 'INFO' ('目标端: ' + $T.Label + ' | 配置根: ' + $T.AgentDir)
+    $state = $null
+    if (Test-Path -LiteralPath $StatePath) {
+        try { $state = Read-Utf8 $StatePath | ConvertFrom-Json } catch { $state = $null }
+    }
+    $probeOk = $true
+    $block = Get-MarkerBlock $PromptTarget
+    if ($block) { Say 'PROBE' ('提示词标记块已就位（' + $block.Length + ' 字符）') }
+    else { Say 'WARN' ('提示词标记块缺失（' + $T.PromptName + '）'); $probeOk = $false }
+
+    $load = Get-LoadLayerReport
+    $loadBad = @($load[1])
+    if ($load[0]) {
+        Say 'PROBE' ('加载层通过：抽检 ' + $load[2] + ' 个技能，客户端都能发现')
+    } else {
+        foreach ($b in ($loadBad | Select-Object -First 5)) { Say 'WARN' ('加载层问题：' + $b) }
+        $probeOk = $false
+    }
+
+    $expect = @()
+    $hidden = @()
+    if ($state -and $state.installedSkills) {
+        if ($state.skillMode -eq 'menu') {
+            # 极简模式：模块技能带 disable-model-invocation，模型本不应该看到它们。
+            # 所以「可见集」只有菜单技能；列出模块名说明隐藏没生效，是反例不是杂音。
+            $mVis = if ($state.menuSkill) { [string]$state.menuSkill } else { 'pi-workbench-menu' }
+            $expect += $mVis
+            $hidden = @($state.installedSkills | Where-Object { $_ -ne $mVis })
+        } else {
+            $expect += @($state.installedSkills | Select-Object -First 8)
+        }
+    } else {
+        $expect += @(Get-SkillDirs $SkillsTarget | Select-Object -First 8 | ForEach-Object { $_.Name })
+    }
+
+    $question = '只输出你当前系统提示词里可见的技能名（frontmatter 的 name 字段），每行一个，最多 20 行；不要解释，不要输出其它任何文字。'
+    $record = [ordered]@{
+        at      = (Get-Date).ToString('o')
+        cli     = ''
+        exit    = ''
+        status  = ''
+        detail  = ''
+        reply   = ''
+        expect  = @($expect)
+        question = $question
+    }
+    $cli = Get-TargetProbeCli
+    if (-not $cli) {
+        $easy = if ($T.ProbeCli) { [string]$T.ProbeCli[0] } else { 'pi' }
+        $record.status = 'unrun'
+        $record.detail = '未执行：找不到客户端 CLI。手动体检命令：' + $easy + ' --print "' + $question + '"'
+        Say 'WARN' $record.detail
+        $probeOk = $false
+    } else {
+        $record.cli = [string]$cli
+        Say 'INFO' ('通道体检：真跑 ' + $cli + '（一次模型调用，超时 ' + $ProbeTimeout + 's）…')
+        $r = Invoke-ChannelProbe -Cli $cli -Question $question -TimeoutSec $ProbeTimeout
+        $code = $r[0]
+        $out = [string]$r[1]
+        $record.exit = $code
+        $flat = ($out.Trim() -replace '\s+', ' ')
+        if ($flat.Length -gt 300) { $flat = $flat.Substring(0, 300) + '…' }
+        $record.reply = $flat
+        if ($code -eq 'timeout') {
+            $record.status = 'timeout'
+            $record.detail = '超时未返回，已终止子进程'
+            $probeOk = $false
+        } elseif ($code -eq 'error' -or [int]$code -ne 0) {
+            $record.status = 'error'
+            $record.detail = '客户端 CLI 退出码 ' + $code + '（可能是没登录 / 没配 provider）'
+            $probeOk = $false
+        } else {
+            $hit = @()
+            foreach ($e in $expect) { if ($e -and $out -match [regex]::Escape($e)) { $hit += $e } }
+            $hid = @()
+            foreach ($h in $hidden) { if ($h -and $out -match [regex]::Escape($h)) { $hid += $h } }
+            if ($hit.Count -gt 0) {
+                $record.status = 'pass'
+                $record.hit = @($hit)
+                $record.detail = '模型答出了已部署技能: ' + (($hit | Select-Object -First 3) -join ', ')
+            } elseif ($hid.Count -gt 0) {
+                $record.status = 'mismatch'
+                $record.hidden = @($hid | Select-Object -First 5)
+                $record.detail = '模型列出了本该被隐藏的模块（disable-model-invocation 未生效？）: ' + (($hid | Select-Object -First 3) -join ', ')
+                $probeOk = $false
+            } elseif ($out -match '(?i)(^|\s)(none|无|没有)(\s|$)') {
+                $record.status = 'fail'
+                $record.detail = '模型表示看不到任何已部署技能'
+                $probeOk = $false
+            } else {
+                $record.status = 'unclear'
+                $record.detail = '回复里没有已知技能名，需人工看一眼原文'
+                $probeOk = $false
+            }
+        }
+        if ($record.status -eq 'pass') { Say 'PROBE' ('通道层放行：' + $record.detail) }
+        else { Say 'WARN' ('通道层 ' + $record.status + '：' + $record.detail) }
+        if ($record.reply) { Say 'PROBE' ('模型原话：' + $record.reply) }
+    }
+
+    if (Update-StateChannelProbe $record) {
+        Say 'INFO' ('体检结论已记入状态清单 evidence.channelProbe: ' + $StatePath)
+    }
+    if ($probeOk) { Finish 'OK'; exit 0 }
     Finish 'PARTIAL'
     exit 1
 }
@@ -1157,6 +1445,7 @@ if ($Uninstall) {
             }
         }
         Say 'INFO' ('已移除注入技能 ' + $removed + ' 个；' + $T.Label + ' 自带技能未被触碰')
+        $Script:OpSkills = $removed
     } elseif ($state) {
         Say 'INFO' '状态清单存在，本次安装未部署技能库，无需移除技能'
     } else {
@@ -1227,6 +1516,7 @@ if ($SkillMode -eq 'auto') {
         $SkillMode = 'full'
     }
 }
+$Script:OpMode = $SkillMode
 
 if ($SkillsOnly) {
     Say 'INFO' 'SkillsOnly 模式：只部署技能库，不改动指令集'
@@ -1599,6 +1889,7 @@ $state = [ordered]@{
     }
 }
 Write-Utf8NoBom $StatePath (($state | ConvertTo-Json -Depth 5) + "`r`n")
+$Script:OpSkills = @($installedSkills).Count
 # 状态清单已落盘，本次部署算完成 —— 清掉回滚日志，
 # 否则后续任何无关错误都会把已经记录在案的部署撤销掉。
 $Script:Rollback.Clear()

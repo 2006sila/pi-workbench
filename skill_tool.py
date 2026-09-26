@@ -11,6 +11,8 @@
   py -X utf8 skill_tool.py list                     # 类目与登记情况
   py -X utf8 skill_tool.py gen                      # 按技能自己的声明重排类目表（机械动作）
   py -X utf8 skill_tool.py gen --check              # 只读校验三方一致（可进 CI）
+  py -X utf8 skill_tool.py contract                # 校验部署契约 ↔ 仓库实际状态（随包资源/spec/标记块/退出码/溯源）
+  py -X utf8 skill_tool.py pack [--out X.zip] [--verify X.zip]   # 技能库打包（含 SHA-256 清单）/ 校验包
   py -X utf8 skill_tool.py add <目录|zip> --category <类目> [--name X] [--desc X] [--dry-run] [--force]
   py -X utf8 skill_tool.py add --batch <目录> --category <类目> [--dry-run]
   py -X utf8 skill_tool.py register <技能名> --category <类目>    # 只改登记，不动文件
@@ -39,6 +41,10 @@ except Exception:
 ROOT = os.path.dirname(os.path.abspath(__file__))
 SKILLS_DIR = os.path.join(ROOT, 'skills-v4')
 CATS_PATH = os.path.join(ROOT, 'skill-categories.json')
+CONTRACT_PATH = os.path.join(ROOT, 'deploy-contract.json')
+SPEC_PATH = os.path.join(ROOT, 'bj_tool.spec')
+INJECT_PATH = os.path.join(ROOT, 'inject.ps1')
+README_PATH = os.path.join(ROOT, 'README.md')
 REMOVED_DIR = os.path.join(SKILLS_DIR, '_removed')
 
 # Agent Skills 规范 / Pi 文档里的硬规则
@@ -619,6 +625,275 @@ def cmd_gen(args):
     return 0
 
 
+# ---------------------------------------------------------------- 契约（deploy-contract.json）
+
+def _spec_datas():
+    """从 bj_tool.spec 里把 DATAS 读出来（用 AST，不执行 PyInstaller 代码）。"""
+    import ast
+    if not os.path.isfile(SPEC_PATH):
+        return []
+    tree = ast.parse(read(SPEC_PATH))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for t in node.targets:
+                if getattr(t, 'id', '') == 'DATAS':
+                    try:
+                        return [tuple(ast.literal_eval(e)) for e in node.value.elts]
+                    except Exception:
+                        return []
+    return []
+
+
+def _covered_by_datas(rel: str, datas) -> bool:
+    rel = rel.replace(os.sep, '/')
+    for ent in datas:
+        src = str(ent[0]).replace(os.sep, '/')
+        if rel == src or rel.startswith(src.rstrip('/') + '/'):
+            return True
+    return False
+
+
+def cmd_contract(args):
+    """校验部署契约与仓库实际状态一致。
+
+    契约不是文档：里面每条都要能被核到，否则就是摆设。这里查四类东西 ——
+      ① 随包资源清单 ↔ 磁盘 ↔ bj_tool.spec 的 DATAS（新增模板忘了进包 = 跑到客户机才炸）
+      ② 技能库规模 / 类目数 ↔ 
+      ③ 标记块字符串 / 退出码 ↔ inject.ps1 里实际用的是不是同一套
+      ④ 溯源记录（clean-room）↔ README 「致谢与参考」写的是不是同一个 commit/许可证
+    """
+    errors, warnings = [], []
+    if not os.path.isfile(CONTRACT_PATH):
+        print('✗ 缺 deploy-contract.json')
+        return 2
+    c = json.loads(read(CONTRACT_PATH))
+    for k in ('schema', 'version', 'title'):
+        if not c.get(k):
+            errors.append('契约缺字段 %s' % k)
+
+    inject_txt = read(INJECT_PATH) if os.path.isfile(INJECT_PATH) else ''
+    datas = _spec_datas()
+
+    # ① 资源清单
+    resources = list(c.get('resources') or [])
+    if 'deploy-contract.json' not in resources:
+        errors.append('resources 里得包含 deploy-contract.json 自己（否则打包后 check 读不到契约）')
+    if len(set(resources)) != len(resources):
+        errors.append('resources 有重复项')
+    missing, uncovered = [], []
+    for rel in resources:
+        if not os.path.exists(os.path.join(ROOT, rel.replace('/', os.sep))):
+            missing.append(rel)
+        if not _covered_by_datas(rel, datas):
+            uncovered.append(rel)
+    if missing:
+        errors.append('resources 里这些文件磁盘上没有：%s' % '、'.join(missing))
+    if uncovered:
+        errors.append('这些资源没进 bj_tool.spec 的 DATAS（打包后会缺）：%s' % '、'.join(uncovered))
+    if not datas:
+        errors.append('读不到 bj_tool.spec 的 DATAS')
+
+    # ② 技能库规模与类目
+    lib = c.get('skillLibrary') or {}
+    skroot = os.path.join(ROOT, lib.get('root') or 'skills-v4')
+    disk = [x for x in sorted(os.listdir(skroot)) if not x.startswith('_')
+            and os.path.isfile(os.path.join(skroot, x, 'SKILL.md'))] if os.path.isdir(skroot) else []
+    if len(disk) < int(lib.get('minSkills') or 0):
+        errors.append('技能库只 %d 个，低于契约下限 %s' % (len(disk), lib.get('minSkills')))
+    cats_file = os.path.join(ROOT, lib.get('categoriesFile') or 'skill-categories.json')
+    ncat = 0
+    if os.path.isfile(cats_file):
+        ncat = len(json.loads(read(cats_file)).get('categories') or [])
+        if ncat != int(lib.get('categories') or 0):
+            errors.append('类目数不一致：契约 %s / 实际 %d（跑一次 gen 或更新契约）'
+                          % (lib.get('categories'), ncat))
+    else:
+        errors.append('类目表不存在：%s' % lib.get('categoriesFile'))
+    if (lib.get('classField') or '') != 'metadata.' + CLASS_KEY:
+        errors.append('契约声明的类目字段（%s）与 skill_tool.py 的 CLASS_KEY（metadata.%s）不一致'
+                      % (lib.get('classField'), CLASS_KEY))
+    for a in c.get('addons') or []:
+        if not os.path.isfile(os.path.join(skroot, a, 'SKILL.md')):
+            errors.append('附加包缺失：%s' % a)
+
+    # ③ 标记块 / 目标端 / 退出码 ↔ inject.ps1
+    # 标记块在源码里是拼出来的（'<!-- BEGIN ' + $TOOL_TAG + ' v4 -->'），
+    # 所以不能直接搜字面量：先把 $TOOL_TAG 取出来，按同一拼法还原期望值再比。
+    tag_m = re.search(r"^\$TOOL_TAG\s*=\s*'([^']+)'", inject_txt, re.M)
+    tag = tag_m.group(1) if tag_m else ''
+    if not tag:
+        errors.append('读不到 inject.ps1 的 $TOOL_TAG')
+    for kind in ('BEGIN', 'END'):
+        # 源码里是 '<!-- BEGIN ' + $TOOL_TAG + ' v4 -->'（对齐空格数量会有变化，所以用正则）
+        pat = re.compile(r"'\x3c!-- " + kind + r" '\s*\+\s*\$TOOL_TAG\s*\+\s*' v4 --\x3e'")
+        if not pat.search(inject_txt):
+            errors.append('inject.ps1 里没有用 $TOOL_TAG 拼出标记块：%s' % kind)
+    for t in c.get('targets') or []:
+        key = t.get('key')
+        if not key:
+            errors.append('targets 里有一项没 key')
+            continue
+        if ("'" + key + "' = @{") not in inject_txt:
+            errors.append('inject.ps1 的 目标表里没有 %s' % key)
+        if tag:
+            for f, want in (('markerBegin', '<!-- BEGIN ' + tag + ' v4 -->'),
+                            ('markerEnd', '<!-- END ' + tag + ' v4 -->')):
+                got = t.get(f)
+                if got != want:
+                    errors.append('targets.%s.%s 与 inject.ps1 的 $TOOL_TAG(%s) 拼出来的不一致：%s ≠ %s'
+                                  % (key, f, tag, got, want))
+        if not t.get('promptName'):
+            errors.append('targets.%s 缺 promptName' % key)
+        elif t['promptName'] not in inject_txt:
+            errors.append('targets.%s.promptName 在 inject.ps1 里找不到：%s' % (key, t['promptName']))
+        if t.get('patchName') and t['patchName'] not in inject_txt:
+            errors.append('targets.%s.patchName 在 inject.ps1 里找不到：%s' % (key, t['patchName']))
+        for cli in t.get('probeCli') or []:
+            if cli not in inject_txt:
+                warnings.append('targets.%s.probeCli 里的 %s 没写进 inject.ps1（体检会退到自动探测）' % (key, cli))
+    for code in (c.get('exitCodes') or {}):
+        pat = 'exit ' + str(code)
+        if pat not in inject_txt:
+            errors.append('契约声明了退出码 %s，但 inject.ps1 里没有 `%s`' % (code, pat))
+
+    # ④ 溯源记录 ↔ README
+    readme = read(README_PATH) if os.path.isfile(README_PATH) else ''
+    for name, src in (c.get('cleanroom') or {}).items():
+        repo, commit, lic = src.get('repo'), src.get('commit'), src.get('license')
+        if not (repo and commit and lic and src.get('method')):
+            errors.append('cleanroom.%s 缺 repo/commit/license/method（溯源不能只写一句话）' % name)
+            continue
+        if len(commit) != 40 or not all(ch in '0123456789abcdef' for ch in commit.lower()):
+            errors.append('cleanroom.%s.commit 不是 40 位 sha：%s' % (name, commit))
+        for label, needle in (('repo', repo), ('license', lic), ('commit', commit)):
+            if needle not in readme:
+                errors.append('README 没写 cleanroom.%s 的 %s（%s）—— 口头致谢不算溯源' % (name, label, needle))
+        if not any(x in readme for x in ('未使用其代码', '未复制', 'clean-room', 'clean room')):
+            errors.append('README 没写明「只借设计、未取文本」（clean-room）')
+    if 'GPL-3.0' in json.dumps(c, ensure_ascii=False) and not (c.get('cleanroom')):
+        errors.append('契约里提到了第三方许可证，但没写 cleanroom 溯源段')
+
+    print('契约：%s（schema %s / 版本 %s）' % (os.path.relpath(CONTRACT_PATH, ROOT), c.get('schema'), c.get('version')))
+    print('  随包资源      %d 项（磁盘齐全 %d / 已进 DATAS %d）'
+          % (len(resources), len(resources) - len(missing), len(resources) - len(uncovered)))
+    print('  技能库        %d 个技能（下限 %s）｜ 类目 %d 个'
+          % (len(disk), lib.get('minSkills'), ncat))
+    print('  目标端        %s' % '、'.join(t.get('label') or t.get('key') or '?' for t in c.get('targets') or []))
+    print('  退出码        %s' % '、'.join(sorted((c.get('exitCodes') or {}).keys())))
+    print('  溯源          %s' % '、'.join('%s %s (%s)' % (k, v.get('commit', '')[:7], v.get('license'))
+                                          for k, v in (c.get('cleanroom') or {}).items()))
+    for w in warnings:
+        print('  ⚠ %s' % w)
+    for e in errors:
+        print('  ✗ %s' % e)
+    print()
+    print('结论：%s' % ('契约与仓库一致' if not errors else '不一致（%d 个错误）' % len(errors)))
+    return 1 if errors else 0
+
+
+def cmd_pack(args):
+    """把技能库打成可分发压缩包（含 SHA-256 清单），或校验一个已打好的包。
+
+    为什么不做「安装器/加密封印」：本仓库是 MIT 且暂不发布，拆包本来就该能读。
+    能带走的只有两件事：完整的技能库，跟一份能自证的清单。
+    """
+    import datetime
+    import zipfile
+
+    def collect():
+        files = []
+        for cat in ('skill-categories.json', 'deploy-contract.json'):
+            p = os.path.join(ROOT, cat)
+            if os.path.isfile(p):
+                files.append((cat, p))
+        for r, dirs, fs in os.walk(SKILLS_DIR):
+            dirs[:] = [d for d in sorted(dirs) if d != '_removed']
+            for f in sorted(fs):
+                p = os.path.join(r, f)
+                files.append((os.path.relpath(p, ROOT).replace(os.sep, '/'), p))
+        return sorted(set(files))
+
+    if args.verify:
+        if not os.path.isfile(args.verify):
+            print('文件不存在：%s' % args.verify)
+            return 2
+        bad, missing, nost = [], [], []
+        with zipfile.ZipFile(args.verify) as z:
+            names = set(z.namelist())
+            if 'MANIFEST.sha256' not in names:
+                print('✗ 包里没有 MANIFEST.sha256，无法校验')
+                return 2
+            man = z.read('MANIFEST.sha256').decode('utf-8').splitlines()
+            want = {}
+            for ln in man:
+                if not ln.strip():
+                    continue
+                h, rel = ln.split('  ', 1)
+                want[rel] = h
+            for rel, h in sorted(want.items()):
+                if rel not in names:
+                    missing.append(rel)
+                    continue
+                got = hashlib.sha256(z.read(rel)).hexdigest()
+                if got != h:
+                    bad.append(rel)
+            extra = sorted(names - set(want) - {'MANIFEST.sha256'})
+            if extra:
+                nost = extra
+        print('校验 %s' % os.path.relpath(args.verify, ROOT) if args.verify.startswith(ROOT) else args.verify)
+        print('  清单项 %d ｜ 摘要不符 %d ｜ 清单有包内无 %d ｜ 包内有清单无 %d'
+              % (len(want), len(bad), len(missing), len(nost)))
+        for x in bad[:5]:
+            print('  ✗ 摘要不符：%s' % x)
+        for x in missing[:5]:
+            print('  ✗ 缺失：%s' % x)
+        for x in nost[:5]:
+            print('  ⚠ 未入清单：%s' % x)
+        ok = not (bad or missing)
+        print()
+        print('结论：%s' % ('包完整，与清单一致' if ok else '包与清单不一致'))
+        return 0 if ok else 1
+
+    files = collect()
+    if not files:
+        print('没有可打包的文件（skills-v4 是空的？）')
+        return 2
+    out = args.out or os.path.join(ROOT, 'build',
+                                   'skill-library-%s.zip' % datetime.datetime.now().strftime('%Y%m%d-%H%M'))
+    out = os.path.abspath(out)
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    lines = []
+    for rel, p in files:
+        with open(p, 'rb') as fh:
+            lines.append('%s  %s' % (hashlib.sha256(fh.read()).hexdigest(), rel))
+    manifest = '\n'.join(lines) + '\n'
+    tmp = out + '.tmp'
+    with zipfile.ZipFile(tmp, 'w', zipfile.ZIP_DEFLATED) as z:
+        # 时间戳写死：同样的输入每次打出同样的字节，方便对哈希
+        fixed = (1980, 1, 1, 0, 0, 0)
+        for rel, p in files:
+            zi = zipfile.ZipInfo(rel, date_time=fixed)
+            zi.compress_type = zipfile.ZIP_DEFLATED
+            zi.external_attr = 0o644 << 16
+            with open(p, 'rb') as fh:
+                z.writestr(zi, fh.read())
+        zi = zipfile.ZipInfo('MANIFEST.sha256', date_time=fixed)
+        zi.compress_type = zipfile.ZIP_DEFLATED
+        zi.external_attr = 0o644 << 16
+        z.writestr(zi, manifest)
+    os.replace(tmp, out)
+    size = os.path.getsize(out)
+    with open(out, 'rb') as fh:
+        zh = hashlib.sha256(fh.read()).hexdigest()
+    print('已打包 %d 个文件 → %s（%s 字节）' % (len(files), os.path.relpath(out, ROOT), size))
+    print('  包 sha256  %s' % zh)
+    print('  清单       MANIFEST.sha256（%d 行）' % len(lines))
+    print('  技能数     %d' % len(disk_skills()))
+    print()
+    print('校验：py -X utf8 skill_tool.py pack --verify "%s"' % out)
+    return 0
+
+
 def _find_skill_root(base: str):
     """在解包/给定目录里找含 SKILL.md 的那个技能目录（支持纵深一层）"""
     if os.path.isfile(os.path.join(base, 'SKILL.md')):
@@ -811,6 +1086,19 @@ def cmd_new_category(args):
         return 2
     cats['categories'].append({'name': args.name, 'when': args.when or '', 'modules': []})
     save_cats(cats)
+    # 契约里的类目数是硬声明（contract --check 会核对），机械同步，别指望人记得改
+    if os.path.isfile(CONTRACT_PATH):
+        try:
+            c = json.loads(read(CONTRACT_PATH))
+            c.setdefault('skillLibrary', {})['categories'] = len(cats['categories'])
+            tmp = CONTRACT_PATH + '.tmp'
+            with open(tmp, 'w', encoding='utf-8', newline='\n') as fh:
+                json.dump(c, fh, ensure_ascii=False, indent=2)
+                fh.write('\n')
+            os.replace(tmp, CONTRACT_PATH)
+            print('契约里的类目数已同步为 %d' % len(cats['categories']))
+        except Exception as e:
+            print('⚠ 契约同步失败（记得手改 deploy-contract.json）: %s' % e)
     print('已新增类目「%s」' % args.name)
     if not args.when:
         print('提醒：没写 --when，菜单里该类目会缺「何时进这类」说明。')
@@ -833,6 +1121,14 @@ def main():
     p = sub.add_parser('gen', help='按技能声明的类目重排/校验类目表')
     p.add_argument('--check', action='store_true', help='只读校验三方一致（不一致退出码 1）')
     p.set_defaults(func=cmd_gen)
+
+    p = sub.add_parser('contract', help='校验部署契约（deploy-contract.json）与仓库实际状态一致')
+    p.set_defaults(func=cmd_contract)
+
+    p = sub.add_parser('pack', help='把技能库打成可分发压缩包（含 SHA-256 清单）')
+    p.add_argument('--out', help='输出 zip 路径（默认 build/skill-library-<时间>.zip）')
+    p.add_argument('--verify', help='校验一个已打好的包（不给则打新包）')
+    p.set_defaults(func=cmd_pack)
 
     p = sub.add_parser('add', help='加技能（目录或 zip）')
     p.add_argument('source', nargs='?', help='技能目录或 zip；--batch 时是父目录')
