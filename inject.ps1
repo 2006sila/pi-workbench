@@ -796,6 +796,16 @@ if (Test-Path -LiteralPath $StatePath) {
     try { $prevState = Read-Utf8 $StatePath | ConvertFrom-Json } catch { $prevState = $null }
 }
 
+# 技能呈现模式：未显式指定（auto）时沿用上次记录。
+# 必须在这里就定下来——指令集写入比技能部署靠前，晚了就来不及往标记块里加取用纪律。
+if ($SkillMode -eq 'auto') {
+    if ($prevState -and $prevState.skillMode -and (@('full', 'menu') -contains [string]$prevState.skillMode)) {
+        $SkillMode = [string]$prevState.skillMode
+    } else {
+        $SkillMode = 'full'
+    }
+}
+
 if ($SkillsOnly) {
     Say 'INFO' 'SkillsOnly 模式：只部署技能库，不改动指令集'
 }
@@ -846,10 +856,22 @@ if ($SkillsOnly) {
 } else {
 $baseText    = Strip-MarkerBlock $currentText
 $promptBody  = Read-Utf8 $SourcePrompt
-$block       = $MARK_BEG + "`r`n" + $promptBody.TrimEnd() + "`r`n" + $MARK_END
+# 极简模式：模块技能不进系统提示词，全靠菜单技能带路。
+# 只在菜单描述里写领域词还不够（那只是一条可选的技能描述），这里在
+# APPEND_SYSTEM.md（系统级、每轮都在、优先级高于技能描述）里再硬性说一句。
+$routeNote = ''
+if ($SkillMode -eq 'menu') {
+    $menuPath = Join-Path (Join-Path $SkillsTarget 'pi-workbench-menu') 'SKILL.md'
+    $routeNote = "`r`n`r`n## 技能取用（本工作台部署）`r`n`r`n" +
+        '需要专业技能的任务，先读技能菜单定位模块，再按需读该模块正文：' + "`r`n`r`n" +
+        '- 菜单：`' + $menuPath + '`' + "`r`n" +
+        '- 初始只取 1 个最匹配的模块；一个阶段最多加载 4 个模块正文。' + "`r`n" +
+        '- 找不到匹配模块就用自身知识继续，不要为凑数读无关模块。' + "`r`n"
+}
+$block       = $MARK_BEG + "`r`n" + $promptBody.TrimEnd() + $routeNote + "`r`n" + $MARK_END
 $newText     = ($baseText.TrimEnd() + "`r`n`r`n" + $block + "`r`n").TrimStart()
 Write-Utf8NoBom $PromptTarget $newText
-Say 'INFO' ('已写入指令集: ' + $PromptTarget + '（' + $promptBody.Length + ' 字符，版本 ' + $VersionLabel + '）')
+Say 'INFO' ('已写入指令集: ' + $PromptTarget + '（' + $promptBody.Length + ' 字符，版本 ' + $VersionLabel + '，模式 ' + $SkillMode + '）')
 }
 
 # 1b) DSH：home 级 patch 层提高 agent-instructions 的 maxBytes 预算。
@@ -994,15 +1016,6 @@ if ($SkillsOnly -and $prevState) {
 # + 生成一个菜单技能进提示词；agent 按菜单里的模块 id 直接 read 对应 SKILL.md。
 $MenuSkillName = 'pi-workbench-menu'
 $MenuModules   = 0
-# 未显式指定时沿用上次记录的模式——否则「部署附加包」这类局部操作
-# （不传 -SkillMode）会误走完整模式分支，把极简模式的菜单技能删掉。
-if ($SkillMode -eq 'auto') {
-    if ($prevState -and $prevState.skillMode -and (@('full', 'menu') -contains [string]$prevState.skillMode)) {
-        $SkillMode = [string]$prevState.skillMode
-    } else {
-        $SkillMode = 'full'
-    }
-}
 if (-not $NoSkills) {
     if ($SkillMode -eq 'menu') {
         $menuable = @($installedSkills | Where-Object { $_ -ne $MenuSkillName })
