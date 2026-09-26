@@ -44,7 +44,17 @@ param(
     # -ListVersions 列表；-Restore <id> 按版本恢复（恢复前验 afterHash）。
     [switch]$ListVersions,
     [string]$Restore = '',
-    [switch]$Json
+    [switch]$Json,
+
+    # 任务构建器：把「模糊的一句话」变成可执行的任务契约（档位 + 工作链 + 通道 + 交付要求）。
+    # 只生成文本，不联网、不写配置。
+    [switch]$Compose,
+    [string]$Goal = '',
+    [ValidateSet('max', 'focused', 'builder', 'research', 'creative')]
+    [string]$Profile = 'max',
+    [ValidateSet('auto', 'reverse', 'crack', 'pentest', 'game', 'sample', 'content')]
+    [string]$Channel = 'auto',
+    [string]$Out = ''
 )
 
 Set-StrictMode -Off
@@ -148,6 +158,7 @@ $Script:OpName = if ($Uninstall) { 'uninstall' }
     elseif ($RemoveAddons) { 'remove-addons' }
     elseif ($ListVersions) { 'list-versions' }
     elseif ($Restore) { 'restore' }
+    elseif ($Compose) { 'compose' }
     elseif ($Probe) { 'probe' }
     elseif ($Check) { 'check' }
     elseif ($SkillsOnly) { 'skills-only' }
@@ -185,6 +196,8 @@ $Script:BaselineDrift = New-Object System.Collections.ArrayList
 # 操作留痕用的字段
 $Script:OpSkills = 0
 $Script:OpMode = ''
+# 体检结论（有就一并写进 last-run，没部署记录时也能查到）
+$Script:ProbeRecord = $null
 
 function Say([string]$Level, [string]$Message) {
     $line = '[' + $Level + '] ' + $Message
@@ -236,6 +249,7 @@ function Finish([string]$Status) {
         modelStatus = $modelStatus
         conflicts = @($Script:RollbackConflicts)
         baselineDrift = @($Script:BaselineDrift)
+        channelProbe = $(if ($Script:ProbeRecord) { $Script:ProbeRecord } else { $null })
         exitCode  = $Script:ExitCode
         finishedAt = (Get-Date).ToString('o')
     }
@@ -1316,6 +1330,22 @@ if ($Probe) {
     }
 
     $question = '只输出你当前系统提示词里可见的技能名（frontmatter 的 name 字段），每行一个，最多 20 行；不要解释，不要输出其它任何文字。'
+    # 通道预检：先把「没装 CLI / 配置根里根本没有 provider 配置」与「上下文没送达」分开。
+    # 前者根本不该花一次模型调用，报「未送达」也会把人带偏。
+    $pre = @()
+    if (-not (Test-Path -LiteralPath $T.AgentDir)) { $pre += ('配置根不存在: ' + $T.AgentDir) }
+    $provHits = @()
+    foreach ($pf in @($T.ProbeFiles)) {
+        if ($pf -and (Test-Path -LiteralPath $pf)) { $provHits += (Split-Path -Leaf $pf) }
+    }
+    if (@($T.ProbeFiles).Count -gt 0 -and $provHits.Count -eq 0) {
+        # 括号里不能在 + 后换行（PS 5.1 会把行尾当表达式结束），先拼变量
+        $provNames = (@($T.ProbeFiles) | ForEach-Object { Split-Path -Leaf $_ }) -join ' / '
+        $pre += ('配置根里没有任何 provider 配置（' + $provNames + '）—— 先在客户端登录 / 配好通道，再体检')
+    }
+    if (@($expect).Count -eq 0) {
+        $pre += '没有可核对的已部署技能（先部署一次，再体检）'
+    }
     $record = [ordered]@{
         at      = (Get-Date).ToString('o')
         cli     = ''
@@ -1323,11 +1353,19 @@ if ($Probe) {
         status  = ''
         detail  = ''
         reply   = ''
+        preflight = @($pre)
+        providerFiles = @($provHits)
         expect  = @($expect)
         question = $question
     }
+    $Script:ProbeRecord = $record
     $cli = Get-TargetProbeCli
-    if (-not $cli) {
+    if ($pre.Count -gt 0) {
+        $record.status = 'preflight'
+        $record.detail = ('预检没过（未发起模型调用）：' + ($pre -join '；'))
+        Say 'WARN' ('通道预检没过，已跳过模型调用：' + ($pre -join '；'))
+        $probeOk = $false
+    } elseif (-not $cli) {
         $easy = if ($T.ProbeCli) { [string]$T.ProbeCli[0] } else { 'pi' }
         $record.status = 'unrun'
         $record.detail = '未执行：找不到客户端 CLI。手动体检命令：' + $easy + ' --print "' + $question + '"'
@@ -1383,9 +1421,77 @@ if ($Probe) {
     if (Update-StateChannelProbe $record) {
         Say 'INFO' ('体检结论已记入状态清单 evidence.channelProbe: ' + $StatePath)
     }
+    if (($provHits.Count -gt 0) -and (-not $cli)) {
+        $easy = if ($T.ProbeCli) { [string]$T.ProbeCli[0] } else { 'pi' }
+        Say 'INFO' ('提示：已探测到 provider 配置（' + ($provHits -join ' / ') + '），但找不到 CLI；手动体检：' + $easy + ' --print "..."')
+    }
     if ($probeOk) { Finish 'OK'; exit 0 }
     Finish 'PARTIAL'
     exit 1
+}
+
+# ---------------------------------------------------------------- 任务构建器（-Compose）
+
+# 只做一件事：把「写清楚的一句话」变成任务契约 —— 档位、工作链、通道、交付要求。
+# 不联网、不写配置、不动任何已部署内容；产物是文本（stdout / -Out 文件 / -Json）。
+if ($Compose) {
+    $GoalText = $Goal.Trim()
+    if ([string]::IsNullOrWhiteSpace($GoalText)) {
+        Fail '先用 -Goal 给出目标（一句话就行）'
+    }
+    $Profiles = [ordered]@{
+        'max'      = @{ label = 'MAX / 全开';      tone = '完整、直接、可继续';        stages = @('目标', '上下文', '产物', '自检') }
+        'focused'  = @{ label = 'FOCUS / 聚焦';    tone = '短链路、少噪声';            stages = @('目标', '产物') }
+        'builder'  = @{ label = 'BUILDER / 构建';  tone = '实现、打包、可复现';        stages = @('目标', '设计', '实现', '测试', '打包', '自检') }
+        'research' = @{ label = 'RESEARCH / 研究'; tone = '来源、证据、分层';          stages = @('目标', '取证', '对照', '自检') }
+        'creative' = @{ label = 'CREATIVE / 创作'; tone = '角色、语气、连续性';        stages = @('目标', '角色与设定', '场景', '成稿', '连续性检查') }
+    }
+    $Channels = [ordered]@{
+        'auto'    = '自动判断'
+        'reverse' = '结构还原 / 逆向（二进制、固件、协议、脱壳）'
+        'crack'   = '校验链路 / 授权分析（卡密、激活、试用、补丁）'
+        'pentest' = '攻击面验证（资产、Web/API、云、内网）'
+        'game'    = '客户端工程（内存、渲染、输入、反作弊面）'
+        'sample'  = '样本 / 取证（静态动态、C2、流量、日志）'
+        'content' = '内容创作（正文、剧本、文档）'
+    }
+    $pf = $Profiles[$Profile]
+    $chName = [string]$Channels[$Channel]
+    $chain = ($pf.stages -join ' → ')
+    $lines = @()
+    $lines += '[任务契约 · ' + $TOOL_TAG + ' · ' + $T.Label + ']'
+    $lines += '档位：' + $pf.label + ' —— ' + $pf.tone
+    $lines += '工作链：' + $chain
+    $lines += '通道：' + $chName
+    $lines += '交付要求：'
+    $lines += '1. 先给可执行产物，再列检查点；不写「我可以帮你…」这类前言。'
+    $lines += '2. 缺参数用占位符（TARGET / PATH / OFFSET / PAYLOAD / SERIAL 等）继续，不回头问。'
+    $lines += '3. 用到技能模块时报一行：参考模块: <模块id>（用途）。'
+    $lines += '4. 结论区分「观察到的 / 推测的 / 已验证的」；没跑就写「未执行」并给下一条可复现命令。'
+    $lines += '目标：' + $GoalText
+    $text = ($lines -join "`r`n") + "`r`n"
+
+    if ($Json) {
+        $payload = [ordered]@{
+            profile = $Profile; profileLabel = $pf.label; tone = $pf.tone
+            channel = $Channel; channelLabel = $chName
+            stages = @($pf.stages); goal = $GoalText; text = $text
+        }
+        # 变量名别用 $json —— PowerShell 变量名不区分大小写，那会把字符串写进 [switch]$Json 参数，
+        # 报“无法将 System.String 转换为 SwitchParameter”，而且看起来像参数绑定错了。
+        $jsonText = ($payload | ConvertTo-Json -Depth 4)
+        if ($Out) {
+            Write-AtomicText $Out ($jsonText + "`r`n") $Utf8NoBom
+            Say 'INFO' ('任务契约已写入: ' + $Out)
+        } else { Write-Output $jsonText }
+    } elseif ($Out) {
+        Write-AtomicText $Out $text $Utf8NoBom
+        Say 'INFO' ('任务契约已写入: ' + $Out)
+    } else {
+        Write-Output $text
+    }
+    Finish 'OK'
+    exit 0
 }
 
 # ---------------------------------------------------------------- 版本历史（可恢复的部署历史）

@@ -44,6 +44,7 @@ CATS_PATH = os.path.join(ROOT, 'skill-categories.json')
 CONTRACT_PATH = os.path.join(ROOT, 'deploy-contract.json')
 SPEC_PATH = os.path.join(ROOT, 'bj_tool.spec')
 INJECT_PATH = os.path.join(ROOT, 'inject.ps1')
+BJTOOL_PATH = os.path.join(ROOT, 'bj_tool.py')
 README_PATH = os.path.join(ROOT, 'README.md')
 REMOVED_DIR = os.path.join(SKILLS_DIR, '_removed')
 
@@ -653,6 +654,24 @@ def _covered_by_datas(rel: str, datas) -> bool:
     return False
 
 
+def _bj_composed():
+    """从 bj_tool.py 读 COMPOSED 表（AST，不 import：那会拖进 PySide6）。"""
+    import ast
+    if not os.path.isfile(BJTOOL_PATH):
+        return {}
+    try:
+        tree = ast.parse(read(BJTOOL_PATH))
+    except Exception:
+        return {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and any(getattr(t, 'id', '') == 'COMPOSED' for t in node.targets):
+            try:
+                return {k: (v[0], list(v[1])) for k, v in ast.literal_eval(node.value).items()}
+            except Exception:
+                return {}
+    return {}
+
+
 def cmd_contract(args):
     """校验部署契约与仓库实际状态一致。
 
@@ -715,6 +734,86 @@ def cmd_contract(args):
     for a in c.get('addons') or []:
         if not os.path.isfile(os.path.join(skroot, a, 'SKILL.md')):
             errors.append('附加包缺失：%s' % a)
+
+    # ②b 模板：引用的零件齐全且在清单里、身份锚定串齐全且不拄串、与 bj_tool.py 的版本表一致
+    tpl = c.get('templates') or {}
+    tplroot = os.path.join(ROOT, 'prompts')
+    anchors = tpl.get('anchors') or {}
+    composed = tpl.get('composed') or {}
+    standalone = tpl.get('standalone') or {}
+    names = set(anchors) | set(standalone.values())
+    shared = tpl.get('shared_anchors') or []
+    for item in shared:
+        names |= set(item.get('files') or [])
+    for spec in composed.values():
+        names |= set(spec.get('parts') or [])
+    texts = {}
+    for n in names:
+        p = os.path.join(tplroot, n)
+        texts[n] = read(p) if os.path.isfile(p) else None
+    referenced = set(standalone.values())
+    for spec in composed.values():
+        referenced |= set(spec.get('parts') or [])
+    for n in sorted(referenced):
+        if texts.get(n) is None:
+            errors.append('模板缺失（被版本引用）：prompts/%s' % n)
+        elif not texts[n].strip():
+            errors.append('模板是空文件：prompts/%s' % n)
+        if ('prompts/' + n) not in resources:
+            errors.append('prompts/%s 被版本引用但不在 resources 里（打包清单会漏掉它）' % n)
+    for n, words in anchors.items():
+        t = texts.get(n)
+        if t is None:
+            errors.append('锚定串声明的模板不存在：prompts/%s' % n)
+            continue
+        for w in words:
+            if w not in t:
+                errors.append('prompts/%s 缺锚定串「%s」（模板被改坏或换错了？）' % (n, w))
+            others = sorted(g for g, gt in texts.items() if g != n and gt and w in gt)
+            if others:
+                errors.append('锚定串拄串：prompts/%s 的「%s」也出现在 %s' % (n, w, '、'.join(others)))
+    # 共享锚定串（如 V5.1b 与 V5.2c 共用开头）：必须在声明的那几个文件里，且不得流到其它模板
+    for item in shared:
+        w = item.get('text') or ''
+        group = list(item.get('files') or [])
+        if not w or not group:
+            errors.append('shared_anchors 项缺 text 或 files')
+            continue
+        for n in group:
+            t = texts.get(n)
+            if t is None:
+                errors.append('共享锚定串声明的模板不存在：prompts/%s' % n)
+            elif w not in t:
+                errors.append('prompts/%s 缺共享锚定串「%s」' % (n, w))
+        extra = sorted(g for g, gt in texts.items() if g not in group and gt and w in gt)
+        if extra:
+            errors.append('共享锚定串「%s」流到了不该有的模板：%s' % (w, '、'.join(extra)))
+    # 与 bj_tool.py 的版本表对齐（防“契约改了、代码没改”）
+    bt = _bj_composed()
+    for key, spec in composed.items():
+        got = bt.get(key)
+        want_out, want_parts = spec.get('out'), list(spec.get('parts') or [])
+        if got is None:
+            errors.append('契约声明了合成版本 %s，但 bj_tool.py 的 COMPOSED 里没有' % key)
+        elif got[0] != want_out or got[1] != want_parts:
+            errors.append('合成版本 %s 与 bj_tool.py 不一致：契约 %s%s / 代码 %s%s'
+                          % (key, want_out, want_parts, got[0], got[1]))
+    bjtxt = read(BJTOOL_PATH) if os.path.isfile(BJTOOL_PATH) else ''
+    for key, f in standalone.items():
+        pat = re.search(r"'" + re.escape(key) + r"':\s*'([^']+)'", bjtxt)
+        if not pat:
+            errors.append('契约声明了独立模板 %s，但 bj_tool.py 的 _prompt_file 里没有' % key)
+        elif pat.group(1) != f:
+            errors.append('独立模板 %s 指向不一致：契约 %s / bj_tool.py %s' % (key, f, pat.group(1)))
+    # 孤儿模板：既没被版本引用、也不在随包清单（也没声明 orphan_ok）
+    orphan_ok = set(tpl.get('orphan_ok') or [])
+    if os.path.isdir(tplroot):
+        for f in sorted(os.listdir(tplroot)):
+            if not f.endswith('.md') or f.upper().startswith('README'):
+                continue
+            if f in referenced or ('prompts/' + f) in resources or f in orphan_ok:
+                continue
+            warnings.append('模板 prompts/%s 没被任何版本引用、也不在随包清单里 —— 是要删，还是漏登记？' % f)
 
     # ③ 标记块 / 目标端 / 退出码 ↔ inject.ps1
     # 标记块在源码里是拼出来的（'<!-- BEGIN ' + $TOOL_TAG + ' v4 -->'），
@@ -784,6 +883,8 @@ def cmd_contract(args):
           % (len(resources), len(resources) - len(missing), len(resources) - len(uncovered)))
     print('  技能库        %d 个技能（下限 %s）｜ 类目 %d 个'
           % (len(disk), lib.get('minSkills'), ncat))
+    print('  模板          %d 个引用件 ｜ 合成版本 %d ｜ 独立版本 %d ｜ 锚定串 %d 个模板'
+          % (len(referenced), len(composed), len(standalone), len(anchors)))
     print('  目标端        %s' % '、'.join(t.get('label') or t.get('key') or '?' for t in c.get('targets') or []))
     print('  退出码        %s' % '、'.join(sorted((c.get('exitCodes') or {}).keys())))
     print('  溯源          %s' % '、'.join('%s %s (%s/%s)' % (k, str(v.get('commit', ''))[:7], v.get('license'), v.get('mode'))

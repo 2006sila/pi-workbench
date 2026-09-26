@@ -807,6 +807,13 @@ def _btn_style(kind):
         # Qt 的 QSS 不支持 text-decoration（写了也无效），下划线效果靠颜色与 hover 区分
         return ('QPushButton { background: transparent; color: ' + C['ACCENT'] + '; border: none; }'
                 'QPushButton:hover { color: ' + C['ACCENT_GLOW'] + '; }')
+    if kind == 'chip':
+        # 可切换的选择器（任务构建器的档位 / 通道）：必须给 :checked 上色，否则选不选看不出来
+        return ('QPushButton { background: ' + C['CARD_BG'] + '; color: ' + C['TEXT_SECONDARY'] + ';'
+                ' border: 1px solid ' + C['BORDER'] + '; border-radius: 8px; font-weight: 500; padding: 0 10px; }'
+                'QPushButton:hover { border-color: ' + C['ACCENT'] + '; color: ' + C['TEXT_PRIMARY'] + '; }'
+                'QPushButton:checked { background: ' + C['ACCENT'] + '; color: #FFFFFF;'
+                ' border-color: ' + C['ACCENT'] + '; font-weight: 600; }')
     return ('QPushButton { background: ' + C['CARD_BG'] + '; color: ' + C['TEXT_PRIMARY'] + ';'
             ' border: 1px solid ' + C['BORDER'] + '; border-radius: 8px;'
             ' font-weight: 500; padding: 0 14px; }'
@@ -862,6 +869,12 @@ def _glyph_icon(kind, color):
         p.drawRoundedRect(5, 8, 12, 8, 3, 3)
         p.drawRoundedRect(8, 16, 2, 3, 1, 1)
         p.drawRoundedRect(12, 16, 2, 3, 1, 1)
+    elif kind == 'task':
+        # 文档 + 勾选：任务契约
+        p.drawRoundedRect(3, 2, 16, 18, 3, 3)
+        p.setPen(QPen(QColor(C['BG']), 2.0))
+        p.drawLine(7, 8, 15, 8)
+        p.drawLine(7, 12, 15, 12)
     elif kind == 'clock':
         p.setBrush(Qt.NoBrush)
         p.setPen(QPen(QColor(color), 2.0))
@@ -1441,6 +1454,18 @@ class HomePage(Page):
         b_check.setCursor(Qt.PointingHandCursor)
         b_check.clicked.connect(self.main._check_all)
         hdr.addWidget(b_check)
+        b_probe = QPushButton('体检两端')
+        b_probe.setStyleSheet(_btn_style('ghost'))
+        b_probe.setFixedHeight(34)
+        b_probe.setCursor(Qt.PointingHandCursor)
+        b_probe.clicked.connect(self.main._probe_all)
+        hdr.addWidget(b_probe)
+        b_task = QPushButton('任务构建')
+        b_task.setStyleSheet(_btn_style('ghost'))
+        b_task.setFixedHeight(34)
+        b_task.setCursor(Qt.PointingHandCursor)
+        b_task.clicked.connect(self.main._compose)
+        hdr.addWidget(b_task)
         lay.addLayout(hdr)
 
         # 两张目标卡
@@ -1467,7 +1492,9 @@ class HomePage(Page):
         q2.clicked.connect(lambda: self.main.switch_page(2))
         q3 = QuickCard('term', '运行日志', '注入与自检输出')
         q3.clicked.connect(lambda: self.main.switch_page(3))
-        for q in (q1, q2, q3):
+        q4 = QuickCard('task', '任务构建', '一句话 → 任务契约')
+        q4.clicked.connect(lambda: self.main._compose())
+        for q in (q1, q2, q3, q4):
             quick.addWidget(q, 1)
         lay.addLayout(quick)
 
@@ -2459,6 +2486,152 @@ class VersionsDialog(QDialog):
         self.main._enqueue(['-Target', self.target['key'], '-Restore', vid],
                            '恢复版本 ' + self.target['card'], done,
                            kind='操作', target_card=self.target['card'])
+
+
+class TaskComposeDialog(QDialog):
+    """任务构建器：把一句话变成任务契约（档位 + 工作链 + 通道 + 交付要求）。
+
+    文案由 inject.ps1 -Compose 生成（CLI 与 GUI 同一份实现的道理），
+    这里只负责选项、预览与复制；不写任何配置、不联网。
+    """
+
+    PROFILES = [('max', 'MAX / 全开', '完整直接'),
+                ('focused', 'FOCUS / 聚焦', '短链路'),
+                ('builder', 'BUILDER / 构建', '实现打包'),
+                ('research', 'RESEARCH / 研究', '来源证据'),
+                ('creative', 'CREATIVE / 创作', '角色语气')]
+    CHANNELS = [('auto', '自动判断'), ('reverse', '逆向 / 结构还原'), ('crack', '授权 / 校验链路'),
+                ('pentest', '攻击面验证'), ('game', '客户端工程'), ('sample', '样本 / 取证'),
+                ('content', '内容创作')]
+
+    def __init__(self, main, parent=None):
+        super().__init__(parent)
+        self.main = main
+        self.setWindowTitle('任务构建 · 一句话 → 任务契约')
+        self.setMinimumSize(760, 620)
+        self.setStyleSheet('QDialog { background: ' + C['BG'] + '; }')
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(22, 20, 22, 18)
+        lay.setSpacing(10)
+        lay.addWidget(_mk_label('任务构建', 18, 'TEXT_PRIMARY', bold=True))
+        lay.addWidget(_mk_label('写一句目标 → 选档位与通道 → 生成任务契约，复制到客户端发过去。'
+                                '只生成文本，不写配置、不联网。', 12, 'TEXT_SECONDARY', bold=False))
+
+        lay.addWidget(_mk_label('档位', 12, 'TEXT_SECONDARY', bold=True))
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self._pgroup = QButtonGroup(self)
+        self._pbtn = {}
+        for i, (k, label, sub) in enumerate(self.PROFILES):
+            b = QPushButton(label + '\n' + sub)
+            b.setCheckable(True)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setFixedHeight(48)
+            b.setStyleSheet(_btn_style('chip'))
+            self._pgroup.addButton(b, i)
+            self._pbtn[k] = b
+            row.addWidget(b, 1)
+            if k == 'max':
+                b.setChecked(True)
+        lay.addLayout(row)
+
+        lay.addWidget(_mk_label('通道', 12, 'TEXT_SECONDARY', bold=True))
+        row2 = QHBoxLayout()
+        row2.setSpacing(8)
+        self._cgroup = QButtonGroup(self)
+        self._cbtn = {}
+        for i, (k, label) in enumerate(self.CHANNELS):
+            b = QPushButton(label)
+            b.setCheckable(True)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setFixedHeight(34)
+            b.setStyleSheet(_btn_style('chip'))
+            self._cgroup.addButton(b, i)
+            self._cbtn[k] = b
+            row2.addWidget(b, 1)
+            if k == 'auto':
+                b.setChecked(True)
+        lay.addLayout(row2)
+
+        lay.addWidget(_mk_label('目标（一句话也行）', 12, 'TEXT_SECONDARY', bold=True))
+        self.goal = QPlainTextEdit()
+        self.goal.setPlaceholderText('例：把 D:\\samples\\demo.exe 的注册校验链还原出来，并给出可回滚的补丁')
+        self.goal.setFixedHeight(74)
+        self.goal.setStyleSheet('QPlainTextEdit { background: ' + C['SURFACE'] + '; border: 1px solid '
+                                + C['BORDER'] + '; border-radius: 10px; padding: 8px; color: '
+                                + C['TEXT_PRIMARY'] + '; }')
+        lay.addWidget(self.goal)
+
+        row3 = QHBoxLayout()
+        self.hint = _mk_label('', 12, 'TEXT_MUTED', bold=False)
+        row3.addWidget(self.hint)
+        row3.addStretch(1)
+        b_gen = QPushButton('生成契约')
+        b_gen.setStyleSheet(_btn_style('primary'))
+        b_gen.setFixedHeight(34)
+        b_gen.clicked.connect(self.generate)
+        row3.addWidget(b_gen)
+        b_copy = QPushButton('复制')
+        b_copy.setStyleSheet(_btn_style('ghost'))
+        b_copy.setFixedHeight(34)
+        b_copy.clicked.connect(self._copy)
+        row3.addWidget(b_copy)
+        lay.addLayout(row3)
+
+        lay.addWidget(_mk_label('预览（可直接复制）', 12, 'TEXT_SECONDARY', bold=True))
+        self.preview = QPlainTextEdit()
+        self.preview.setReadOnly(True)
+        self.preview.setStyleSheet('QPlainTextEdit { background: ' + C['LOG_BG'] + '; border: 1px solid '
+                                   + C['BORDER'] + '; border-radius: 10px; padding: 10px; color: '
+                                   + C['LOG_FG'] + '; font-family: Consolas, monospace; font-size: 12px; }')
+        lay.addWidget(self.preview, 1)
+
+    def _selected(self):
+        prof = 'max'
+        for k, b in self._pbtn.items():
+            if b.isChecked():
+                prof = k
+        chan = 'auto'
+        for k, b in self._cbtn.items():
+            if b.isChecked():
+                chan = k
+        return prof, chan
+
+    def generate(self):
+        goal = self.goal.toPlainText().strip()
+        if not goal:
+            self.hint.setText('先写一句目标')
+            return
+        prof, chan = self._selected()
+        out = os.path.join(work_root(), 'compose-preview.md')
+        try:
+            os.remove(out)
+        except OSError:
+            pass
+
+        def done(code, tail):
+            if code != 0 or not os.path.exists(out):
+                self.hint.setText('生成失败（退出码 %d），见日志' % code)
+                return
+            try:
+                with open(out, encoding='utf-8') as fh:
+                    self.preview.setPlainText(fh.read())
+                self.hint.setText('已生成（档位 %s / 通道 %s）' % (prof, chan))
+            except Exception as e:
+                self.hint.setText('读不到生成结果：' + str(e))
+
+        self.hint.setText('生成中…')
+        self.main._enqueue(['-Target', TARGETS[0]['key'], '-Compose', '-Profile', prof,
+                            '-Channel', chan, '-Goal', goal, '-Out', out],
+                           '生成任务契约', done, kind='操作', target_card=TARGETS[0]['card'])
+
+    def _copy(self):
+        text = self.preview.toPlainText().strip()
+        if not text:
+            self.hint.setText('还没有内容可复制')
+            return
+        QApplication.clipboard().setText(text)
+        self.hint.setText('已复制到剪贴板')
 
 
 # ------------------------------------------------------------------ 历史页
@@ -3536,6 +3709,13 @@ class MainWindow(FramelessWindow):
                        '看是否第一行就给交付物（不出现「我不能/无法」类开场)')
         self.switch_page(3)
 
+    def _compose(self):
+        """打开任务构建器（只生成文本，不动部署，不联网）。"""
+        try:
+            TaskComposeDialog(self).exec()
+        except Exception as e:
+            self._set_status('任务构建窗口打不开：' + str(e), 'error')
+
     def _versions(self, target):
         """打开版本历史：先让 inject.ps1 刷一份列表 JSON，再弹窗选。"""
         def done(code, tail):
@@ -3550,6 +3730,35 @@ class MainWindow(FramelessWindow):
         self._enqueue(['-Target', target['key'], '-ListVersions', '-Json'],
                       '读版本列表 ' + target['card'], done,
                       kind='操作', target_card=target['card'])
+
+    def _probe_all(self):
+        """两端一起体检（每端一次真实模型调用；预检不过的那端不会花调用）。"""
+        ans = QMessageBox.question(
+            self, APP_NAME,
+            '对两端各做一次通道体检？\n\n'
+            '· 加载层（不联网）：技能会不会被客户端发现\n'
+            '· 通道层：真跑一次客户端 CLI，问模型「能看见哪些技能」\n'
+            '  两端就是**两次真实模型调用**，会花时间与额度\n\n'
+            '配置根里没有 provider 配置、或找不到 CLI 的那一端，会在预检处拦下，不白花调用。',
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+        if ans != QMessageBox.Yes:
+            return
+        cn = {'pass': '体检放行', 'mismatch': '体检异常（隐藏标记未生效）', 'fail': '体检未送达',
+              'unclear': '体检存疑', 'unrun': '体检未执行（缺 CLI）',
+              'preflight': '预检没过，已跳过调用', 'timeout': '体检超时'}
+
+        def done_factory(tg):
+            def done(code, tail):
+                st = read_json(state_path(tg['key'])) or {}
+                status = ((st.get('evidence') or {}).get('channelProbe') or {}).get('status')
+                self._set_status('%s %s' % (tg['card'], cn.get(status, '体检完成（退出码 %s）' % code)),
+                                 'ok' if status == 'pass' else 'warn')
+            return done
+
+        for target in TARGETS:
+            self._enqueue(['-Target', target['key'], '-Probe'], '通道体检 ' + target['card'],
+                          done_factory(target), kind='自检', target_card=target['card'])
+        self.switch_page(3)
 
     def _probe(self, target):
         """通道体检：文件写对了不等于客户端真的读了。

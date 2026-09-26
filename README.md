@@ -151,6 +151,37 @@ UI 上直接点模式按钮重新部署一次即可；命令行传 `-SkillMode`�
 
 ---
 
+## 任务构建（一句话 → 任务契约）
+
+首页快捷卡「任务构建」或模板页右上角「任务构建」打开。写一句目标、选档位与通道，
+生成一份**可直接粘到客户端发出去**的任务契约：控制行 + 工作链 + 交付要求 + 原样保留的目标。
+
+| 档位 | 工作链 |
+|---|---|
+| MAX / 全开 | 目标 → 上下文 → 产物 → 自检 |
+| FOCUS / 聚焦 | 目标 → 产物 |
+| BUILDER / 构建 | 目标 → 设计 → 实现 → 测试 → 打包 → 自检 |
+| RESEARCH / 研究 | 目标 → 取证 → 对照 → 自检 |
+| CREATIVE / 创作 | 目标 → 角色与设定 → 场景 → 成稿 → 连续性检查 |
+
+通道：自动判断 / 结构还原（逆向）/ 校验链路（授权）/ 攻击面验证 / 客户端工程 / 样本取证 / 内容创作。
+契约里固定带四条交付要求：先给产物再列检查点、缺参用占位符继续、用到模块要报名、
+结论区分观察/推测/已验证且没跑就写「未执行」。
+
+**只生成文本**：不联网、不写配置、不动已部署内容。命令行同一份实现：
+
+```powershell
+# 生成到屏幕（直接复制）
+powershell -ExecutionPolicy Bypass -File inject.ps1 -Target pideck -Compose `
+    -Profile builder -Channel reverse -Goal "把 demo.exe 的注册校验链还原出来，给出可回滚补丁"
+
+# 写文件 / 结构化输出（GUI 与脚本用）
+powershell -ExecutionPolicy Bypass -File inject.ps1 -Target pideck -Compose -Goal "..." -Out D:\task.md
+powershell -ExecutionPolicy Bypass -File inject.ps1 -Target pideck -Compose -Goal "..." -Json
+```
+
+---
+
 ## 模板体系
 
 按目标模型分组，共 8 个模板：
@@ -413,10 +444,15 @@ pi-workbench/
 
 ```
 %LOCALAPPDATA%\pi-workbench\
-├── state\<target>.json        安装状态清单（versionKey / 技能名单 / 备份路径 / 初值标记）
+├── state\<target>.json        安装状态清单（versionKey / 技能名单 / 备份路径 / 初值标记 / 版本号 / evidence）
 ├── backup\<target>\<时间戳>\  安装前原文件与被覆盖的同名技能
+├── backup\<target>\history\   可恢复版本日志（每次部署一条：写前写后全文 + 双哈希）
+├── backup\drift\              被外部改过的现场副本（卸载 / 恢复时另存）
 ├── logs\<target>.log          执行日志
-├── last-run-<target>.json     最近一次执行的结构化结果
+├── logs\operations.log        一行一次操作（时间/目标/动作/状态/exit/skills/mode/drift/conflicts）
+├── last-run-<target>.json     最近一次执行的结构化结果（含 channelProbe）
+├── history-<target>.json      GUI 版本窗口读的版本列表
+├── compose-preview.md         任务构建器的最近一次产物
 ├── prompts\                   现场拼装的成品指令集
 ├── history.json               GUI 操作历史
 └── tool-config.json           GUI 配置（主题 / 自动注入 / 托盘行为 / 跳过弹窗）
@@ -463,6 +499,20 @@ pi-workbench/
 ## 更新记录
 
 **V1.2 · 2026-09-26**
+
+- **任务构建器（一句话 → 任务契约）**：5 个档位（MAX/FOCUS/BUILDER/RESEARCH/CREATIVE）× 7 个通道 →
+  生成带工作链与四条交付要求的契约，一键复制；GUI 入口（首页快捷卡 + 模板页按钮）+ CLI `-Compose`
+- **体检联动**：
+  - 模板页新增「体检两端」：一次把两端的通道体检排进队列
+  - **通道预检**：配置根里没有 provider 配置、或没有可核对的已部署技能时，直接报「预检没过（未发起模型调用）」
+    —— 不再白花一次调用，也不再把自己的配置问题误报成「上下文没送达」
+  - 体检结论同时写进 `state.evidence.channelProbe` 与 `last-run-*.json`（没 state 时也能查）
+- **模板体检**（`skill_tool.py contract` 新增一组）：
+  - 身份锚定串必须出现且**不得出现在其它模板**（防抄串）；共享锚定串只能出现在声明的那几个文件
+  - 合成版本的零件齐全、非空、**必须在随包清单里**；合成表与 `bj_tool.py` 的 `COMPOSED`、
+    独立模板与 `_prompt_file` 双向对齐（契约改了代码没改就会报）
+  - 没被任何版本引用、也不在随包清单的模板 → 提醒（不报错）
+  - 顺带把 `glm-dshpurge.md` 补进随包清单（它此前既不在清单、也无版本引用）
 
 - **通道体检（`-Probe`）—— 回答「部署到底生效了没有」**：
   - 加载层（不联网）：逐个查已装技能的 frontmatter 与 description（**缺 description = Pi 直接不加载**，
