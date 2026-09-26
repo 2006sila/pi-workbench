@@ -354,7 +354,7 @@ py -X utf8 skill_tool.py pack --verify build\skill-library.zip
 
 ### 方式一：用打包好的单文件 exe
 
-从 [Releases](https://github.com/2006sila/pi-workbench/releases/latest) 下载 `pi-workbench-vX.Y.exe`（单文件，约 48MB），双击即用（无需 Python 环境）。
+从 [Releases](https://github.com/2006sila/pi-workbench/releases/latest) 下载 `pi-workbench-v1.3.exe`（单文件，约 48MB），双击即用（无需 Python 环境）。
 本地自己构建的产物名是 `pi用学习工作台.exe`，功能相同。
 首次启动会解压内置资源到临时目录，约 2~4 秒。
 
@@ -440,10 +440,16 @@ powershell -ExecutionPolicy Bypass -File inject.ps1 -Target pideck -AgentDir D:\
 
 两个目标端还有便捷包装（参数同上）：`inject-pideck.ps1` / `inject-dsh.ps1`。
 
-打包自检（验证单文件 exe 内资源完整性，结果写 `%LOCALAPPDATA%\pi-workbench\bundle-check.json`）：
+打包自检与构建身份自检（都写结果文件，窗口化 exe 没有 stdout）：
 
 ```powershell
-$env:PJ_BUNDLE_CHECK='1'; .\dist\pi用学习工作台.exe
+# 打包自检：验证随包资源可寻址（清单来自 deploy-contract.json，不再写死在这里）
+$env:PJ_BUNDLE_CHECK='1'; .\dist\pi-workbench-v1.3.exe
+# 结果：%LOCALAPPDATA%\pi-workbench\bundle-check.json
+
+# 构建身份自检：确认你跑的是不是这个构建（升级排查第一步）
+$env:PJ_VERSION_CHECK='1'; .\dist\pi-workbench-v1.3.exe
+# 结果：%LOCALAPPDATA%\pi-workbench\version-check.json（版本号 / APP_BUILD / frozen）
 ```
 
 ---
@@ -466,7 +472,7 @@ pi-workbench/
 ├── prompts/                   指令集模板（头部 + 正文分离，详见 prompts/README.md）
 │   └── archive/               已退役的历史头部
 ├── skills-v4/                 65 个技能模块（Agent Skills 标准）
-├── docs/                      README 截图
+├── docs/                      README 截图 · docs/SECURITY.md（发布前安全检查）· docs/releases/（发布说明）
 ├── NOTICE.md                  第三方内容署名
 └── dist/                      构建产物（.gitignore）
 ```
@@ -532,12 +538,14 @@ pi-workbench/
 - **自检 L4 需人工**：会话层（新开会话看是否第一行就给交付物）无法自动判定
 - **提示词实测数据来自本机**：不同模型版本、不同服务端可能表现不同
 - **技能库为收集内容**：三个第三方技能包随附原始 LICENSE，其余为整理收集，署名见 NOTICE.md
+- **通道体检会花一次模型调用**：`-Probe` 的通道层用你自己客户端的通道与额度（默认要你确认；预检不过不会发起）
+- **本工具自身零网络**：不发任何 HTTP 请求；体检的流量全部来自你客户端自己的 CLI（详见 docs/SECURITY.md）
 
 ---
 
 ## 更新记录
 
-**V1.2 · 2026-09-26**
+**V1.3 · 2026-09-26**
 
 - **任务构建器补齐（对齐上游更完整的那一版）**：
   - 新增 **上下文 / 约束** 两个输入 + **输出格式**（markdown / json / code，各自要求写进契约）
@@ -607,6 +615,8 @@ pi-workbench/
     加 `-Force` 才继续，且先把被改过的内容另存到 `backup\drift\<时间>-<目标>\`
   - `state.evidence` 补上 `object / action / baselineSha256 / baselineDrift / verification / rollback`，
     出事不用猜怎么退回去（GUI 也认识退出码 3：弹出「强制卸载」确认，不再当成失败）
+
+**V1.2 · 2026-09-26**
 
 - **写入安全加固**（无一项改变部署路径，全是新增校验）：
   - 目录穿越防护：从状态清单 / 配置拼出来的名字先过 `Resolve-Within`，跑出目标目录就拒写

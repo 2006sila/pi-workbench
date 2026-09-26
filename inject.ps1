@@ -373,6 +373,16 @@ function Get-Sha256([byte[]]$Bytes) {
     } finally { $sha.Dispose() }
 }
 
+function Short-Hash([string]$Hash) {
+    # 展示用短哈希。空值返回空串，长度不足 12 就原样返回 ——
+    # 不要直接 .Substring(0, 12)：SkillsOnly / NoSkills 路径下哈希本来就是空的，
+    # 而空串取子串会抛「Index and length must refer to a location within the string」
+    # （真踩过：GUI 技能库页的“只部署技能库”在已装过指令集时直接崩）。
+    if ([string]::IsNullOrEmpty($Hash)) { return '' }
+    if ($Hash.Length -le 12) { return $Hash }
+    return $Hash.Substring(0, 12) + '…'
+}
+
 function Test-BaselineDrift([string]$Path, $FileHashes, [string]$Kind) {
     # 上次部署记下的 after 哈希 × 现在磁盘上的内容。
     # 不一致 = 部署之后有人（用户/其它工具）动过这个文件。
@@ -384,11 +394,11 @@ function Test-BaselineDrift([string]$Path, $FileHashes, [string]$Kind) {
     $want = [string]$entry.after
     if (-not $want) { return $null }
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
-        return ('文件已不存在（记录 ' + $want.Substring(0, 12) + '…）')
+        return ('文件已不存在（记录 ' + (Short-Hash $want) + '）')
     }
     $cur = Get-Sha256 ([System.IO.File]::ReadAllBytes($Path))
     if ($cur -eq $want) { return $null }
-    return ($cur.Substring(0, 12) + '… ≠ 记录 ' + $want.Substring(0, 12) + '…')
+    return ((Short-Hash $cur) + ' ≠ 记录 ' + (Short-Hash $want))
 }
 
 # ---------------------------------------------------------------- 版本日志（可恢复的部署历史）
@@ -436,7 +446,7 @@ function Assert-Unchanged([string]$Path, [string]$ExpectedHash, [string]$Label) 
     }
     $cur = Get-Sha256 ([System.IO.File]::ReadAllBytes($Path))
     if ($cur -ne $ExpectedHash) {
-        Refuse ($Label + ' 在准备写入期间被其它程序改动（' + $cur.Substring(0, 12) + '… ≠ ' + $ExpectedHash.Substring(0, 12) + '…），已停下未写入')
+        Refuse ($Label + ' 在准备写入期间被其它程序改动（' + (Short-Hash $cur) + ' ≠ ' + (Short-Hash $ExpectedHash) + '），已停下未写入')
     }
 }
 
@@ -1319,8 +1329,12 @@ if ($Check) {
 
     Say 'L4' '会话层需人工验证：在客户端新开会话，直接给一个技术任务，看是否第一行就给交付物'
     Say 'L4' '会话层要自动化验证就用 -Probe（真跑一次客户端 CLI，问模型能看见哪些技能）'
-    $ok = ($l1ok -and $loadOk -and $genOk -and $l2ok -and $l3ok)
-    if ($ok) { Say 'INFO' '文件层 / 配置层 / 进程层 自检通过' } else { Say 'WARN' '存在未通过项，详见上方 L1-L3' }
+    # 进程层只作参考：本工具管的是文件，客户端装没装 / 跑没跑不是它能改变的。
+    # 旧写法把它算进结论，导致“刚在没装客户端的机器上自检”被报成未通过（exit 1）。
+    $ok = ($l1ok -and $loadOk -and $genOk -and $l2ok)
+    if (-not $l3ok) { Say 'L3' '进程层未确认（客户端未安装或未运行）—— 不影响文件层结论，装好后重启客户端即可' }
+    if ($ok) { Say 'INFO' '文件层 / 配置层 / 加载层 自检通过（进程层仅供参考）' }
+    else { Say 'WARN' '存在未通过项，详见上方 L1-L2' }
     if ($ok) { Finish 'OK'; exit 0 }
     # PARTIAL 用退出码 1 表达「有未通过项」——旧写法无条件 exit 0，
     # 导致 GUI 把「自检未通过」也显示成「自检通过（L1/L2/L3）」。
@@ -1730,7 +1744,7 @@ if ($Restore) {
         $cur = Get-Sha256 ([System.IO.File]::ReadAllBytes($p))
         $want = [string]$fl.afterHash
         if ($want -and $cur -ne $want) {
-            $drift += ($p + ': ' + $cur.Substring(0, 12) + '… ≠ 记录 ' + $want.Substring(0, 12) + '…')
+            $drift += ($p + ': ' + (Short-Hash $cur) + ' ≠ 记录 ' + (Short-Hash $want))
         }
     }
     if ($drift.Count -gt 0) {
@@ -2362,6 +2376,18 @@ if (-not $NoSkills) {
         }
     }
 }
+# SkillsOnly 不动指令文件：把上次记录的哈希继承下来。
+# 不继承的话，这次会把 fileHashes 写成空值 → 下次卸载失去漂移检测，会静默拿备份盖回去。
+if ($SkillsOnly -and $prevState -and $prevState.fileHashes) {
+    if (-not $promptAfterHash -and $prevState.fileHashes.prompt) {
+        $promptBeforeHash = [string]$prevState.fileHashes.prompt.before
+        $promptAfterHash = [string]$prevState.fileHashes.prompt.after
+    }
+    if (-not $patchAfterHash -and $prevState.fileHashes.patch) {
+        $patchBeforeHash = [string]$prevState.fileHashes.patch.before
+        $patchAfterHash = [string]$prevState.fileHashes.patch.after
+    }
+}
 $sourcePromptLeaf = (Split-Path -Leaf $SourcePrompt)
 if ($SkillsOnly -and $prevState -and $prevState.sourcePrompt) { $sourcePromptLeaf = [string]$prevState.sourcePrompt }
 # 回滚命令写进证据里：出事了不用猜怎么退回去（哈希表字面量里不放多行 if，先赋值）
@@ -2370,6 +2396,15 @@ if ($Script:Journal.Count -gt 0) {
     $rollbackCmd += '｜按版本恢复: inject.ps1 -Target ' + $Target + ' -Restore ' + $Script:VersionId
 }
 if ($Script:BaselineDrift.Count -gt 0) { $rollbackCmd += '（当前有基线漂移，默认会被拦下）' }
+# 证据里那行写实：没动指令文件就别写「写入前后」（多行 if 先赋变量，别塞进哈希表字面量）
+$promptHashLine = ''
+if ($SkillsOnly) {
+    $promptHashLine = '文件层：本次未改指令文件（SkillsOnly），只动技能库；状态里保留上次记录的哈希'
+} elseif ($promptBeforeHash -or $promptAfterHash) {
+    $promptHashLine = '文件层：本文件写入前后 SHA-256 = ' + $(if ($promptBeforeHash) { (Short-Hash $promptBeforeHash) + ' -> ' } else { '(原不存在) -> ' }) + $(if ($promptAfterHash) { Short-Hash $promptAfterHash } else { '(未重写)' })
+} else {
+    $promptHashLine = '文件层：本次未改指令文件（NoSkills），只动指令集外的内容'
+}
 $state = [ordered]@{
     version             = $TOOL_VER
     target              = $Target
@@ -2412,7 +2447,7 @@ $state = [ordered]@{
         baselineSha256 = $promptAfterHash
         baselineDrift  = @($Script:BaselineDrift)
         verification   = @(
-            ('文件层：本文件写入前后 SHA-256 = ' + $(if ($promptBeforeHash) { $promptBeforeHash.Substring(0, 12) + '… -> ' } else { '(原不存在) -> ' }) + $promptAfterHash.Substring(0, 12) + '…'),
+            $promptHashLine,
             '标记层：托管标记块恒为 1 对（异常时 -RepairMarker 可修，不静默自愈）',
             '人工层：模型侧未验证，需在新会话里确认客户端已加载（见 modelStatus）'
         )

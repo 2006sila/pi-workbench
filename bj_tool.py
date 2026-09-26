@@ -28,14 +28,16 @@ from PySide6.QtWidgets import (
 
 APP_NAME = 'pi用学习工作台'
 APP_SUBTITLE = 'PiDeck / DeepSeek Harness 一键部署 · 注入即用 · 卸载即还原'
-APP_VERSION = 'V1.2'
-APP_BUILD = '2026-09-26 · v1.2 极简模式 + 增强版模板'
+APP_VERSION = 'V1.3'
+APP_BUILD = '2026-09-26 · v1.3 事务式部署 + 版本恢复 · 通道体检 · 任务构建'
 
 _ACTIVE_WINDOW = None
 _THEME_FILTER = None      # 系统主题监听器：必须持引用，否则可能被 GC 后悬垂
 
 IS_WINDOWS = os.name == 'nt'
 CREATE_NO_WINDOW = 0x08000000 if IS_WINDOWS else 0
+
+_SKILL_COUNT_CACHE = None      # 随包技能数缓存（bundled_skill_count 用）
 
 # 单任务超时上限（秒）。注入 65 个技能实测不到 1 分钟；体检要跑一次模型调用，
 # 所以给得宽。卡死的任务由它兜底杀整棵进程树，不再拖住界面。
@@ -460,6 +462,19 @@ def bundle_skill_count():
             if os.path.exists(os.path.join(d, name, 'SKILL.md')):
                 n += 1
     return n
+
+
+def bundled_skill_count():
+    """随包技能数。界面文案里不要写死 65 —— 技能库一改就过期。"""
+    global _SKILL_COUNT_CACHE
+    if _SKILL_COUNT_CACHE is None:
+        d = _res('skills-v4')
+        try:
+            _SKILL_COUNT_CACHE = sum(
+                1 for n in os.listdir(d) if os.path.isfile(os.path.join(d, n, 'SKILL.md')))
+        except OSError:
+            _SKILL_COUNT_CACHE = 0
+    return _SKILL_COUNT_CACHE
 
 
 def home_dir():
@@ -1486,7 +1501,7 @@ class HomePage(Page):
         # 快捷入口
         quick = QHBoxLayout()
         quick.setSpacing(16)
-        q1 = QuickCard('grid', '模板库', '7 个模板 · 按目标模型分组')
+        q1 = QuickCard('grid', '模板库', str(len(VERSIONS)) + ' 个模板 · 按目标模型分组')
         q1.clicked.connect(lambda: self.main.switch_page(1))
         q2 = QuickCard('plug', '技能库', '查看 / 禁用 / 启用')
         q2.clicked.connect(lambda: self.main.switch_page(2))
@@ -1704,10 +1719,10 @@ class TemplatePage(Page):
         self._tgt_path.setText('配置根 ' + resolve_agent_dir(tg))
         if self._sel_mode == 'menu':
             self._mode_hint.setText('只 1 个菜单技能进系统提示词（每轮 ≈90 tokens），'
-                                    '65 个模块按需读取')
+                                    + str(bundled_skill_count()) + ' 个模块按需读取')
         else:
-            self._mode_hint.setText('65 个模块全进系统提示词（每轮 ≈7,000 tokens），'
-                                    'AI 按描述自选')
+            self._mode_hint.setText(str(bundled_skill_count()) + ' 个模块全进系统提示词'
+                                    '（每轮 ≈7,000 tokens），AI 按描述自选')
 
     def _set_target(self, key):
         self._sel_target = key
@@ -4013,6 +4028,32 @@ def _apply_ui_font_px(app, px=13):
     return 'default' 
 
 
+def version_check():
+    """叮版本身份自检：窗口化 exe 没有 stdout，所以把结果写文件。
+
+    干嘛用：拿到一个 exe 先确认「跑的是不是这个构建」—— 升级排查里最常见的问题
+    就是“我装的新包怎么还是旧行为”。结果落 work_root/version-check.json。
+    """
+    res = {
+        'name': APP_NAME,
+        'version': APP_VERSION,
+        'build': APP_BUILD,
+        'frozen': bool(getattr(sys, '_MEIPASS', None)),
+        'python': sys.version.split()[0],
+        'executable': sys.executable,
+        'workRoot': work_root(),
+        'checkedAt': time.strftime('%Y-%m-%dT%H:%M:%S'),
+    }
+    out = os.path.join(work_root(), 'version-check.json')
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    try:
+        with open(out, 'w', encoding='utf-8') as fh:
+            json.dump(res, fh, ensure_ascii=False, indent=2)
+    except Exception:
+        return 1
+    return 0
+
+
 def bundle_check():
     """打包自检：确认单文件 exe 内部的脚本与资源都可寻址。写结果到文件后退出。
 
@@ -4075,6 +4116,8 @@ def main():
     global _ACTIVE_WINDOW
     if os.environ.get('PJ_BUNDLE_CHECK') == '1':
         return bundle_check()
+    if os.environ.get('PJ_VERSION_CHECK') == '1':
+        return version_check()
 
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)

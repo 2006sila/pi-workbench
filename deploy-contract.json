@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "version": "1.2.0",
+  "version": "1.3.0",
   "title": "pi-workbench 部署契约",
   "note": "这份文件是给 `py -X utf8 skill_tool.py contract --check` 用的，不是给人读的文档。里面每一条都能被脚本核对：加模板 / 加技能库 / 改标记块 / 改退出码时改这里，check 会指出哪一处忘了同步（打包资源、bj_tool.spec、README 溯源）。",
 
