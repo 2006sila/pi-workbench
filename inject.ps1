@@ -854,14 +854,18 @@ function Invoke-ChannelProbe([string]$Cli, [string]$Question, [int]$TimeoutSec) 
 
 function Update-StateChannelProbe($Record) {
     # 把体检结论并进已有状态清单（没有状态就跳过）。原子写，不碰其它字段。
+    # 注意：旧版状态清单没有 evidence 字段（1.2 之前装的），不能因此丢结论 ——
+    # 遇到就新建一个。PSCustomObject 上没有的属性要 Add-Member，不能直接赋值。
     if (-not (Test-Path -LiteralPath $StatePath)) { return $false }
     try { $st = Read-Utf8 $StatePath | ConvertFrom-Json } catch { return $false }
-    if (-not $st.evidence) { return $false }
     $ev = [ordered]@{}
-    foreach ($p in $st.evidence.PSObject.Properties) { $ev[$p.Name] = $p.Value }
+    if ($st.PSObject.Properties['evidence'] -and $st.evidence) {
+        foreach ($p in $st.evidence.PSObject.Properties) { $ev[$p.Name] = $p.Value }
+    }
     $ev['channelProbe'] = $Record
-    $st.evidence = $ev
     try {
+        if ($st.PSObject.Properties['evidence']) { $st.evidence = $ev }
+        else { $st | Add-Member -NotePropertyName evidence -NotePropertyValue $ev -Force }
         Write-AtomicText $StatePath (($st | ConvertTo-Json -Depth 6) + "`r`n") $Utf8NoBom
         return $true
     } catch { return $false }
@@ -1014,6 +1018,11 @@ if ($Check) {
     $state = $null
     if (Test-Path -LiteralPath $StatePath) {
         try { $state = Read-Utf8 $StatePath | ConvertFrom-Json } catch { $state = $null }
+    }
+    if ($state) {
+        # 让 operations.log 里 check 这行也能看出当时装的是什么模式 / 多少个技能
+        $Script:OpMode = [string]$state.skillMode
+        $Script:OpSkills = @($state.installedSkills).Count
     }
     $skillsOk = $false
     if ($state -and $state.installedSkills) {
@@ -1174,6 +1183,10 @@ if ($Probe) {
     if (Test-Path -LiteralPath $StatePath) {
         try { $state = Read-Utf8 $StatePath | ConvertFrom-Json } catch { $state = $null }
     }
+    if ($state) {
+        $Script:OpMode = [string]$state.skillMode
+        $Script:OpSkills = @($state.installedSkills).Count
+    }
     $probeOk = $true
     $block = Get-MarkerBlock $PromptTarget
     if ($block) { Say 'PROBE' ('提示词标记块已就位（' + $block.Length + ' 字符）') }
@@ -1202,6 +1215,15 @@ if ($Probe) {
         }
     } else {
         $expect += @(Get-SkillDirs $SkillsTarget | Select-Object -First 8 | ForEach-Object { $_.Name })
+    }
+    # 模型答的是 frontmatter 里的声明名（可能不等于目录名，如 anti-cheat → anti-cheat-systems），
+    # 两边都放进匹配集，否则目录名与声明名不同的技能会被误判成「存疑」。
+    foreach ($e in @($expect)) {
+        $p = Join-Path (Join-Path $SkillsTarget $e) 'SKILL.md'
+        if (Test-Path -LiteralPath $p) {
+            $dn = Get-FrontField (Read-Utf8 $p) 'name'
+            if ($dn -and $dn -ne $e) { $expect += $dn }
+        }
     }
 
     $question = '只输出你当前系统提示词里可见的技能名（frontmatter 的 name 字段），每行一个，最多 20 行；不要解释，不要输出其它任何文字。'
