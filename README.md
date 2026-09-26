@@ -197,6 +197,50 @@ Agent Skills 标准：每个技能是 `<name>/SKILL.md`，Pi 递归扫描发现�
 
 ---
 
+## 技能库维护（skill_tool.py）
+
+往技能库加技能原本是手工建目录 + 改 JSON；现在一条命令，并且带体检。
+**分工原则：脚本只做机械动作与机械校验，不做语义猜测** —— 类目由你（或 AI）判，
+给错了、名字不合规、描述太短，脚本直接拒绍并说明原因，不替你猜。
+
+```powershell
+# 体检（默认动作）：硬规则 + 提示词预算 + 登记一致性 + 相对链接可达性
+py -X utf8 skill_tool.py check
+
+# 看类目与登记情况（会指出哪些技能没登记，极简模式下会落到「其他」）
+py -X utf8 skill_tool.py list
+
+# 加技能（目录或 zip；--dry-run 只校验不落库）
+py -X utf8 skill_tool.py add D:\inbox\my-skill --category 工程交付 --dry-run
+py -X utf8 skill_tool.py add D:\inbox\my-skill --category 工程交付
+py -X utf8 skill_tool.py add D:\inbox\一批技能 --batch --category 逆向 / 二进制
+
+# 只登记类目（不动文件）、新增类目、移出技能（移到 skills-v4/_removed/，可移回）
+py -X utf8 skill_tool.py register seagull-exploit --category 逆向 / 二进制
+py -X utf8 skill_tool.py new-category 内容创作 --when "写正文/小说/文案、时政历史梳理"
+py -X utf8 skill_tool.py remove my-old-skill --yes
+```
+
+校验规则（来自 Agent Skills 规范与 Pi 文档，不是自定）：
+
+| 规则 | 级别 |
+|---|---|
+| frontmatter 必须存在，且含 `name` 与 `description`（Pi 会直接不加载无描述的技能） | 错误 |
+| `name` 仅小写字母/数字/单连字符，无首尾或连续连字符，≤ 64 字符 | 错误 |
+| `description` ≤ 1024 字符 | 错误 |
+| 名字与已有技能重名 | 错误 |
+| 描述 > 200 字符（完整模式下每轮都进提示词） | 提示 |
+| 描述 < 15 字符（路由信息不足） | 提示 |
+| 未登记类目（极简模式会落到「其他」） | 提示 |
+
+加技能时还会当场告诉你：这个技能会给完整模式每轮加多少 tokens，以及**菜单里那一行会长什么样**。
+
+> 脚本自动把落库目录名规范成 `frontmatter 里的 name` —— 两者一致是其他 Agent Skills 实现的硬要求。
+> 库里现有 7 个技能声明名与目录名不同（如 `anti-cheat` 声明 `anti-cheat-systems`），
+> 菜单会在这类模块后标出 `（/skill:<真名>）`，方便用斜杠命令强制加载。
+
+---
+
 ## 附加技能包
 
 两个**独立**技能包，可以和模板一起打，也可以单独部署 / 单独移除：
@@ -301,6 +345,7 @@ pi-workbench/
 ├── build.cmd                  一键构建
 ├── requirements.txt
 ├── app.ico                    应用图标（7 尺寸）
+├── skill_tool.py               技能库维护工具（加技能 / 移除 / 登记类目 / 体检）
 ├── skill-categories.json      技能类目表（极简模式的菜单按此分类生成）
 ├── inject.ps1                 注入器核心（双目标：安装 / 卸载 / 自检 / 附加包）
 ├── inject-pideck.ps1          PiDeck 便捷入口
@@ -357,6 +402,12 @@ pi-workbench/
 
 **V1.2 · 2026-09-26**
 
+- **新增 skill_tool.py（技能库维护工具）**：add / remove / register / new-category / list / check
+  - 校验按 Agent Skills 规范与 Pi 文档：frontmatter、name 字符集与长度、description ≤1024、重名
+  - 加技能时报「每轮多少 tokens」并预览菜单行；落库目录名自动规范成 frontmatter 的 name
+  - check 体检：硬规则 + 提示词预算 + 登记一致性 + 相对链接可达性（剔除代码片段，206 条链接 2 条真失效）
+- 菜单给声明名与目录名不同的模块标出 `（/skill:<真名>）`（库里 7 个），否则斜杠命令用不了
+- 修：`reverse-engineering/field-notes.md` 的悬空链接（引用的案例文件不在包内）
 - **模板页改为三步部署流程**：① 客户端 → ② 模式 → ③ 点卡片部署（选择记在配置，首页「去部署」会把 ① 同步过去）
 - 新增技能呈现模式（`-SkillMode full|menu|auto`）
   - `menu`（极简）：只留一个菜单技能进系统提示词，其余 65 个模块加 `disable-model-invocation` 不进提示词，AI 按需 `read`

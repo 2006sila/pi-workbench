@@ -311,10 +311,14 @@ function New-SkillMenu {
         try { $cats = @((Read-Utf8 $CatFile | ConvertFrom-Json).categories) } catch { $cats = @() }
     }
     $one = @{}
+    $declared = @{}          # 模块 id -> frontmatter 里的真名（用于 /skill: 强制加载）
     foreach ($id in $ModuleIds) {
         $p = Join-Path (Join-Path $Target $id) 'SKILL.md'
         if (-not (Test-Path -LiteralPath $p)) { continue }
-        $one[$id] = Shorten-Desc (Get-FrontField (Read-TextKeepBom $p)[0] 'description')
+        $fm = (Read-TextKeepBom $p)[0]
+        $one[$id] = Shorten-Desc (Get-FrontField $fm 'description')
+        $dn = Get-FrontField $fm 'name'
+        if ($dn -and $dn -ne $id) { $declared[$id] = $dn }
     }
     $placed = @{}
     $lines = New-Object System.Collections.ArrayList
@@ -329,7 +333,11 @@ function New-SkillMenu {
         [void]$lines.Add('')
         [void]$lines.Add('| 模块 | 何时用 |')
         [void]$lines.Add('|---|---|')
-        foreach ($h in $hit) { [void]$lines.Add('| `' + $h + '` | ' + $one[$h] + ' |') }
+        foreach ($h in $hit) {
+            $cell = '`' + $h + '`'
+            if ($declared.ContainsKey($h)) { $cell += '（/skill:' + $declared[$h] + '）' }
+            [void]$lines.Add('| ' + $cell + ' | ' + $one[$h] + ' |')
+        }
     }
     $rest = @($ModuleIds | Where-Object { -not $placed.ContainsKey($_) })
     if ($rest.Count -gt 0) {
@@ -339,7 +347,11 @@ function New-SkillMenu {
         [void]$lines.Add('')
         [void]$lines.Add('| 模块 | 何时用 |')
         [void]$lines.Add('|---|---|')
-        foreach ($h in $rest) { [void]$lines.Add('| `' + $h + '` | ' + $one[$h] + ' |') }
+        foreach ($h in $rest) {
+            $cell = '`' + $h + '`'
+            if ($declared.ContainsKey($h)) { $cell += '（/skill:' + $declared[$h] + '）' }
+            [void]$lines.Add('| ' + $cell + ' | ' + $one[$h] + ' |')
+        }
     }
     $domains = @()
     foreach ($c in $cats) { if ($c.name) { $domains += [string]$c.name } }
@@ -355,6 +367,7 @@ function New-SkillMenu {
     [void]$sb.Append("---`r`n`r`n")
     [void]$sb.Append('# 技能菜单 · ' + $one.Count + " 个模块`r`n`r`n")
     [void]$sb.Append("本目录下每个模块都是一个技能目录：``<本技能根>/<模块 id>/SKILL.md``。`r`n")
+    [void]$sb.Append("括号里是 frontmatter 里的真名（与目录名不同时才有）；用 ``/skill:<真名>`` 可强制加载。`r`n")
     [void]$sb.Append("本文件只给「有哪些模块 + 何时用」，正文按需读。`r`n`r`n")
     [void]$sb.Append("## 取用纪律（硬性）`r`n`r`n")
     [void]$sb.Append("1. **先选类目再选模块**：按任务选 1 个类目，类目内按「何时用」取 **1 个**最匹配的模块，读完 ``SKILL.md`` 再动手。`r`n")
