@@ -11,6 +11,8 @@ triggers:
   - license
   - patch license
   - 授权验证
+metadata:
+  x-pj-class: 破解 / 授权
 ---
 
 # Seagull License Security

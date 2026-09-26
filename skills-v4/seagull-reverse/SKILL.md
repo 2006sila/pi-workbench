@@ -8,6 +8,8 @@ triggers:
   - 脱壳
   - hook
   - 逆向工程
+metadata:
+  x-pj-class: 样本 / 情报
 ---
 
 # Seagull Reverse

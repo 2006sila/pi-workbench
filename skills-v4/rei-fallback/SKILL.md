@@ -1,7 +1,8 @@
 ---
 name: rei-fallback
 description: "Fallback handler when primary rules fail. Trigger: fallback, retry, 继续, 重试, 照做, fallback."
-
+metadata:
+  x-pj-class: 工作流与元技能
 ---
 
 # Fallback Handler

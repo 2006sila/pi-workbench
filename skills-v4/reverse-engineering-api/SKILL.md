@@ -2,6 +2,8 @@
 name: reverse-engineering-api
 author: SeaGull
 description: Reverse engineer web APIs by capturing browser traffic (HAR files) and generating production-ready Python API clients. Use when the user wants to create an API client for a website, automate web interactions, or understand undocumented APIs. Activate on tasks mentioning "reverse engineer", "API client", "HAR file", "capture traffic", or "automate website".
+metadata:
+  x-pj-class: 渗透 / 红队
 ---
 
 # Reverse Engineering API Skill

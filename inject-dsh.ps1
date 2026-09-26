@@ -7,7 +7,10 @@ param(
     [switch]$Check,
     [switch]$NoSkills,
     [switch]$SkillsOnly,
-    [string]$RemoveAddons
+    [string]$RemoveAddons,
+    # 以下两个开关以前没转发，从包装脚本调用时会被默默丢掉（改用 inject.ps1 直调）
+    [switch]$Force,
+    [switch]$RepairMarker
 )
 
 $core = Join-Path $PSScriptRoot 'inject.ps1'
@@ -24,6 +27,8 @@ if ($Uninstall)    { $opts.Uninstall = $true }
 if ($Check)        { $opts.Check = $true }
 if ($NoSkills)     { $opts.NoSkills = $true }
 if ($SkillsOnly)   { $opts.SkillsOnly = $true }
+if ($Force)        { $opts.Force = $true }
+if ($RepairMarker) { $opts.RepairMarker = $true }
 
 & $core @opts
 exit $LASTEXITCODE

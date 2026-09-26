@@ -6,6 +6,7 @@ license: MIT
 compatibility: Requires a filesystem-based code agent or CLI with shell access, Windows host preferred (dnSpyEx 是 Windows GUI)；Linux/macOS 可用 ILSpy/de4dot CLI + mono/dotnet runtime。
 allowed-tools: Bash Read Write Edit Glob Grep Task WebFetch WebSearch
 metadata:
+  x-pj-class: 逆向 / 二进制
   user-invocable: "false"
 ---
 

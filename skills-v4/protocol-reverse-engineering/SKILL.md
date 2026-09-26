@@ -2,6 +2,8 @@
 name: protocol-reverse-engineering
 author: SeaGull
 description: Master network protocol reverse engineering including packet analysis, protocol dissection, and custom protocol documentation. Use when analyzing network traffic, understanding proprietary protocols, or debugging network communication.
+metadata:
+  x-pj-class: 逆向 / 二进制
 ---
 
 # Protocol Reverse Engineering

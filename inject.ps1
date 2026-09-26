@@ -14,6 +14,10 @@ param(
     [switch]$SkillsOnly,
     [string]$RemoveAddons,
 
+    # 卸载时目标文件在部署后被外部改过（SHA-256 基线漂移）→ 默认停下不还原，
+    # 加这个开关才继续（会先把改动存到备份区）。
+    [switch]$Force,
+
     # 技能呈现模式：
     #   full（默认）= 65 个模块全部进系统提示词，AI 按描述自选
     #   menu         = 只留一个菜单技能进提示词，模块加 disable-model-invocation，按需 read
@@ -115,6 +119,9 @@ foreach ($d in @($WorkRoot, $StateDir, $BackupRoot, $LogDir)) {
 
 $Script:Report = New-Object System.Collections.ArrayList
 $Script:PatchWarn = $null
+# 退出码：0 成功 · 1 失败/自检未过 · 3 需人工确认（没做任何写入）
+$Script:ExitCode = 0
+$Script:BaselineDrift = New-Object System.Collections.ArrayList
 
 function Say([string]$Level, [string]$Message) {
     $line = '[' + $Level + '] ' + $Message
@@ -134,7 +141,17 @@ function SayHost([string]$Level, [string]$Message) {
     [void]$Script:Report.Add($line)
 }
 
-function Fail([string]$Message) { Say 'ERROR' $Message; Finish 'FAIL'; exit 1 }
+function Fail([string]$Message) { $Script:ExitCode = 1; Say 'ERROR' $Message; Finish 'FAIL'; exit 1 }
+
+function Refuse([string]$Message) {
+    # 「停下来等人拍板」不是失败：什么都没写，把判断交回给用户。
+    # 与 Fail（exit 1）分开，GUI 才能把这两种情况显示成不同的样子：
+    # 1 = 出错了；3 = 有个选择要你定。
+    $Script:ExitCode = 3
+    Say 'ERROR' $Message
+    Finish 'NEEDS-CONFIRM'
+    exit 3
+}
 
 function Finish([string]$Status) {
     # 明确写出「这步没有任何东西验证过模型侧」——
@@ -142,6 +159,8 @@ function Finish([string]$Status) {
     # 把这句话做成数据字段（而不是只写在文档里），GUI 就能把它显示在日志里。
     $modelStatus = if ($Status -eq 'OK') {
         '未验证：文件已写入，但不代表客户端已加载或已生效；重启客户端后需在新会话里确认'
+    } elseif ($Status -eq 'NEEDS-CONFIRM') {
+        '未执行：检测到外部改动，已停下等确认（本次没有写入任何文件）'
     } else {
         '未验证：本次未正常完成（' + $Status + '），不要当作已生效'
     }
@@ -153,6 +172,8 @@ function Finish([string]$Status) {
         lines     = @($Script:Report)
         modelStatus = $modelStatus
         conflicts = @($Script:RollbackConflicts)
+        baselineDrift = @($Script:BaselineDrift)
+        exitCode  = $Script:ExitCode
         finishedAt = (Get-Date).ToString('o')
     }
     try {
@@ -252,6 +273,24 @@ function Get-Sha256([byte[]]$Bytes) {
     try {
         return ([System.BitConverter]::ToString($sha.ComputeHash($Bytes)) -replace '-', '').ToLowerInvariant()
     } finally { $sha.Dispose() }
+}
+
+function Test-BaselineDrift([string]$Path, $FileHashes, [string]$Kind) {
+    # 上次部署记下的 after 哈希 × 现在磁盘上的内容。
+    # 不一致 = 部署之后有人（用户/其它工具）动过这个文件。
+    # 这不是错误，但必须让人知道：卸载会拿备份盖回去，手写的内容就没了。
+    # 没传文件哈希（旧版 state）或没这项（SkillsOnly）时返回 $null，不误报。
+    if (-not $FileHashes) { return $null }
+    $entry = $FileHashes.$Kind
+    if (-not $entry) { return $null }
+    $want = [string]$entry.after
+    if (-not $want) { return $null }
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return ('文件已不存在（记录 ' + $want.Substring(0, 12) + '…）')
+    }
+    $cur = Get-Sha256 ([System.IO.File]::ReadAllBytes($Path))
+    if ($cur -eq $want) { return $null }
+    return ($cur.Substring(0, 12) + '… ≠ 记录 ' + $want.Substring(0, 12) + '…')
 }
 
 function Test-SameContent([string]$Path, [byte[]]$Bytes) {
@@ -1015,6 +1054,33 @@ if ($Uninstall) {
         try { $state = Read-Utf8 $StatePath | ConvertFrom-Json } catch { $state = $null }
     }
 
+    # 0) 基线漂移：部署之后目标文件被外部改过 → 默认停下，不静默拿备份盖回去。
+    #    没有这一步的话，用户手写的改动会被卸载无声抹掉（且没有任何提示）。
+    if ($state -and $state.fileHashes) {
+        $drift = @()
+        $d1 = Test-BaselineDrift $PromptTarget $state.fileHashes 'prompt'
+        if ($d1) { $drift += ($T.PromptName + ': ' + $d1) }
+        if ($Target -eq 'dsh') {
+            $d2 = Test-BaselineDrift $PatchFile $state.fileHashes 'patch'
+            if ($d2) { $drift += ('cordis.patch.yml: ' + $d2) }
+        }
+        if ($drift.Count -gt 0) {
+            Say 'WARN' ('基线漂移（部署后被外部改动 ' + $drift.Count + ' 项）：' + ($drift -join '；'))
+            if (-not $Force) {
+                Refuse '目标文件在部署后被外部改动，卸载会把这些改动覆盖掉。确认要还原就加 -Force 重跑（会先把改动另存一份）'
+            }
+            # -Force：先把当前（被改过的）内容另存一份，再走原有还原逻辑
+            $driftDir = Join-Path (Join-Path $BackupRoot 'drift') ((Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + $Target)
+            New-Item -ItemType Directory -Force -Path $driftDir | Out-Null
+            foreach ($f in @(@($PromptTarget, $T.PromptName), @($PatchFile, 'cordis.patch.yml'))) {
+                if (Test-Path -LiteralPath $f[0] -PathType Leaf) {
+                    Copy-Item -LiteralPath $f[0] -Destination (Join-Path $driftDir $f[1]) -Force -ErrorAction SilentlyContinue
+                }
+            }
+            Say 'WARN' ('已按 -Force 继续卸载；卸载前的改动另存于: ' + $driftDir)
+        }
+    }
+
     # 1) 恢复注入的指令文件
     if (Test-Path -LiteralPath $PromptTarget) {
         $txt = Read-Utf8 $PromptTarget
@@ -1132,6 +1198,24 @@ New-Item -ItemType Directory -Force -Path $BackupDir | Out-Null
 $prevState = $null
 if (Test-Path -LiteralPath $StatePath) {
     try { $prevState = Read-Utf8 $StatePath | ConvertFrom-Json } catch { $prevState = $null }
+}
+
+# 基线漂移巡检：上次记的 after 哈希 × 现在磁盘上的内容。
+# 重注入本身是安全的（用户手写内容会被 Strip-MarkerBlock 保留后写回），所以这里只告警，
+# 但把漂移记进 state.evidence —— 下次卸载会据此停下来等人拍板，而不是静默覆盖。
+if ($prevState -and $prevState.fileHashes) {
+    $d1 = Test-BaselineDrift $PromptTarget $prevState.fileHashes 'prompt'
+    if ($d1) {
+        [void]$Script:BaselineDrift.Add(($T.PromptName + ': ' + $d1))
+        Say 'WARN' ('目标文件在部署后被外部改动（基线漂移：' + $d1 + '）: ' + $PromptTarget + '（本次会重写注入段；标记块以外的内容按现有逻辑保留）')
+    }
+    if ($Target -eq 'dsh') {
+        $d2 = Test-BaselineDrift $PatchFile $prevState.fileHashes 'patch'
+        if ($d2) {
+            [void]$Script:BaselineDrift.Add(('cordis.patch.yml: ' + $d2))
+            Say 'WARN' ('home 级 patch 在部署后被外部改动（基线漂移：' + $d2 + '）: ' + $PatchFile)
+        }
+    }
 }
 
 # 技能呈现模式：未显式指定（auto）时沿用上次记录。
@@ -1464,6 +1548,9 @@ if (-not $NoSkills) {
 }
 $sourcePromptLeaf = (Split-Path -Leaf $SourcePrompt)
 if ($SkillsOnly -and $prevState -and $prevState.sourcePrompt) { $sourcePromptLeaf = [string]$prevState.sourcePrompt }
+# 回滚命令写进证据里：出事了不用猜怎么退回去（哈希表字面量里不放多行 if，先赋值）
+$rollbackCmd = 'inject.ps1 -Target ' + $Target + ' -Uninstall'
+if ($Script:BaselineDrift.Count -gt 0) { $rollbackCmd += ' -Force（当前有基线漂移，默认会被拦下）' }
 $state = [ordered]@{
     version             = $TOOL_VER
     target              = $Target
@@ -1495,6 +1582,20 @@ $state = [ordered]@{
     fileHashes          = [ordered]@{
         prompt = [ordered]@{ path = $PromptTarget; before = $promptBeforeHash; after = $promptAfterHash }
         patch  = [ordered]@{ path = $(if ($patchFileRel) { $PatchFile } else { $null }); before = $patchBeforeHash; after = $patchAfterHash }
+    }
+    # 证据记录：下次动手（重注入/卸载）前先拿这份哈希对一遍 ——
+    # fileHashes 只写不读就是死数据，接上消费方它才能拦住「静默覆盖用户改动」。
+    evidence            = [ordered]@{
+        object         = $PromptTarget
+        action         = 'deploy'
+        baselineSha256 = $promptAfterHash
+        baselineDrift  = @($Script:BaselineDrift)
+        verification   = @(
+            ('文件层：本文件写入前后 SHA-256 = ' + $(if ($promptBeforeHash) { $promptBeforeHash.Substring(0, 12) + '… -> ' } else { '(原不存在) -> ' }) + $promptAfterHash.Substring(0, 12) + '…'),
+            '标记层：托管标记块恒为 1 对（异常时 -RepairMarker 可修，不静默自愈）',
+            '人工层：模型侧未验证，需在新会话里确认客户端已加载（见 modelStatus）'
+        )
+        rollback       = $rollbackCmd
     }
 }
 Write-Utf8NoBom $StatePath (($state | ConvertTo-Json -Depth 5) + "`r`n")

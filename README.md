@@ -229,7 +229,17 @@ py -X utf8 skill_tool.py add D:\inbox\一批技能 --batch --category 逆向 / �
 py -X utf8 skill_tool.py register seagull-exploit --category 逆向 / 二进制
 py -X utf8 skill_tool.py new-category 内容创作 --when "写正文/小说/文案、时政历史梳理"
 py -X utf8 skill_tool.py remove my-old-skill --yes
+
+# 类目表不是手维护的：真源是每个技能自己 SKILL.md 里的声明
+#   metadata:
+#     x-pj-class: 逆向 / 二进制
+# add / register 会自动写入声明，gen 按声明重排类目表（加技能时不会漏登记）：
+py -X utf8 skill_tool.py gen --check     # 只读校验三方一致（frontmatter × 类目表 × 磁盘），不一致退出码 1
+py -X utf8 skill_tool.py gen             # 缺声明的从类目表回填，再按声明重排（已有顺序保留，新技能追加末尾）
 ```
+
+`gen` 不做语义猜测：技能没声明类目、声明的类目不存在、或类目表登记了磁盘上却没有的技能，
+一律停下报错（退出码 2）并且不动任何文件，不替你归类。
 
 校验规则（来自 Agent Skills 规范与 Pi 文档，不是自定）：
 
@@ -332,10 +342,17 @@ powershell -ExecutionPolicy Bypass -File inject.ps1 -Target pideck `
 # 卸载还原
 powershell -ExecutionPolicy Bypass -File inject.ps1 -Target pideck -Uninstall
 
+# 目标文件在部署后被外部改过（SHA-256 基线漂移）—— 卸载会停下等你拍板，
+# 退出码 3（本次没有写入任何文件）；确认要还原就加 -Force，
+# 被改过的内容会先另存到 %LOCALAPPDATA%\pi-workbench\backup\drift\<时间>-<目标>\
+powershell -ExecutionPolicy Bypass -File inject.ps1 -Target pideck -Uninstall -Force
+
 # 指令文件里标记块被外部编辑坏了（重复 / 顺序颠倒）时自动修：只保留最后一对
 # 不加这个开关时遇到损坏标记块默认报错退出，不会静默改动你的文件
 powershell -ExecutionPolicy Bypass -File inject.ps1 -Target pideck `
     -SourcePrompt prompts\_v52c-header.md -RepairMarker
+
+# 退出码：0 成功 ｜ 1 失败 / 自检有未通过项 ｜ 3 需人工确认（未写入任何文件）
 
 # 自定义配置根（沙箱测试用）
 powershell -ExecutionPolicy Bypass -File inject.ps1 -Target pideck -AgentDir D:\tmp\sandbox
@@ -431,6 +448,22 @@ pi-workbench/
 ## 更新记录
 
 **V1.2 · 2026-09-26**
+
+- **类目声明链路**（修「新增技能忘了登记 → 极简模式下落进『其他』」）：
+  - 类目表从「手维护」改成「生成物」：真源是每个技能 `SKILL.md` 的 `metadata.x-pj-class`
+    （Agent Skills 规范允许 `metadata` 放任意键值；纯追加式改写，不动既有字节）
+  - `skill_tool.py gen` 按声明重排类目表（已有顺序保留、新技能追加末尾）；
+    `gen --check` 只读校验 `frontmatter × 类目表 × 磁盘` 三方一致，可进 CI
+  - `add` / `register` 自动写入声明，`remove` 自动摘掉（`metadata` 块空了连块一起收）
+  - 脚本不做语义猜测：没声明 / 类目不存在 / 表里有磁盘没有 → 停下报错（退出码 2）且不动任何文件；
+    另外加了「一个声明都读不到就拒绝重写类目表」的防守，避免把表清空
+- **基线漂移拦截**（修「`fileHashes` 只写不读 = 死数据」）：
+  - 部署时拿上次 `state.fileHashes` 的 `after` 哈希与磁盘现状比对，不一致就告警并记进
+    `state.evidence.baselineDrift`（标记块以外的用户内容仍按原逻辑保留）
+  - **卸载时同一个比对变成拦截**：目标文件被外部改过 → 停下，退出码 **3**（本次未写入任何文件），
+    加 `-Force` 才继续，且先把被改过的内容另存到 `backup\drift\<时间>-<目标>\`
+  - `state.evidence` 补上 `object / action / baselineSha256 / baselineDrift / verification / rollback`，
+    出事不用猜怎么退回去（GUI 也认识退出码 3：弹出「强制卸载」确认，不再当成失败）
 
 - **写入安全加固**（无一项改变部署路径，全是新增校验）：
   - 目录穿越防护：从状态清单 / 配置拼出来的名字先过 `Resolve-Within`，跑出目标目录就拒写

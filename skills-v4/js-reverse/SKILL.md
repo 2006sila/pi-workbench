@@ -1,6 +1,8 @@
 ---
 name: js-reverse
 description: "JavaScript reverse engineering: obfuscation recovery, signature/HMAC location, browser environment patching, and frontend crypto extraction."
+metadata:
+  x-pj-class: 渗透 / 红队
 ---
 
 ---

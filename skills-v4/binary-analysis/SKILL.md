@@ -1,6 +1,8 @@
 ---
 name: binary-analysis
 description: Static binary reverse engineering, PE/ELF structural analysis, pattern scanning, disassembly, and binary patch generation.
+metadata:
+  x-pj-class: 逆向 / 二进制
 ---
 
 # Binary Analysis Skill

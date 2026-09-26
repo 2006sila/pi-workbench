@@ -9,6 +9,8 @@
 用法：
   py -X utf8 skill_tool.py check                    # 体检整个技能库（默认动作）
   py -X utf8 skill_tool.py list                     # 类目与登记情况
+  py -X utf8 skill_tool.py gen                      # 按技能自己的声明重排类目表（机械动作）
+  py -X utf8 skill_tool.py gen --check              # 只读校验三方一致（可进 CI）
   py -X utf8 skill_tool.py add <目录|zip> --category <类目> [--name X] [--desc X] [--dry-run] [--force]
   py -X utf8 skill_tool.py add --batch <目录> --category <类目> [--dry-run]
   py -X utf8 skill_tool.py register <技能名> --category <类目>    # 只改登记，不动文件
@@ -46,6 +48,11 @@ NAME_RE = re.compile(r'^[a-z0-9]+(-[a-z0-9]+)*$')
 # 项目自定阈值（不是规范，是提示词预算）
 DESC_WARN_HIGH = 200      # 完整模式下每条描述每轮都进系统提示词
 DESC_WARN_LOW = 15        # 太短则路由信息不足
+
+# 技能自己声明类目：写在 frontmatter 的 metadata 下（Agent Skills 规范允许
+# metadata 放任意键值），也兼容顶层同名键。这样「这个技能属于哪一类」跟着技能走，
+# 加技能时顺手写下，不用回头改 skill-categories.json —— 漏登记就是这么来的。
+CLASS_KEY = 'x-pj-class'
 
 
 # ---------------------------------------------------------------- 基础
@@ -96,6 +103,111 @@ def fm_keys(fm: str):
     return set(re.findall(r'^([A-Za-z][A-Za-z0-9_-]*):', fm or '', re.M))
 
 
+def _unquote(v: str) -> str:
+    v = (v or '').strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in ('"', "'"):
+        return v[1:-1]
+    return v
+
+
+def fm_meta(fm: str, key: str) -> str:
+    """读 metadata: 块下的子键（只支持块形式，不支持内联 {a: b}）。
+
+    注意行尾：技能库的 SKILL.md 是 CRLF，用 `^metadata:$` 配 re.M 会永远匹配不上
+    —— `$` 停在 `\n` 前，行尾那个 `\r` 就成了多余字符（踩过一次：声明全读成空，
+    gen 把类目表清空）。
+    """
+    if not fm:
+        return ''
+    m = re.search(r'^metadata:[ \t]*(?:\r?\n|$)', fm, re.M)
+    if not m:
+        return ''
+    for ln in fm[m.end():].splitlines():
+        if not re.match(r'^[ \t]+', ln):
+            break
+        mm = re.match(r'^[ \t]+' + re.escape(key) + r':[ \t]*(.*)$', ln)
+        if mm:
+            return _unquote(mm.group(1))
+    return ''
+
+
+def skill_class(fm: str) -> str:
+    """技能自己声明的类目：metadata.x-pj-class 优先，兼容顶层 x-pj-class。"""
+    return fm_meta(fm, CLASS_KEY) or fm_value(fm, CLASS_KEY)
+
+
+def set_skill_class(path: str, value: str = '', remove: bool = False) -> bool:
+    """在 SKILL.md frontmatter 里写入/更新/删除 metadata.x-pj-class。
+
+    纯追加式改写：只动 frontmatter 里与这个键相关的字节，其余字节（含 BOM、
+    正文、既有行尾）原样保留 —— 技能库是 git 内容，diff 越小越好审。
+    返回是否改动了文件。
+    """
+    with open(path, 'rb') as fh:
+        raw = fh.read()
+    bom = raw.startswith(b'\xef\xbb\xbf')
+    text = raw.decode('utf-8-sig')
+    m = re.match(r'^---[ \t]*(?:\r?\n)', text)
+    if not m:
+        return False
+    close = re.search(r'^---[ \t]*(?:\r?\n|$)', text[m.end():], re.M)
+    if not close:
+        return False
+    fm_start = m.end()
+    fm_end = m.end() + close.start()
+    fm = text[fm_start:fm_end]
+
+    child = re.compile(r'^([ \t]+)' + re.escape(CLASS_KEY) + r':[^\r\n]*(\r?\n|$)', re.M)
+    top = re.compile(r'^' + re.escape(CLASS_KEY) + r':[^\r\n]*(\r?\n|$)', re.M)
+    meta = re.search(r'^metadata:[ \t]*(?:\r?\n|$)', fm, re.M)
+
+    # 有两种写法：顶层 x-pj-class（旧）与 metadata 下（规范）。
+    # 哪个已存在就改哪个 —— 不把旧写法升级成新写法，避免留下两份。
+    if top.search(fm):
+        if remove:
+            new_fm = top.sub('', fm, count=1)
+        else:
+            new_fm = top.sub(lambda mm: CLASS_KEY + ': ' + value + (mm.group(1) or ''), fm, count=1)
+    elif child.search(fm):
+        if remove:
+            new_fm = child.sub('', fm, count=1)
+            # metadata 块被清空 → 连块一起收掉，别留空壳
+            mm = re.search(r'^metadata:[ \t]*(?:\r?\n|$)', new_fm, re.M)
+            if mm:
+                rest = new_fm[mm.end():]
+                kept = []
+                for ln in rest.splitlines(keepends=True):
+                    if re.match(r'^[ \t]+', ln):
+                        kept.append(ln)
+                    else:
+                        break
+                if not any(x.strip() for x in kept):
+                    new_fm = new_fm[:mm.start()] + rest[len(''.join(kept)):]
+        else:
+            new_fm = child.sub(lambda mm: mm.group(1) + CLASS_KEY + ': ' + value + (mm.group(2) or ''), fm, count=1)
+    elif remove:
+        return False
+    elif meta:
+        nl = '\r\n' if meta.group(0).endswith('\r\n') else '\n'
+        new_fm = fm[:meta.end()] + '  ' + CLASS_KEY + ': ' + value + nl + fm[meta.end():]
+    else:
+        nl = '\r\n' if '\r\n' in fm else '\n'
+        # 插在最后一行内容之后：先去掉末尾空行（frontmatter 结尾的空白无信息量），
+        # 再补一个换行把 metadata 块接上。
+        core = fm.rstrip()
+        new_fm = core + nl + 'metadata:' + nl + '  ' + CLASS_KEY + ': ' + value + nl
+
+    if new_fm == fm:
+        return False
+    out = text[:fm_start] + new_fm + text[fm_end:]
+    data = (b'\xef\xbb\xbf' if bom else b'') + out.encode('utf-8')
+    tmp = path + '.tmp'
+    with open(tmp, 'wb') as fh:
+        fh.write(data)
+    os.replace(tmp, path)
+    return True
+
+
 def load_cats():
     with open(CATS_PATH, encoding='utf-8') as fh:
         return json.load(fh)
@@ -144,6 +256,7 @@ def skill_info(name: str):
         'size': os.path.getsize(p),
         'name': fm_value(fm, 'name'),
         'desc': fm_value(fm, 'description'),
+        'class': skill_class(fm),
         'keys': fm_keys(fm),
         'text': text,
     }
@@ -326,6 +439,19 @@ def cmd_check(args):
     dangling = sorted(set(reg) - set(disk))
     if dangling:
         errors.append('登记了但磁盘没有：%s' % '、'.join(dangling))
+    # 技能自报类目（真源）↔ 类目表（生成物）
+    no_decl, off_decl = [], []
+    for name in disk:
+        dc = skill_info(name)['class']
+        if not dc:
+            no_decl.append(name)
+        elif name in reg and reg[name] != dc:
+            off_decl.append('%s（声明「%s」≠ 登记「%s」）' % (name, dc, reg[name]))
+    if no_decl:
+        warnings.append('未在 frontmatter 声明类目（metadata.x-pj-class，共 %d 个）：%s'
+                        % (len(no_decl), '、'.join(no_decl[:8]) + ('…' if len(no_decl) > 8 else '')))
+    if off_decl:
+        warnings.append('frontmatter 与类目表不一致，跑 gen 对齐：%s' % '；'.join(off_decl))
 
     # 链接可达性
     broken_detail = []
@@ -373,6 +499,124 @@ def cmd_check(args):
     print()
     print('结论：%s' % ('通过' if not errors else '有问题（%d 个错误）' % len(errors)))
     return 1 if errors else 0
+
+
+def cmd_gen(args):
+    """按技能自己声明的类目重排 skill-categories.json。
+
+    真源是 `skills-v4/<id>/SKILL.md` 的 metadata.x-pj-class；类目表是**生成物**。
+    已有类目的顺序与块位置保留，新技能追加到所属类目末尾 —— 不做字母重排，
+    免得每次生成都把人工挑过的顺序冲掉。
+    脚本不做语义猜测：声明缺失、类目不存在、登记了但磁盘没有，一律停下报，
+    不替你归类。
+    """
+    d = load_cats()
+    cat_names = [c['name'] for c in d['categories']]
+    disk = disk_skills()
+    json_map = registered(d)
+
+    declared = {n: skill_class(skill_info(n)['fm']) for n in disk}
+
+    # 可自动修复：frontmatter 没写，但类目表里已登记且类目有效 → 把登记回填进 frontmatter
+    backfill = sorted(n for n in disk if not declared[n] and json_map.get(n) in cat_names)
+    # 需人工：从没登记过
+    no_field = sorted(n for n in disk if not declared[n] and n not in json_map)
+    # 需人工：声明了不存在的类目
+    unknown = sorted((n, declared[n]) for n in disk if declared[n] and declared[n] not in cat_names)
+    # 需人工：类目表登记了，磁盘上没这个技能
+    dangling = sorted(set(json_map) - set(disk))
+    # frontmatter 与类目表声明不一致（以 frontmatter 为准）
+    mismatch = sorted((n, declared[n], json_map[n]) for n in disk
+                      if declared[n] and n in json_map and json_map[n] != declared[n])
+
+    block = bool(no_field or unknown or dangling)
+    drift = bool(block or mismatch or backfill)
+
+    print('扫描 %s ｜ 磁盘 %d 个技能 ｜ 类目表 %d 个类目／已登记 %d 个'
+          % (os.path.relpath(SKILLS_DIR, ROOT), len(disk), len(cat_names), len(json_map)))
+    print()
+    print('  已声明类目          %d' % sum(1 for n in disk if declared[n]))
+    print('  可回填（表里有登记）  %d' % len(backfill))
+    print('  从未登记            %d' % len(no_field))
+    print('  声明了不存在的类目    %d' % len(unknown))
+    print('  表里有但磁盘没有      %d' % len(dangling))
+    print('  两边声明不一致        %d' % len(mismatch))
+    if backfill:
+        print()
+        print('── 可从类目表回填 ──')
+        for n in backfill:
+            print('  %s → %s' % (n, json_map[n]))
+    for label, items in (('从未登记（先决定它属于哪类）', no_field),
+                         ('声明了类目表里没有的类目', unknown),
+                         ('类目表里登记了但磁盘没有', dangling),
+                         ('frontmatter 与类目表不一致（以 frontmatter 为准）', mismatch)):
+        if items:
+            print()
+            print('── %s ──' % label)
+            for it in items:
+                print('  %s' % ('、'.join(str(x) for x in it) if isinstance(it, tuple) else it))
+
+    if args.check:
+        print()
+        if block:
+            print('结论：有问题，需人工处置（脚本不猜类目）')
+            return 1
+        if drift:
+            print('结论：能自动对齐，跑 `py -X utf8 skill_tool.py gen` 即可')
+            return 1
+        print('结论：三方一致（frontmatter × 类目表 × 磁盘）')
+        return 0
+
+    if block:
+        print()
+        print('✗ 不动文件。先处置上面的条目：')
+        if no_field:
+            print('   · 给技能写入声明（或直接登记）：')
+            print('     py -X utf8 skill_tool.py register %s --category "<类目>"' % no_field[0])
+        if unknown:
+            print('   · 类目不存在：改 frontmatter，或先 new-category 建类目')
+        if dangling:
+            print('   · 表里有磁盘没有：技能改名/删除后忘了同步，用 remove 或手改类目表')
+        return 2
+
+    # 回填 + 重排
+    filled = 0
+    for n in backfill:
+        if set_skill_class(os.path.join(SKILLS_DIR, n, 'SKILL.md'), json_map[n]):
+            declared[n] = json_map[n]
+            filled += 1
+    want = {}
+    for n in disk:
+        if declared[n]:
+            want.setdefault(declared[n], []).append(n)
+    # 防守：一个声明都读不到却要重写类目表 → 一定会把表清空。宁可停下。
+    if disk and not want:
+        print()
+        print('✗ 读不到任何技能类目声明，拒绝重写类目表（会把它清空）。')
+        print('  先查 skills-v4/*/SKILL.md 的 frontmatter 是否被改坏。')
+        return 2
+
+    changed = []
+    for c in d['categories']:
+        cur = [m for m in c.get('modules', []) if m in want.get(c['name'], [])]
+        new = [m for m in want.get(c['name'], []) if m not in cur]
+        mods = cur + new
+        if c.get('modules') != mods:
+            c['modules'] = mods
+            changed.append((c['name'], len(mods)))
+
+    if filled or changed:
+        save_cats(d)
+    print()
+    if filled:
+        print('已回填 frontmatter 声明 %d 个技能' % filled)
+    for name, n in changed:
+        print('类目表已同步：「%s」%d 个' % (name, n))
+    if not filled and not changed:
+        print('无需改动。')
+    else:
+        print('提醒：技能库是 git 内容，记得提交。')
+    return 0
 
 
 def _find_skill_root(base: str):
@@ -436,6 +680,8 @@ def _install_one(src: str, category: str, name_override: str, desc_override: str
     if os.path.exists(dest):
         shutil.rmtree(dest)
     shutil.copytree(root, dest)
+    # 声明写回技能自己身上（类目表是生成物，真源在 SKILL.md）
+    set_skill_class(os.path.join(dest, 'SKILL.md'), category)
     print('  ✓ %s' % name)
     for x in info[1:]:
         print('    %s' % x)
@@ -497,7 +743,7 @@ def cmd_add(args):
             save_cats(cats)
             print()
             print('已登记到「%s」：%s' % (args.category, '、'.join(added)))
-            print('提醒：技能库是 git 内容，记得提交；极简模式的菜单在部署时生成，无需重建。')
+            print('提醒：技能库是 git 内容，记得提交；类目表已同步（frontmatter 也写了声明）。')
         elif added:
             print()
             print('[dry-run] 未落库、未登记。去掉 --dry-run 执行。')
@@ -525,8 +771,10 @@ def cmd_register(args):
                 c['modules'].remove(nm)
         if nm not in target['modules']:
             target['modules'].append(nm)
+        # 声明写回技能自己身上
+        set_skill_class(os.path.join(SKILLS_DIR, nm, 'SKILL.md'), args.category)
     save_cats(cats)
-    print('已登记 %d 个到「%s」' % (len(args.skill), args.category))
+    print('已登记 %d 个到「%s」（frontmatter 声明已同步）' % (len(args.skill), args.category))
     return 0
 
 
@@ -549,6 +797,7 @@ def cmd_remove(args):
         for c in cats['categories']:
             if nm in c.get('modules', []):
                 c['modules'].remove(nm)
+        set_skill_class(os.path.join(REMOVED_DIR, nm, 'SKILL.md'), remove=True)
         print('已移出：%s → skills-v4/_removed/%s' % (nm, nm))
     save_cats(cats)
     print('类目表已同步。记得提交 git。')
@@ -580,6 +829,10 @@ def main():
 
     p = sub.add_parser('list', help='类目与登记情况')
     p.set_defaults(func=cmd_list)
+
+    p = sub.add_parser('gen', help='按技能声明的类目重排/校验类目表')
+    p.add_argument('--check', action='store_true', help='只读校验三方一致（不一致退出码 1）')
+    p.set_defaults(func=cmd_gen)
 
     p = sub.add_parser('add', help='加技能（目录或 zip）')
     p.add_argument('source', nargs='?', help='技能目录或 zip；--batch 时是父目录')

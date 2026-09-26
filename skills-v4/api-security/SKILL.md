@@ -1,6 +1,8 @@
 ---
 name: api-security
 description: "API security testing for REST/GraphQL/WebSocket/SOAP: discovery, authz, BOLA/IDOR, JWT/OAuth, rate-limit, and CI-oriented validation workflows."
+metadata:
+  x-pj-class: 渗透 / 红队
 ---
 
 # API 安全测试

@@ -1,6 +1,8 @@
 ---
 name: game-hacking-techniques
 description: Guide for game-hacking technique taxonomy and threat modeling relevant to game security. Use this skill when researching memory access, code injection, overlays, input simulation, engine-specific attack surfaces, or how modern anti-cheat systems constrain user-mode, kernel-mode, hypervisor, and DMA-based cheat implementations.
+metadata:
+  x-pj-class: 游戏安全
 ---
 
 # Game Hacking Techniques

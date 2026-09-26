@@ -1,6 +1,8 @@
 ---
 name: code-quality-gate
 description: "工程自检评分门禁（Quality Gate）。对一个代码改动/功能交付做 9 维是/否自检 + 扣分项 + 10 分制评分，≥7 分通过，输出结构化报告（得分/扣分记录/未证明项/结论+下一步）。触发：自检、质量门禁、scorecard、quality gate、交付前检查、屎山自检、帮我评分。"
+metadata:
+  x-pj-class: 工程交付
 ---
 
 # Code Quality Gate · 工程自检评分门禁

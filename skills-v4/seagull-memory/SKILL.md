@@ -12,6 +12,8 @@ triggers:
   - Volatility
   - 堆分析
   - 内存扫描
+metadata:
+  x-pj-class: 样本 / 情报
 ---
 
 # Seagull Memory

@@ -10,6 +10,8 @@ triggers:
   - 游戏防护
   - 完整性校验
   - 遥测分析
+metadata:
+  x-pj-class: 游戏安全
 ---
 
 # Seagull Game Security

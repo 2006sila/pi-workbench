@@ -1,6 +1,8 @@
 ---
 name: protocol-reversing
 description: Network traffic dissection, Protobuf wire format parsing, TLV binary packet analysis, and API simulation.
+metadata:
+  x-pj-class: 逆向 / 二进制
 ---
 
 # Protocol Reversing Skill

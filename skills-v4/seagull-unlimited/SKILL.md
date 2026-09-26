@@ -17,6 +17,8 @@ triggers:
   - CTF红队覆盖
   - 红队模式
   - CTF全局
+metadata:
+  x-pj-class: 工作流与元技能
 ---
 
 # 海鸥全域专家模式

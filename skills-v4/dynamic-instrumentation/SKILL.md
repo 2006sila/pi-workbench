@@ -1,6 +1,8 @@
 ---
 name: dynamic-instrumentation
 description: Frida dynamic hooking, memory patching, API parameter tracing, and anti-debug bypass script generation.
+metadata:
+  x-pj-class: 逆向 / 二进制
 ---
 
 # Dynamic Instrumentation Skill

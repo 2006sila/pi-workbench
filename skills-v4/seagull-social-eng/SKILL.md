@@ -14,6 +14,8 @@ triggers:
   - 暴露面
   - brand monitoring
   - credential audit
+metadata:
+  x-pj-class: 渗透 / 红队
 ---
 
 # Seagull Social-Eng

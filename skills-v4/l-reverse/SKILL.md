@@ -1,6 +1,8 @@
 ---
 name: l-reverse
 description: "MUST on 逆向/脱壳/反编译/Frida/IDA/PE/APK/Hook/协议/微信小程序. Surface→deep→reproduce. Evidence E#."
+metadata:
+  x-pj-class: 逆向 / 二进制
 ---
 
 # l-reverse · 通用逆向

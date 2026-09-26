@@ -1,6 +1,8 @@
 ---
 name: attack-chain
 description: "Multi-stage attack-path orchestration for CTF/red-team lab chains: recon to foothold to privilege to lateral to evidence packaging."
+metadata:
+  x-pj-class: 渗透 / 红队
 ---
 
 # Attack Chain Orchestration Skill

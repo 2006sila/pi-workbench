@@ -10,6 +10,8 @@ triggers:
   - 取证
   - evidence
   - 案例管理
+metadata:
+  x-pj-class: 样本 / 情报
 ---
 
 # Seagull Lab

@@ -18,6 +18,8 @@ triggers:
   - HWID
   - 驱动读写
   - 注入过检
+metadata:
+  x-pj-class: 游戏安全
 ---
 
 # Seagull Anti-Cheat Force-Start

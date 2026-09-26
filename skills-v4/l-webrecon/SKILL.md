@@ -1,6 +1,8 @@
 ---
 name: l-webrecon
 description: "MUST on 搞一下/弄一下/看看/渗透/测安全/注入/加管理员 + URL. Plain speech OK. Real curl first. No fake output. Local twin for inject lab."
+metadata:
+  x-pj-class: 渗透 / 红队
 ---
 
 # l-webrecon

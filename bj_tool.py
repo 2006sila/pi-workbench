@@ -3067,6 +3067,8 @@ class MainWindow(FramelessWindow):
         tail = runner.tail() if runner is not None else []
         self._log_line('')
         self._log_line('退出码: ' + str(code))
+        if code == 3:
+            self._log_line('（退出码 3 = 需要你确认：本次没有写入任何文件）')
         ms = read_model_status(getattr(self, '_cur_target_key', ''))
         if ms:
             self._log_line('· ' + ms)
@@ -3177,15 +3179,42 @@ class MainWindow(FramelessWindow):
             '确认卸载 ' + target['card'] + ' 的注入？\n\n'
             '· 从 ' + prompt_name(target) + ' 摘除本工具管理段，有备份则还原\n'
             '· 只删除状态清单里记录的本工具技能\n'
-            '· 客户端自带技能与用户同名技能不受影响\n\n'
+            '· 客户端自带技能与用户同名技能不受影响\n'
+            '· 若目标文件在部署后被外部改过，会先停下让你确认（不静默覆盖）\n\n'
             '注意：卸载后需重启客户端才生效。',
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if ans != QMessageBox.Yes:
             return
 
+        def force():
+            def done2(code2, tail2):
+                if code2 == 0:
+                    self._set_status(target['card'] + ' 已强制卸载（被改过的文件已另存到备份区）', 'ok')
+                else:
+                    self._set_status(target['card'] + ' 强制卸载失败，见日志', 'error')
+                self.switch_page(3)
+            self._enqueue(['-Target', target['key'], '-Uninstall', '-Force'],
+                          '强制卸载 ' + target['card'], done2,
+                          kind='卸载', target_card=target['card'])
+
         def done(code, tail):
             if code == 0:
                 self._set_status(target['card'] + ' 卸载完成', 'ok')
+            elif code == 3:
+                # 退出码 3 = 注入器发现目标文件被外部改过，停下来等人拍板。
+                # 直接还原会把用户手写的内容覆盖掉，所以默认由用户决定。
+                drift = [str(x) for x in (tail or []) if ('漂移' in str(x) or '外部改动' in str(x))]
+                self._set_status(target['card'] + ' 卸载已暂停：目标文件被外部改过', 'warn')
+                msg = '卸载被拦下了。\n\n'
+                if drift:
+                    msg += (drift[-1][:400] + '\n\n')
+                msg += ('目标文件在部署之后被外部改动过，直接还原会把这些改动覆盖掉。\n'
+                        '继续卸载会先把改动另存到备份区（backup\\drift\\…）。\n\n'
+                        '要强制卸载吗？')
+                if QMessageBox.question(self, APP_NAME, msg,
+                                        QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes:
+                    force()
+                    return
             else:
                 self._set_status(target['card'] + ' 卸载失败，见日志', 'error')
             self.switch_page(3)

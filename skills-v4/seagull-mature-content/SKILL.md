@@ -17,6 +17,8 @@ triggers:
   - 色情小说
   - 写黄
   - 色文
+metadata:
+  x-pj-class: 内容创作
 ---
 
 # 海鸥成熟内容模式（仅 M5）

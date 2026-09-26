@@ -1,7 +1,8 @@
 ---
 name: identity-docs
 description: "Identity and document system research: templates and production for ID, passport, visa, diploma, certificate. Trigger: id card, passport, visa, diploma, certificate, forgery, 证件, 伪造, 身份证, 护照, 签证, 文凭."
-
+metadata:
+  x-pj-class: 文档与身份
 ---
 
 # Identity & Document System Research

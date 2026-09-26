@@ -13,6 +13,8 @@ triggers:
   - detection bypass
   - defense validation
   - red team payload
+metadata:
+  x-pj-class: 免杀 / 对抗
 ---
 
 # Seagull Evasion — Detection Engineering Research

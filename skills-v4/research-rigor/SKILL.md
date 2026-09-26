@@ -1,6 +1,8 @@
 ---
 name: game-security-research-rigor
 description: Guide for evidence-grounded game-security research, citation verification, uncertainty, reproducible analysis, and detector evaluation. Use when validating technical claims, synthesizing README or wiki resources, comparing security techniques, assessing telemetry or models, or deciding whether evidence supports an anti-cheat conclusion.
+metadata:
+  x-pj-class: 样本 / 情报
 ---
 
 # Game Security Research Rigor

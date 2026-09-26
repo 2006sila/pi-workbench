@@ -17,6 +17,8 @@ triggers:
   - 星穹铁道
   - game redteam
   - anti-cheat bypass
+metadata:
+  x-pj-class: 游戏安全
 ---
 
 # Seagull Game Red-Team

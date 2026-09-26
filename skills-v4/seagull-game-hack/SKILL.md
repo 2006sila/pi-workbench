@@ -15,6 +15,8 @@ triggers:
   - 游戏逆向
   - game mod
   - 游戏研究
+metadata:
+  x-pj-class: 游戏安全
 ---
 
 # Seagull Game Hack

@@ -5,6 +5,7 @@ license: MIT
 compatibility: Requires a filesystem-based code agent or CLI with shell access, Python 3, and internet access for tool installation.
 allowed-tools: Bash Read Write Edit Glob Grep Task WebFetch WebSearch
 metadata:
+  x-pj-class: 逆向 / 二进制
   user-invocable: "false"
 ---
 

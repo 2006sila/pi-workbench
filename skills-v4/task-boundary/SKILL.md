@@ -1,6 +1,8 @@
 ---
 name: task-boundary
 description: "任务边界守卫（Stop That Shit 规则层）。防止 AI 干活时的四类反模式：范围膨胀、无用防御、意图越界、任务打转。干活前声明任务模式（review 只读 / change 授权内修改），干活中按 Stop Ladder 五级判断，发现多余动作即停。触发：review、只读检查、别多干、不要重构、scope creep、任务越界、防跑偏。"
+metadata:
+  x-pj-class: 工程交付
 ---
 
 # Task Boundary · 任务边界守卫

@@ -1,6 +1,8 @@
 ---
 name: game-engine-resources
 description: Guide for game-engine internals, source trees, plugins, and engine-specific security research. Use this skill when researching Unreal, Unity, Source, Godot, custom engines, engine detectors, engine explorers, or engine protection patterns relevant to modding, reverse engineering, and anti-cheat.
+metadata:
+  x-pj-class: 游戏安全
 ---
 
 # Game Engine Development Resources
