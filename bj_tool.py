@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
 APP_NAME = 'pi用学习工作台'
 APP_SUBTITLE = 'PiDeck / DeepSeek Harness 一键部署 · 注入即用 · 卸载即还原'
 APP_VERSION = 'V1.2'
-APP_BUILD = '2026-09-26 · v1.2 极简模式'
+APP_BUILD = '2026-09-26 · v1.2 极简模式 + 三步部署'
 
 _ACTIVE_WINDOW = None
 _THEME_FILTER = None      # 系统主题监听器：必须持引用，否则可能被 GC 后悬垂
@@ -1277,11 +1277,14 @@ class TargetCard(QFrame):
         self._addon_lbl.setText('<span style="color:' + C['TEXT_SECONDARY'] + ';">附加包：</span>'
                                 + '　'.join(parts))
 
-    def update_state(self, installed, version_label):
+    def update_state(self, installed, version_label, skill_mode=None):
         self._refresh_addons()
+        mode_txt = ''
+        if installed and skill_mode in ('full', 'menu'):
+            mode_txt = ' · ' + ('极简模式' if skill_mode == 'menu' else '完整模式')
         if installed:
             self._chip.set_state('已注入', C['SUCCESS'])
-            self._st.setText('已部署 · ' + (version_label or ''))
+            self._st.setText('已部署 · ' + (version_label or '') + mode_txt)
             _set_px_font(self._st, 11)
             self._st.setStyleSheet('color: ' + C['SUCCESS'] + ';')
             self._tpl.setText('当前模板：' + (version_label or '—'))
@@ -1418,7 +1421,7 @@ class HomePage(Page):
 # ------------------------------------------------------------------ 模板页
 
 class TemplatePage(Page):
-    """左分组 tab + 右模板卡网格。"""
+    """部署流程：① 选客户端 → ② 选模式 → ③ 选模板（卡片上单一「部署」按钮）。"""
     def __init__(self, main, parent=None):
         super().__init__(parent)
         self.main = main
@@ -1427,26 +1430,34 @@ class TemplatePage(Page):
         # 是已销毁的 C++ 对象，isChecked() 会抛 RuntimeError。
         self._addon_picked = {}
         self._addon_checks = {}
+        # 部署设置：客户端 + 技能呈现模式（记在配置里，下次打开沿用）
+        cfg = read_app_config()
+        self._sel_target = cfg.get('deployTarget') if cfg.get('deployTarget') in ('pideck', 'dsh') else 'pideck'
+        self._sel_mode = cfg.get('deployMode') if cfg.get('deployMode') in ('full', 'menu') else 'full'
+        self._cur_group = 0          # 当前分组下标；-1 表示在附加模板页
         outer = QVBoxLayout(self)
         outer.setContentsMargins(28, 24, 28, 20)
-        outer.setSpacing(16)
+        outer.setSpacing(14)
 
         hdr = QHBoxLayout()
         col = QVBoxLayout()
         col.setSpacing(2)
         t = _mk_label('模板库', 21, 'TEXT_PRIMARY', bold=True)
         col.addWidget(t)
-        s = _mk_label('按目标模型分组 · 点卡片上的端按钮即注入（含 ' + str(bundle_skill_count())
-                      + ' 个模块技能库）', 12, 'TEXT_SECONDARY', bold=False)
+        s = _mk_label('按目标模型分组 · 先选客户端与模式，再点卡片上的部署（含 '
+                      + str(bundle_skill_count()) + ' 个模块技能库）', 12, 'TEXT_SECONDARY', bold=False)
         col.addWidget(s)
         hdr.addLayout(col)
         hdr.addStretch(1)
         b_reinject = QPushButton('重新注入全部（按上次模板）')
         b_reinject.setStyleSheet(_btn_style('ghost'))
         b_reinject.setFixedHeight(34)
+        b_reinject.setCursor(Qt.PointingHandCursor)
         b_reinject.clicked.connect(self.main._reinject)
         hdr.addWidget(b_reinject)
         outer.addLayout(hdr)
+
+        outer.addWidget(self._build_setup_bar())
 
         body = QHBoxLayout()
         body.setSpacing(16)
@@ -1521,9 +1532,131 @@ class TemplatePage(Page):
         self._grid_frames = []
         self.select_group(0)
 
+    # ---------------------------------------------------------- 部署设置（客户端 / 模式）
+
+    def _seg_btn(self, text, checked=False):
+        b = QPushButton(text)
+        b.setCheckable(True)
+        b.setChecked(checked)
+        _set_px_font(b, 12, bold=True)
+        b.setFixedHeight(30)
+        b.setCursor(Qt.PointingHandCursor)
+        b.setStyleSheet(
+            'QPushButton { background: transparent; color: ' + C['TEXT_SECONDARY'] + ';'
+            ' border: 1px solid ' + C['BORDER'] + '; border-radius: 7px; padding: 0 14px; }'
+            'QPushButton:hover { border-color: ' + C['ACCENT'] + '; color: ' + C['TEXT_PRIMARY'] + '; }'
+            'QPushButton:checked { background: ' + C['ACCENT'] + '; color: #FFFFFF;'
+            ' border-color: ' + C['ACCENT'] + '; }')
+        return b
+
+    def _build_setup_bar(self):
+        """① 客户端 + ② 技能呈现模式：两排分段选择，带一行效果说明。"""
+        bar = QFrame()
+        bar.setObjectName('SettingCard')
+        bar.setStyleSheet(
+            'QFrame#SettingCard { background: ' + C['CARD_BG'] + '; border: 1px solid ' + C['BORDER']
+            + '; border-radius: 12px; }')
+        lay = QVBoxLayout(bar)
+        lay.setContentsMargins(16, 12, 16, 12)
+        lay.setSpacing(9)
+
+        # ① 客户端
+        r1 = QHBoxLayout()
+        r1.setSpacing(10)
+        lb1 = _mk_label('① 客户端', 12, 'TEXT_SECONDARY', bold=True)
+        lb1.setFixedWidth(72)
+        r1.addWidget(lb1)
+        self._tgt_btns = {}
+        self._tgt_group = QButtonGroup(self)
+        self._tgt_group.setExclusive(True)
+        for tg in TARGETS:
+            b = self._seg_btn(tg['card'], tg['key'] == self._sel_target)
+            b.clicked.connect(lambda _=False, k=tg['key']: self._set_target(k))
+            self._tgt_group.addButton(b)
+            self._tgt_btns[tg['key']] = b
+            r1.addWidget(b)
+        r1.addStretch(1)
+        self._tgt_path = _mk_label('', 11, 'TEXT_MUTED', bold=False)
+        r1.addWidget(self._tgt_path)
+        lay.addLayout(r1)
+
+        # ② 模式
+        r2 = QHBoxLayout()
+        r2.setSpacing(10)
+        lb2 = _mk_label('② 模式', 12, 'TEXT_SECONDARY', bold=True)
+        lb2.setFixedWidth(72)
+        r2.addWidget(lb2)
+        self._mode_btns = {}
+        self._mode_group = QButtonGroup(self)
+        self._mode_group.setExclusive(True)
+        for key, label in (('full', '完整模式'), ('menu', '极简模式')):
+            b = self._seg_btn(label, key == self._sel_mode)
+            b.clicked.connect(lambda _=False, k=key: self._set_mode(k))
+            self._mode_group.addButton(b)
+            self._mode_btns[key] = b
+            r2.addWidget(b)
+        r2.addStretch(1)
+        self._mode_hint = _mk_label('', 11, 'TEXT_MUTED', bold=False)
+        r2.addWidget(self._mode_hint)
+        lay.addLayout(r2)
+
+        self._refresh_setup()
+        return bar
+
+    def _refresh_setup(self):
+        tg = next(t for t in TARGETS if t['key'] == self._sel_target)
+        self._tgt_path.setText('配置根 ' + resolve_agent_dir(tg))
+        if self._sel_mode == 'menu':
+            self._mode_hint.setText('只 1 个菜单技能进系统提示词（每轮 ≈90 tokens），'
+                                    '65 个模块按需读取')
+        else:
+            self._mode_hint.setText('65 个模块全进系统提示词（每轮 ≈7,000 tokens），'
+                                    'AI 按描述自选')
+
+    def _set_target(self, key):
+        self._sel_target = key
+        write_app_config('deployTarget', key)
+        for k, b in self._tgt_btns.items():
+            b.setChecked(k == key)      # 程序化调用也要同步分段按钮
+        self._refresh_setup()
+        self._rerender()
+
+    def _set_mode(self, key):
+        self._sel_mode = key
+        write_app_config('deployMode', key)
+        for k, b in self._mode_btns.items():
+            b.setChecked(k == key)
+        self._refresh_setup()
+        self._rerender()
+
+    def _rerender(self):
+        """换客户端/模式后重建当前视图（卡片上的按钮文字与说明跟着变）"""
+        if self._cur_group < 0:
+            self.select_addons()
+        else:
+            self.select_group(self._cur_group)
+
+    def _target_card(self):
+        return next(t for t in TARGETS if t['key'] == self._sel_target)['card']
+
+    def _mode_label(self):
+        return '极简模式' if self._sel_mode == 'menu' else '完整模式'
+
+    def _target_obj(self):
+        return next(t for t in TARGETS if t['key'] == self._sel_target)
+
+    def _deploy_template(self, key, name, no_skills):
+        mode = self._sel_mode
+        if no_skills:
+            mode = 'full'        # 精简模板不含技能库，模式不生效
+        self.main._run_install(self._target_obj(), key, name, no_skills,
+                               addon_keys=self.main._picked_addons(), skill_mode=mode)
+
     def select_group(self, gi):
+        self._cur_group = gi
         for i, b in enumerate(self._group_btns):
             b.setChecked(i == gi)
+        self._addon_btn.setChecked(False)
         grp = MODEL_GROUPS[gi]
         self._note.setText('『' + grp['label'] + '』 ' + grp['note'])
         # 清空旧卡
@@ -1543,6 +1676,7 @@ class TemplatePage(Page):
         self._cards_area.addStretch(1)
 
     def select_addons(self):
+        self._cur_group = -1
         self._addon_btn.setChecked(True)
         for b in self._group_btns:
             b.setChecked(False)
@@ -1572,7 +1706,7 @@ class TemplatePage(Page):
         head = QHBoxLayout()
         ht = _mk_label('部署', 13, 'TEXT_PRIMARY', bold=True)
         head.addWidget(ht)
-        hint = _mk_label('勾选上方技能包后，按端操作', 11, 'TEXT_MUTED', bold=False)
+        hint = _mk_label('勾选上方技能包后，按上面选定的客户端操作', 11, 'TEXT_MUTED', bold=False)
         head.addWidget(hint)
         head.addStretch(1)
         ov.addLayout(head)
@@ -1582,33 +1716,33 @@ class TemplatePage(Page):
         line.setStyleSheet('background: ' + C['BORDER_LIGHT'] + '; border: none;')
         ov.addWidget(line)
 
-        for tg in TARGETS:
-            row = QHBoxLayout()
-            row.setSpacing(10)
-            end_lbl = _mk_label(tg['card'], 13, 'TEXT_PRIMARY', bold=True)
-            end_lbl.setFixedWidth(130)
-            row.addWidget(end_lbl)
-            b_dep = QPushButton('部署勾选包')
-            b_dep.setStyleSheet(_btn_style('primary'))
-            b_dep.setFixedHeight(32)
-            b_dep.setFixedWidth(120)
-            b_dep.setCursor(Qt.PointingHandCursor)
-            b_dep.clicked.connect(lambda _=False, k=tg['key']: self._deploy_addons(k))
-            row.addWidget(b_dep)
-            b_rm = QPushButton('移除勾选包')
-            b_rm.setStyleSheet(_btn_style('ghost'))
-            b_rm.setFixedHeight(32)
-            b_rm.setCursor(Qt.PointingHandCursor)
-            b_rm.clicked.connect(lambda _=False, k=tg['key']: self._remove_addons(k))
-            row.addWidget(b_rm)
-            hint2 = _mk_label('部署 = 只装技能；移除 = 只删这些包', 11, 'TEXT_MUTED', bold=False)
-            row.addWidget(hint2)
-            row.addStretch(1)
-            ov.addLayout(row)
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        dest = _mk_label('→ ' + self._target_card() + ' · ' + self._mode_label(),
+                         12, 'TEXT_PRIMARY', bold=True)
+        dest.setFixedWidth(240)
+        row.addWidget(dest)
+        b_dep = QPushButton('部署勾选包')
+        b_dep.setStyleSheet(_btn_style('primary'))
+        b_dep.setFixedHeight(32)
+        b_dep.setFixedWidth(120)
+        b_dep.setCursor(Qt.PointingHandCursor)
+        b_dep.clicked.connect(self._deploy_addons)
+        row.addWidget(b_dep)
+        b_rm = QPushButton('移除勾选包')
+        b_rm.setStyleSheet(_btn_style('ghost'))
+        b_rm.setFixedHeight(32)
+        b_rm.setCursor(Qt.PointingHandCursor)
+        b_rm.clicked.connect(self._remove_addons)
+        row.addWidget(b_rm)
+        hint2 = _mk_label('部署 = 只装技能（沿用已部署的模式）；移除 = 只删这些包', 11, 'TEXT_MUTED', bold=False)
+        row.addWidget(hint2)
+        row.addStretch(1)
+        ov.addLayout(row)
 
         self._cards_area.addWidget(ops)
 
-        tip = QLabel('提示：与指令集模板一起打 → 勾选后在左侧选模型分组，点模板卡上的端按钮。')
+        tip = QLabel('提示：与指令集模板一起打 → 勾选后回左侧选模型分组，点卡片上的部署按钮（同样遵循上面选的客户端与模式）。')
         tip.setWordWrap(True)
         _set_px_font(tip, 11)
         tip.setStyleSheet('color: ' + C['TEXT_MUTED'] + '; padding: 2px 2px;')
@@ -1631,7 +1765,7 @@ class TemplatePage(Page):
         self._addon_picked[key] = bool(on)
         self._addon_card_style(card, on)
 
-    def _remove_addons(self, target_key):
+    def _remove_addons(self):
         picked = self._addon_selected()
         if not picked:
             QMessageBox.information(self, APP_NAME, '先勾选要移除的附加技能包。')
@@ -1640,22 +1774,20 @@ class TemplatePage(Page):
         names = ' + '.join(a['name'] for a in ADDONS if a['key'] in picked)
         ans = QMessageBox.question(
             self, APP_NAME,
-            '从 ' + ('PiDeck' if target_key == 'pideck' else 'DeepSeek Harness')
-            + ' 移除：' + names + '？\n\n只移除这些技能包，不影响指令集与其它技能。',
+            '从 ' + self._target_card() + ' 移除：' + names + '？\n\n只移除这些技能包，不影响指令集与其它技能。',
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if ans != QMessageBox.Yes:
             return
-        self.main._remove_addons(next(t for t in TARGETS if t['key'] == target_key), dirs, names)
+        self.main._remove_addons(self._target_obj(), dirs, names)
 
-    def _deploy_addons(self, target_key):
+    def _deploy_addons(self):
         picked = self._addon_selected()
         if not picked:
             QMessageBox.information(self, APP_NAME, '先勾选至少一个附加技能包。')
             return
         dirs = ';'.join(a['skill_dir'] for a in ADDONS if a['key'] in picked)
         names = ' + '.join(a['name'] for a in ADDONS if a['key'] in picked)
-        tg = next(t for t in TARGETS if t['key'] == target_key)
-        self.main._run_skills_only(tg, dirs, names)
+        self.main._run_skills_only(self._target_obj(), dirs, names, skill_mode=self._sel_mode)
 
     def _make_addon_card(self, a):
         card = QFrame()
@@ -1742,19 +1874,19 @@ class TemplatePage(Page):
         d.setStyleSheet('color: ' + C['TEXT_SECONDARY'] + ';')
         lay.addWidget(d, 1)
 
+        if no_skills:
+            eff = _mk_label('本模板不含技能库（呈现模式不生效）', 11, 'WARN', bold=False)
+            lay.addWidget(eff)
+
         btns = QHBoxLayout()
         btns.setSpacing(8)
-        lab = _mk_label('部署到：', 12, 'TEXT_MUTED', bold=False)
-        btns.addWidget(lab)
+        b = QPushButton('部署到 ' + self._target_card())
+        b.setStyleSheet(_btn_style('primary'))
+        b.setFixedHeight(34)
+        b.setCursor(Qt.PointingHandCursor)
+        b.clicked.connect(lambda _=False, k=key, l=name, ns=no_skills: self._deploy_template(k, l, ns))
+        btns.addWidget(b)
         btns.addStretch(1)
-        for tg in TARGETS:
-            b = QPushButton(tg['card'])
-            b.setStyleSheet(_btn_style('ghost') if tg['key'] != 'pideck' else _btn_style('primary'))
-            b.setFixedHeight(32)
-            b.setCursor(Qt.PointingHandCursor)
-            b.clicked.connect(lambda _=False, k=key, l=name, ns=no_skills, t=tg:
-                              self.main._run_install(t, k, l, ns, addon_keys=self.main._picked_addons()))
-            btns.addWidget(b)
         lay.addLayout(btns)
         return card
 
@@ -1947,6 +2079,9 @@ class SkillsPage(Page):
         _base, act, dis = self._dirs()
         st = read_json(state_path(TARGETS[self._target_index]['key']))
         ours = set(st.get('installedSkills') or []) if st else set()
+        mode_txt = ''
+        if st and st.get('skillMode') in ('full', 'menu'):
+            mode_txt = ' · ' + ('极简模式' if st['skillMode'] == 'menu' else '完整模式')
         rows = []
         for prefix, state in ((act, '启用'), (dis, '已禁用')):
             if not os.path.isdir(prefix):
@@ -1976,7 +2111,8 @@ class SkillsPage(Page):
             item.setForeground(QColor(C['SUCCESS'] if state == '启用' else C['WARN']))
             self._table.setItem(r, 2, item)
             self._table.setItem(r, 3, QTableWidgetItem(size))
-        self._stat.setText(TARGETS[self._target_index]['card'] + ' · 共 ' + str(len(rows)) + ' 个技能')
+        self._stat.setText(TARGETS[self._target_index]['card'] + ' · 共 ' + str(len(rows)) + ' 个技能'
+                           + mode_txt)
 
     def on_enter(self):
         self._reload()
@@ -2721,6 +2857,10 @@ class MainWindow(FramelessWindow):
             page.on_enter()
 
     def go_deploy(self, target):
+        """首页点某端的「去部署」：切到模板页，并把那里的① 客户端选中该端（保持一致）"""
+        page = self.page_tpl
+        if getattr(page, '_sel_target', None) != target['key']:
+            page._set_target(target['key'])
         self.switch_page(1)
 
     def _picked_addons(self):
@@ -2809,9 +2949,10 @@ class MainWindow(FramelessWindow):
         for target in TARGETS:
             st = read_json(state_path(target['key']))
             ver = st.get('versionLabel') if st else None
+            mode = st.get('skillMode') if st else None
             installed = bool(st)
             any_installed = any_installed or installed
-            self.page_home.cards[target['key']].update_state(installed, ver)
+            self.page_home.cards[target['key']].update_state(installed, ver, mode)
         if self._busy:
             self.page_home._chip_all.set_state('任务执行中…', C['WARN'])
         elif any_installed:
@@ -2891,16 +3032,21 @@ class MainWindow(FramelessWindow):
 
     # ---------------------------------------------------------- 动作
 
-    def _run_install(self, target, version_key, version_label, no_skills, label=None, addon_keys=None):
+    def _run_install(self, target, version_key, version_label, no_skills, label=None, addon_keys=None,
+                     skill_mode='full'):
         prompt = ensure_prompt(version_key)
         args = ['-Target', target['key'], '-SourcePrompt', prompt]
+        mode_note = ''
         if no_skills:
             args.append('-NoSkills')
-        elif addon_keys:
-            # 指令集模板 + 附加技能包：主库 + 附加包目录一起部署
-            dirs = ['skills-v4']
-            dirs += [a['skill_dir'] for a in ADDONS if a['key'] in addon_keys]
-            args += ['-SkillsSource', ';'.join(dirs)]
+        else:
+            if addon_keys:
+                # 指令集模板 + 附加技能包：主库 + 附加包目录一起部署
+                dirs = ['skills-v4']
+                dirs += [a['skill_dir'] for a in ADDONS if a['key'] in addon_keys]
+                args += ['-SkillsSource', ';'.join(dirs)]
+            args += ['-SkillMode', skill_mode]
+            mode_note = ' · ' + ('极简模式' if skill_mode == 'menu' else '完整模式')
 
         def done(code, tail):
             if code == 0:
@@ -2910,7 +3056,7 @@ class MainWindow(FramelessWindow):
                 self._set_status(target['card'] + ' 注入失败，见日志', 'error')
                 self.switch_page(3)
 
-        self._enqueue(args, label or ('注入 ' + target['card'] + ' · ' + version_label), done,
+        self._enqueue(args, label or ('注入 ' + target['card'] + ' · ' + version_label + mode_note), done,
                       kind='注入', target_card=target['card'])
 
     def _remove_addons(self, target, skill_dirs, names):
@@ -2928,9 +3074,11 @@ class MainWindow(FramelessWindow):
         self._enqueue(args, '移除附加包 ' + names + ' <- ' + target['card'], done,
                       kind='卸载', target_card=target['card'])
 
-    def _run_skills_only(self, target, skills_dirs, names):
-        """只部署附加技能包，不动指令集（需先注入过任一指令集模板）。"""
-        args = ['-Target', target['key'], '-SkillsOnly', '-SkillsSource', skills_dirs]
+    def _run_skills_only(self, target, skills_dirs, names, skill_mode='auto'):
+        """只部署附加技能包，不动指令集（需先注入过任一指令集模板）。
+        skill_mode=auto 时沿用目标端上次记录的模式。"""
+        args = ['-Target', target['key'], '-SkillsOnly', '-SkillsSource', skills_dirs,
+                '-SkillMode', skill_mode]
 
         def done(code, tail):
             if code == 0:
@@ -2953,7 +3101,8 @@ class MainWindow(FramelessWindow):
                 target, key,
                 (st.get('versionLabel') or 'V5') + '（自动重注入）',
                 not st.get('installedSkills'),
-                label='自动注入 ' + target['card'])
+                label='自动注入 ' + target['card'],
+                skill_mode=(st.get('skillMode') or 'full'))
 
     def _reinject(self):
         todo = [(t, read_json(state_path(t['key']))) for t in TARGETS]
@@ -2966,7 +3115,8 @@ class MainWindow(FramelessWindow):
             self._run_install(target, key,
                               (st.get('versionLabel') or 'V5') + ' 重新注入',
                               not st.get('installedSkills'),
-                              label='重新注入 ' + target['card'])
+                              label='重新注入 ' + target['card'],
+                              skill_mode=(st.get('skillMode') or 'full'))
 
     def _uninstall(self, target):
         ans = QMessageBox.question(
