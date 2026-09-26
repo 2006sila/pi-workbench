@@ -23,7 +23,11 @@ param(
     # menu 模式下仍要保持「进提示词」的技能（分号分隔）。
     # 用于附属模板这类**行为纪律型**技能：它们靠描述自动触发才有意义，
     # 藏进菜单后就只能「被想起来才用」。
-    [string]$MenuKeepAdvertised
+    [string]$MenuKeepAdvertised,
+
+    # 指令文件里出现重复/顺序颠倒的标记块时，默认报错退出（不猜、不静默改动用户文件）。
+    # 加这个开关则自动只保留最后一对完整标记块。
+    [switch]$RepairMarker
 )
 
 Set-StrictMode -Off
@@ -118,15 +122,36 @@ function Say([string]$Level, [string]$Message) {
     [void]$Script:Report.Add($line)
 }
 
+function SayHost([string]$Level, [string]$Message) {
+    # 与 Say 相同，但走 Write-Host：只上屏，不进管道。
+    # 必须用在「有返回值的函数」内部 —— PowerShell 函数会把管道输出一并返回，
+    # 在里面调 Say 会让调用方拿到 @(消息, 真值)，再被 [string] 强转成
+    # 「消息 值」这种非法路径（实际坑过一次：agentDir 是 junction 时
+    # ReadAllBytes 报「不支持给定路径的格式」）。
+    # Write-Host 不进管道，但仍会进子进程 stdout，GUI 日志照常能看到。
+    $line = '[' + $Level + '] ' + $Message
+    Write-Host $line
+    [void]$Script:Report.Add($line)
+}
+
 function Fail([string]$Message) { Say 'ERROR' $Message; Finish 'FAIL'; exit 1 }
 
 function Finish([string]$Status) {
+    # 明确写出「这步没有任何东西验证过模型侧」——
+    # 文件写对了不等于客户端已加载、更不等于已生效。
+    # 把这句话做成数据字段（而不是只写在文档里），GUI 就能把它显示在日志里。
+    $modelStatus = if ($Status -eq 'OK') {
+        '未验证：文件已写入，但不代表客户端已加载或已生效；重启客户端后需在新会话里确认'
+    } else {
+        '未验证：本次未正常完成（' + $Status + '），不要当作已生效'
+    }
     $payload = [ordered]@{
         status    = $Status
         target    = $Target
         toolVersion = $TOOL_VER
         agentDir  = $T.AgentDir
         lines     = @($Script:Report)
+        modelStatus = $modelStatus
         finishedAt = (Get-Date).ToString('o')
     }
     try {
@@ -138,8 +163,127 @@ function Finish([string]$Status) {
     Write-Output ('RESULT: ' + $Status)
 }
 
-function Read-Utf8([string]$Path) {
-    return [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8)
+$Script:MaxReadBytes = 8388608   # 8 MB：超过这个体积的文本文件基本可判定为损坏
+$Script:LinkWarned   = $false
+
+function Test-OwnFile([string]$Path) {
+    # 是不是本工具自带的文件（在安装目录内）。自带文件才做严格校验 ——
+    # 用户自己的文件用宽松读法，见 Read-Utf8 的说明。
+    try {
+        $b = [System.IO.Path]::GetFullPath($Base).TrimEnd([char]92, [char]47) + [System.IO.Path]::DirectorySeparatorChar
+        return [System.IO.Path]::GetFullPath($Path).StartsWith($b, [System.StringComparison]::OrdinalIgnoreCase)
+    } catch { return $false }
+}
+
+function Get-LinkKind([string]$Path) {
+    # 返回链接类型：'' 普通 / 'HardLink' / 'SymbolicLink' / 'Junction'
+    # PowerShell 5.1 的 FileSystem provider 在 FileSystemInfo 上补了 LinkType；
+    # ReparsePoint 属性同时覆盖符号链接与目录联接。硬链接的 LinkType 是 'HardLink'，
+    # 所以无需 P/Invoke 就能看出 nlink > 1。
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if (-not $item) { return '' }
+    $kind = ''
+    try { $kind = [string]$item.LinkType } catch { $kind = '' }
+    if ($kind) { return $kind }
+    try {
+        if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { return 'ReparsePoint' }
+    } catch { }
+    return ''
+}
+
+function Resolve-Within([string]$Root, [string]$Child) {
+    # 把子路径拼到 Root 下，并确认结果没有跑出 Root。
+    # 拼进来的名字可能来自状态清单 / 配置文件（附加包名、技能目录名），
+    # 含 .. 或写成绝对路径就会把写入带出目标目录。
+    # 不用 [System.IO.Path]::GetRelativePath —— 那是 .NET Core 2.1+ 的 API，
+    # 本脚本跑在 Windows PowerShell 5.1（.NET Framework）上没有。
+    $rootFull = [System.IO.Path]::GetFullPath($Root).TrimEnd([char]92, [char]47)
+    $cand = if ([System.IO.Path]::IsPathRooted($Child)) {
+        [System.IO.Path]::GetFullPath($Child)
+    } else {
+        [System.IO.Path]::GetFullPath((Join-Path $rootFull $Child))
+    }
+    $prefix = $rootFull + [System.IO.Path]::DirectorySeparatorChar
+    if (-not $cand.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+        # 走 Fail 而不是 throw：统一输出 [ERROR] 行 + RESULT: FAIL，
+        # 而不是 PowerShell 的原始错误堆栈（GUI 日志里前者能读，后者一片腥。
+        Fail ('路径超出目标目录，已拒绝写入: ' + $cand)
+    }
+    return $cand
+}
+
+function Assert-Writable([string]$Root, [string]$Child) {
+    # 写入前检查，返回可用的绝对路径。
+    #  · Root 以内（含目标本身）任一层是链接 → 拒绝：写入会穿透到链接指向的位置，
+    #    删除/回滚时也会改错文件。
+    #  · Root 自身及更上层是链接（用户把 ~/.pi 用 mklink /J 联接到别的盘）→ 放行，
+    #    只提示一次：这类目录重定向是用户的合法做法，拦下来会让工具直接用不了。
+    $rootFull = [System.IO.Path]::GetFullPath($Root).TrimEnd([char]92, [char]47)
+    $full = Resolve-Within $rootFull $Child
+    $at = $full
+    while ($at -ne $rootFull) {
+        $kind = Get-LinkKind $at
+        if ($kind) { Fail ('写入路径上有链接（' + $kind + '），已拒绝以免写到别处: ' + $at) }
+        $parent = [System.IO.Path]::GetDirectoryName($at)
+        if ([string]::IsNullOrEmpty($parent) -or $parent -eq $at) { break }
+        $at = $parent
+    }
+    if (-not $Script:LinkWarned) {
+        $hits = @()
+        $up = $rootFull
+        while ($true) {
+            $kind = Get-LinkKind $up
+            if ($kind) { $hits += ($up + '（' + $kind + '）') }
+            $parent = [System.IO.Path]::GetDirectoryName($up)
+            if ([string]::IsNullOrEmpty($parent) -or $parent -eq $up) { break }
+            $up = $parent
+        }
+        if ($hits.Count -gt 0) {
+            $Script:LinkWarned = $true
+            SayHost 'WARN' ('目标目录路径上有链接（用户目录重定向），写入会落在链接指向的真实位置：' + ($hits -join '；'))
+        }
+    }
+    return $full
+}
+
+function Get-Sha256([byte[]]$Bytes) {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return ([System.BitConverter]::ToString($sha.ComputeHash($Bytes)) -replace '-', '').ToLowerInvariant()
+    } finally { $sha.Dispose() }
+}
+
+function Test-SameContent([string]$Path, [byte[]]$Bytes) {
+    # 落盘前比对：内容一致就不重复写（幂等短路）。
+    if (-not (Test-Path -LiteralPath $Path)) { return $false }
+    try {
+        if ((Get-Item -LiteralPath $Path -Force).Length -ne $Bytes.Length) { return $false }
+        return (Get-Sha256 ([System.IO.File]::ReadAllBytes($Path)) -eq (Get-Sha256 $Bytes))
+    } catch { return $false }
+}
+
+function Read-Utf8([string]$Path, [switch]$Strict) {
+    # $Strict 用于本工具自带的文件（技能库、模板）：非法 UTF-8 或体积异常 → 报错。
+    # 用户自己的文件走宽松读法 —— 老记事本存成 ANSI/GBK 的文件现在能装（只是可能乱码），
+    # 加严格校验后会直接装不上，那不是本工具该替用户做的决定。
+    if ([string]::IsNullOrEmpty($Path)) { return '' }
+    $fi = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if ($fi -and $fi.Length -gt $Script:MaxReadBytes) {
+        if ($Strict) { Fail ('文件超过 8 MB，疑似损坏，已拒绝读取: ' + $Path) }
+        # 本函数有返回值，所以用 SayHost（见 SayHost 处的说明）
+        SayHost 'WARN' ('文件超过 8 MB，仍按文本读取: ' + $Path)
+    }
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    if ($Strict) {
+        try { return (New-Object System.Text.UTF8Encoding($false, $true)).GetString($bytes) }
+        catch { Fail ('文件不是合法 UTF-8（疑似曾以 ANSI/GBK 保存过）: ' + $Path) }
+    }
+    return [System.Text.Encoding]::UTF8.GetString($bytes)
+}
+
+function Read-Own([string]$Path) {
+    # 自带文件读，自动判严格模式（在安装目录内就严格）
+    return (Read-Utf8 $Path -Strict:(Test-OwnFile $Path))
 }
 
 function Write-Utf8NoBom([string]$Path, [string]$Text) {
@@ -151,6 +295,51 @@ function Write-Utf8NoBom([string]$Path, [string]$Text) {
 function Copy-Tree([string]$Src, [string]$Dest) {
     robocopy $Src $Dest /E /MT:16 /R:1 /W:1 /NFL /NDL /NJH /NJS /NC /NS /NP | Out-Null
     if ($LASTEXITCODE -ge 8) { throw ("robocopy failed rc=" + $LASTEXITCODE + " for " + $Src) }
+}
+
+function Get-MarkerCounts([string]$Text) {
+    if ([string]::IsNullOrEmpty($Text)) { return @(0, 0) }
+    $b = ([regex]::Matches($Text, [regex]::Escape($MARK_BEG))).Count
+    $e = ([regex]::Matches($Text, [regex]::Escape($MARK_END))).Count
+    return @($b, $e)
+}
+
+function Repair-MarkerBlocks([string]$Text) {
+    # 只保留最后一对完整标记块（最后一对是最近写入的），其余标记全部清掉。
+    $pat = '(?s)' + [regex]::Escape($MARK_BEG) + '.*?' + [regex]::Escape($MARK_END)
+    $all = [regex]::Matches($Text, $pat)
+    $keep = ''
+    if ($all.Count -gt 0) { $keep = $all[$all.Count - 1].Value }
+    $rest = [regex]::Replace($Text, $pat, '')
+    # 清掉落单的标记（不成对的）
+    $rest = [regex]::Replace($rest, [regex]::Escape($MARK_BEG), '')
+    $rest = [regex]::Replace($rest, [regex]::Escape($MARK_END), '')
+    $rest = $rest.TrimEnd()
+    if ([string]::IsNullOrEmpty($keep)) { return $rest }
+    if ([string]::IsNullOrEmpty($rest)) { return $keep }
+    return ($rest + "`r`n`r`n" + $keep)
+}
+
+function Assert-MarkerIntegrity([string]$Text, [switch]$Repair) {
+    # 标记块的重复 / 顺序颠倒一律不静默处理。
+    # 旧写法用非贪婪正则直接替换：重复标记时会删掉第一对、留下第二对，
+    # 看起来「自愈」了，实际上把用户文件改成了他没预期的样子。
+    $c = Get-MarkerCounts $Text
+    $b = $c[0]; $e = $c[1]
+    if ($b -eq 0 -and $e -eq 0) { return $Text }
+    if ($b -eq 1 -and $e -eq 1) {
+        if ($Text.IndexOf($MARK_END) -lt $Text.IndexOf($MARK_BEG)) {
+            if ($Repair) { return (Repair-MarkerBlocks $Text) }
+            Fail ('指令文件里标记块顺序颠倒（结束标记在开始标记之前），疑似被外部编辑过。' + "`r`n" +
+                   '  文件: ' + $PromptTarget + "`r`n" +
+                   '  处理: 备份该文件后运行 `inject.ps1 -Target ' + $Target + ' -RepairMarker` 自动修复')
+        }
+        return $Text
+    }
+    if ($Repair) { return (Repair-MarkerBlocks $Text) }
+    Fail ('指令文件里标记块不完整：' + $b + ' 个开始标记 / ' + $e + ' 个结束标记（应为 0 或 1 对）。' + "`r`n" +
+           '  文件: ' + $PromptTarget + "`r`n" +
+           '  处理: 先备份，再运行 `inject.ps1 -Target ' + $Target + ' -RepairMarker` 只保留最后一对')
 }
 
 function Strip-MarkerBlock([string]$Text) {
@@ -398,7 +587,7 @@ function New-SkillMenu {
     [void]$sb.Append("## 模块清单`r`n")
     [void]$sb.Append(($lines -join "`r`n"))
     [void]$sb.Append("`r`n")
-    $menuDir = Join-Path $Target $MenuName
+    $menuDir = Assert-Writable $Target $MenuName
     New-Item -ItemType Directory -Force -Path $menuDir | Out-Null
     [System.IO.File]::WriteAllText((Join-Path $menuDir 'SKILL.md'), $sb.ToString(), $Utf8NoBom)
     return $one.Count
@@ -497,6 +686,12 @@ $PromptTarget = Join-Path $T.AgentDir $T.PromptName
 $SkillsTarget = Join-Path $T.AgentDir 'skills'
 # DSH 的 home 级 patch 层（提高 agent-instructions 的 maxBytes 预算）
 $PatchFile = Join-Path $T.AgentDir 'cordis.patch.yml'
+
+# 写入路径预检：目录穿越 + 链接。三个主目标先过一遍（技能子目录在写入时再逐个检），
+# 这样问题在动手写文件之前就暴露，而不是写到一半才报错。
+$PromptTarget = Assert-Writable $T.AgentDir $PromptTarget
+$SkillsTarget = Assert-Writable $T.AgentDir $SkillsTarget
+$PatchFile    = Assert-Writable $T.AgentDir $PatchFile
 
 # agent-instructions 的 maxBytes 默认预算（来自 dsh-base 的 cordis.patch.yml）
 $DshDefaultBudget = 65536
@@ -672,7 +867,7 @@ if ($RemoveAddons) {
         if ([string]::IsNullOrWhiteSpace($name)) { continue }
         $name = $name.Trim()
         $removeNames += $name
-        $dest = Join-Path $SkillsTarget $name
+        $dest = Assert-Writable $SkillsTarget $name
         if (Test-Path -LiteralPath $dest) {
             Remove-Item -LiteralPath $dest -Recurse -Force -ErrorAction SilentlyContinue
             $removed += $name
@@ -782,7 +977,7 @@ if ($Uninstall) {
     $removed = 0
     if ($state -and $state.installedSkills) {
         foreach ($n in $state.installedSkills) {
-            $dest = Join-Path $SkillsTarget $n
+            $dest = Assert-Writable $SkillsTarget $n
             $overwrittenBackup = $null
             if ($state.overwrittenSkills -and $state.overwrittenSkills.$n) {
                 $overwrittenBackup = [string]$state.overwrittenSkills.$n
@@ -876,6 +1071,16 @@ $budgetVal     = $null
 $budgetSrcVal  = $null
 $currentText   = ''
 if ($hadPromptFile) { $currentText = Read-Utf8 $PromptTarget }
+# 标记块健康检查。默认只报错不改文件 —— 用户文件里出现重复/颠倒的标记，
+# 说明上一次写入被中断或被外部编辑过，静默自愈会把文件改成用户没预期的样子。
+if ($hadPromptFile -and $currentText) {
+    $markFixed = Assert-MarkerIntegrity $currentText -Repair:$RepairMarker
+    if ($RepairMarker -and $markFixed -ne $currentText) {
+        $currentText = $markFixed
+        Write-Utf8NoBom $PromptTarget $currentText
+        Say 'WARN' ('检测到标记块异常，已按 -RepairMarker 修复（只保留最后一对）: ' + $PromptTarget)
+    }
+}
 
 if ($prevState -and $prevState.promptBackup -and (Test-Path -LiteralPath $prevState.promptBackup)) {
     # 重复注入：沿用第一次的原始备份，不覆盖
@@ -903,7 +1108,7 @@ if ($SkillsOnly) {
     }
 } else {
 $baseText    = Strip-MarkerBlock $currentText
-$promptBody  = Read-Utf8 $SourcePrompt
+$promptBody  = Read-Own $SourcePrompt
 # 极简模式：模块技能不进系统提示词，全靠菜单技能带路。
 # 只在菜单描述里写领域词还不够（那只是一条可选的技能描述），这里在
 # APPEND_SYSTEM.md（系统级、每轮都在、优先级高于技能描述）里再硬性说一句。
@@ -920,8 +1125,16 @@ if ($SkillMode -eq 'menu') {
 }
 $block       = $MARK_BEG + "`r`n" + $promptBody.TrimEnd() + $routeNote + "`r`n" + $MARK_END
 $newText     = ($baseText.TrimEnd() + "`r`n`r`n" + $block + "`r`n").TrimStart()
-Write-Utf8NoBom $PromptTarget $newText
-Say 'INFO' ('已写入指令集: ' + $PromptTarget + '（' + $promptBody.Length + ' 字符，版本 ' + $VersionLabel + '，模式 ' + $SkillMode + '）')
+# 幂等短路：内容已经就是目标状态就不重写（按字节比较，BOM 与行尾也算在内）。
+# 旧写法每次重注入都整文件重写一遍，即使内容一模一样。
+$newBytes    = [System.Text.Encoding]::UTF8.GetBytes($newText)
+$promptFull  = Assert-Writable $T.AgentDir $PromptTarget
+if (Test-SameContent $promptFull $newBytes) {
+    Say 'INFO' ('指令集已是目标内容，未重复写入: ' + $promptFull + '（版本 ' + $VersionLabel + '，模式 ' + $SkillMode + '）')
+} else {
+    Write-Utf8NoBom $promptFull $newText
+    Say 'INFO' ('已写入指令集: ' + $promptFull + '（' + $promptBody.Length + ' 字符，版本 ' + $VersionLabel + '，模式 ' + $SkillMode + '）')
+}
 }
 
 # 1b) DSH：home 级 patch 层提高 agent-instructions 的 maxBytes 预算。
@@ -1011,7 +1224,7 @@ if ($NoSkills) {
         $dirs = @($dirs | Where-Object { if ($seen.ContainsKey($_.Name)) { $false } else { $seen[$_.Name] = $true; $true } })
         if (-not (Test-Path -LiteralPath $SkillsTarget)) { New-Item -ItemType Directory -Force -Path $SkillsTarget | Out-Null }
         foreach ($d in $dirs) {
-            $dest = Join-Path $SkillsTarget $d.Name
+            $dest = Assert-Writable $SkillsTarget $d.Name
             if (Test-Path -LiteralPath $dest) {
                 $alreadyOurs = $false
                 if ($prevState -and $prevState.installedSkills -and ($prevState.installedSkills -contains $d.Name)) { $alreadyOurs = $true }

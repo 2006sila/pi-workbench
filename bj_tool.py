@@ -471,6 +471,26 @@ def state_path(target_key):
     return os.path.join(work_root(), 'state', target_key + '.json')
 
 
+def last_run_path(target_key):
+    return os.path.join(work_root(), 'last-run-' + target_key + '.json')
+
+
+def read_model_status(target_key):
+    """读 inject.ps1 落盘的 last-run JSON 里的 modelStatus。
+
+    inject.ps1 会显式写出「本工具只处理文件，不代表客户端已加载或已生效」。
+    这句话要落在界面上给人看到，而不是只留在文档里当承诺。
+    """
+    if not target_key:
+        return ''
+    try:
+        with open(last_run_path(target_key), 'r', encoding='utf-8') as fh:
+            data = json.load(fh) or {}
+        return str(data.get('modelStatus') or '')
+    except Exception:
+        return ''
+
+
 def tool_config_path():
     return os.path.join(work_root(), 'tool-config.json')
 
@@ -3012,6 +3032,12 @@ class MainWindow(FramelessWindow):
             return
         self._cur_kind = kind
         self._cur_target = target_card
+        self._cur_target_key = ''
+        try:
+            if '-Target' in args:
+                self._cur_target_key = args[args.index('-Target') + 1]
+        except Exception:
+            self._cur_target_key = ''
         script = _res('inject.ps1')
         if not os.path.exists(script):
             self._set_status('找不到 inject.ps1', 'error')
@@ -3041,6 +3067,9 @@ class MainWindow(FramelessWindow):
         tail = runner.tail() if runner is not None else []
         self._log_line('')
         self._log_line('退出码: ' + str(code))
+        ms = read_model_status(getattr(self, '_cur_target_key', ''))
+        if ms:
+            self._log_line('· ' + ms)
         self._busy = False
         self._refresh_status()
         history_add(self._cur_kind, self._cur_target, label, code == 0)

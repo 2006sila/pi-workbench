@@ -332,6 +332,11 @@ powershell -ExecutionPolicy Bypass -File inject.ps1 -Target pideck `
 # 卸载还原
 powershell -ExecutionPolicy Bypass -File inject.ps1 -Target pideck -Uninstall
 
+# 指令文件里标记块被外部编辑坏了（重复 / 顺序颠倒）时自动修：只保留最后一对
+# 不加这个开关时遇到损坏标记块默认报错退出，不会静默改动你的文件
+powershell -ExecutionPolicy Bypass -File inject.ps1 -Target pideck `
+    -SourcePrompt prompts\_v52c-header.md -RepairMarker
+
 # 自定义配置根（沙箱测试用）
 powershell -ExecutionPolicy Bypass -File inject.ps1 -Target pideck -AgentDir D:\tmp\sandbox
 ```
@@ -398,6 +403,21 @@ pi-workbench/
 
 ---
 
+## 边界说明
+
+工具只做文件层的事，这几条是它的能力边界，不是免责声明：
+
+- **不向任何模型发请求**。注入全程是本地文件读写，没有联网，不上传任何内容
+- **文件写对了 ≠ 已生效**。注入完成后需要重启客户端、在新会话里验证；每次运行结束时工具会
+  在日志里打出一行「未验证：文件已写入，但不代表客户端已加载或已生效」，这句话同时写在结果 JSON 里
+- **不保证效果**。提示词与技能能不能让某个模型变好，取决于模型版本、服务端策略与会话上下文；
+  本项目不预填成功率、不给效果承诺
+- **技能库是资料不是保证**。65 个模块是整理收集的领域参考，内容对不对、能不能用，需要使用者自己判断
+- **不替代判断**。模板里的纪律段（不猜、不编造、不冒充已完成）是写给 AI 看的约束，
+  实际会不会遵守由模型决定，工具无法强制
+
+---
+
 ## 已知限制
 
 - **仅 Windows**：注入器是 PowerShell，窗口缩放用 `WM_NCHITTEST`，开机自启用注册表 `Run` 项
@@ -412,6 +432,23 @@ pi-workbench/
 
 **V1.2 · 2026-09-26**
 
+- **写入安全加固**（无一项改变部署路径，全是新增校验）：
+  - 目录穿越防护：从状态清单 / 配置拼出来的名字先过 `Resolve-Within`，跑出目标目录就拒写
+  - 链接检测：写入路径内部出现 symlink / junction / 硬链接时拒写（写到别处、回滚改错文件都是从这里来的）；
+    目标目录自身或上层是链接（用户用 `mklink /J` 把 `~/.pi` 联到别的盘）只警告不拦
+  - 严格 UTF-8 + 8 MB 上限：只对工具自带的技能库与模板启用（这些必须干净）；
+    用户自己的文件保持宽松读取，避免老记事本存成 ANSI/GBK 的文件一升级就装不上
+  - **标记块损坏不再静默自愈**：指令文件里出现重复 / 顺序颠倒的标记块时默认报错退出，
+    错误信息里给出修复命令；加 `-RepairMarker` 才自动只保留最后一对
+  - **幂等短路**：指令文件内容已是目标状态就跳过重写（按字节比较，BOM 与行尾算在内）
+  - 结果 JSON 新增 `modelStatus`：每次运行结束都明写「文件已写入，但不代表客户端已加载或已生效」，
+    并在界面日志里显示
+- **术语归一化补表扩充**（`prompts/_ext-subst.md`，仅增强版模板）：新增三步 ——
+  先洗口去填充词 → 错字按同音归位 → 表里没有时按材料兜底（二进制 / 网址 / 纯文字三类），
+  并明写「不要回头问『你指的是哪个』」
+- **skill_tool.py 新增防串稿检查**：description 或正文与别的技能完全一致时报警
+  （用块标量感知的解析读取，避开 `description: |` 被读成 `|` 的误判）
+- **README 新增「边界说明」节**：不联网、不保证效果、不预填成功率、文件写对 ≠ 已生效
 - **新增 skill_tool.py（技能库维护工具）**：add / remove / register / new-category / list / check
   - 校验按 Agent Skills 规范与 Pi 文档：frontmatter、name 字符集与长度、description ≤1024、重名
   - 加技能时报「每轮多少 tokens」并预览菜单行；落库目录名自动规范成 frontmatter 的 name

@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -295,6 +296,29 @@ def cmd_check(args):
         if k and len(v) > 1:
             errors.append('声明的 name 重复：%s → %s' % (k, '、'.join(v)))
 
+    # 防串稿：description / 正文都不应该与别的技能完全一致。
+    # 两份说明一样时模型无法判断该用哪个，正文一样说明是复制来没改写。
+    # 用 skill_info 的 desc（已经走 fm_value，支持 | / > 块标量）——
+    # 裸正则会把块标量技能的 description 读成「|」，于是全被误判成重复。
+    # 这两项只算提示：同域多技能边界相近难免，拦下来会逼人把描述改差。
+    by_desc, by_body = {}, {}
+    for name in disk:
+        i = skill_info(name)
+        desc = (i['desc'] or '').strip()
+        if desc:
+            by_desc.setdefault(desc, []).append(name)
+        body = (i['body'] or '').strip()
+        if body:
+            norm = re.sub(r'\s+', ' ', body)
+            by_body.setdefault(hashlib.sha256(norm.encode('utf-8')).hexdigest(), []).append(name)
+    for desc, names in by_desc.items():
+        if len(names) > 1:
+            warnings.append('description 与其它技能重复：%s → 「%s」；模型无法区分，建议写明各自边界'
+                            % ('、'.join(names), desc[:48]))
+    for names in by_body.values():
+        if len(names) > 1:
+            warnings.append('正文与其它技能完全一致：%s → 疑似复制未改写' % '、'.join(names))
+
     # 登记情况
     unreg = sorted(set(disk) - set(reg))
     if unreg:
@@ -318,6 +342,9 @@ def cmd_check(args):
     print('  description 存在且 ≤%d     %s' % (DESC_MAX, '✓' if not any('description' in e for e in errors) else '✗'))
     print('  frontmatter 完整           %s' % ('✓' if not any('frontmatter' in e for e in errors) else '✗'))
     print('  登记与磁盘一致             %s' % ('✓' if not dangling else '✗'))
+    dup_n = sum(1 for x in warnings
+                if x.startswith('description 与其它技能重复') or x.startswith('正文与其它技能完全一致'))
+    print('  description / 正文不串稿   %s' % ('✓' if not dup_n else '⚠ %d 组' % dup_n))
     print()
     print('── 提示词预算 ──')
     print('  描述合计 %.0f tokens／每轮（完整模式：65 条全进系统提示词）' % total_desc_tokens)
