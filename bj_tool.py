@@ -2400,12 +2400,27 @@ class VersionsDialog(QDialog):
         b_refresh.setFixedHeight(34)
         b_refresh.clicked.connect(self.refresh)
         row.addWidget(b_refresh)
+        b_diff = QPushButton('看差异')
+        b_diff.setStyleSheet(_btn_style('ghost'))
+        b_diff.setFixedHeight(34)
+        b_diff.setCursor(Qt.PointingHandCursor)
+        b_diff.clicked.connect(self.show_diff)
+        row.addWidget(b_diff)
         b_restore = QPushButton('恢复选中版本')
         b_restore.setStyleSheet(_btn_style('primary'))
         b_restore.setFixedHeight(34)
         b_restore.clicked.connect(self._restore_selected)
         row.addWidget(b_restore)
         lay.addLayout(row)
+        # 差异面板（默认收起）：恢复前先看清楚会改哪几行
+        self.diff = QPlainTextEdit()
+        self.diff.setReadOnly(True)
+        self.diff.setMinimumHeight(200)
+        self.diff.setStyleSheet('QPlainTextEdit { background: ' + C['LOG_BG'] + '; border: 1px solid '
+                                + C['BORDER'] + '; border-radius: 10px; padding: 8px; color: '
+                                + C['LOG_FG'] + '; font-family: Consolas, monospace; font-size: 12px; }')
+        self.diff.setVisible(False)
+        lay.addWidget(self.diff, 2)
         self.reload()
 
     def _path(self):
@@ -2436,6 +2451,39 @@ class VersionsDialog(QDialog):
             self.main._set_status('版本列表已刷新（退出码 %d）' % code, 'ok' if code == 0 else 'warn')
         self.main._enqueue(['-Target', self.target['key'], '-ListVersions', '-Json'],
                            '读版本列表 ' + self.target['card'], done,
+                           kind='操作', target_card=self.target['card'])
+
+    def show_diff(self):
+        """看差异：-Diff 只读输出「当前 → 恢复后」，不写任何目标文件。"""
+        it = self.list.currentItem()
+        if it is None:
+            self.hint.setText('先选一条版本记录')
+            return
+        vid = str(it.data(0x0100) or '')
+        out = os.path.join(work_root(), 'diff-' + self.target['key'] + '.txt')
+        try:
+            os.remove(out)
+        except OSError:
+            pass
+
+        def done(code, tail):
+            if not os.path.exists(out):
+                self.hint.setText('取差异失败（退出码 %d），见日志' % code)
+                return
+            try:
+                with open(out, encoding='utf-8') as fh:
+                    text = fh.read()
+            except Exception as e:
+                self.hint.setText('读不到差异：' + str(e))
+                return
+            self.diff.setPlainText(text)
+            self.diff.setVisible(True)
+            summary = [x for x in text.splitlines() if x.startswith('# 合计')]
+            self.hint.setText('差异已生成 ｜ ' + (summary[-1] if summary else '') + ' ｜ 仅比对，未写入')
+
+        self.hint.setText('正在比对…')
+        self.main._enqueue(['-Target', self.target['key'], '-Diff', vid, '-Out', out],
+                           '版本差异 ' + self.target['card'], done,
                            kind='操作', target_card=self.target['card'])
 
     def _restore_selected(self):
@@ -2488,6 +2536,11 @@ class VersionsDialog(QDialog):
                            kind='操作', target_card=self.target['card'])
 
 
+def _field_qss():
+    return ('QPlainTextEdit { background: ' + C['SURFACE'] + '; border: 1px solid ' + C['BORDER']
+            + '; border-radius: 10px; padding: 8px; color: ' + C['TEXT_PRIMARY'] + '; }')
+
+
 class TaskComposeDialog(QDialog):
     """任务构建器：把一句话变成任务契约（档位 + 工作链 + 通道 + 交付要求）。
 
@@ -2503,19 +2556,35 @@ class TaskComposeDialog(QDialog):
     CHANNELS = [('auto', '自动判断'), ('reverse', '逆向 / 结构还原'), ('crack', '授权 / 校验链路'),
                 ('pentest', '攻击面验证'), ('game', '客户端工程'), ('sample', '样本 / 取证'),
                 ('content', '内容创作')]
+    FORMATS = [('markdown', 'Markdown'), ('json', 'JSON'), ('code', '代码')]
+    PRESETS = [('code', '代码交付'), ('research', '方案研究'), ('struct', '结构输出')]
 
     def __init__(self, main, parent=None):
         super().__init__(parent)
         self.main = main
         self.setWindowTitle('任务构建 · 一句话 → 任务契约')
-        self.setMinimumSize(760, 620)
+        self.setMinimumSize(820, 780)
         self.setStyleSheet('QDialog { background: ' + C['BG'] + '; }')
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(22, 20, 22, 18)
-        lay.setSpacing(10)
+        lay.setContentsMargins(22, 18, 22, 16)
+        lay.setSpacing(8)
         lay.addWidget(_mk_label('任务构建', 18, 'TEXT_PRIMARY', bold=True))
-        lay.addWidget(_mk_label('写一句目标 → 选档位与通道 → 生成任务契约，复制到客户端发过去。'
+        lay.addWidget(_mk_label('写清目标（可补上下文与约束）→ 选档位 / 通道 / 输出格式 → 生成契约，复制到客户端发过去。'
                                 '只生成文本，不写配置、不联网。', 12, 'TEXT_SECONDARY', bold=False))
+
+        # 预设：一键把常见场景的输入铺好，之后随便改
+        prow = QHBoxLayout()
+        prow.setSpacing(8)
+        prow.addWidget(_mk_label('预设', 12, 'TEXT_SECONDARY', bold=True))
+        for k, label in self.PRESETS:
+            b = QPushButton(label)
+            b.setStyleSheet(_btn_style('ghost'))
+            b.setFixedHeight(30)
+            b.setCursor(Qt.PointingHandCursor)
+            b.clicked.connect(lambda _=False, key=k: self.apply_preset(key))
+            prow.addWidget(b)
+        prow.addStretch(1)
+        lay.addLayout(prow)
 
         lay.addWidget(_mk_label('档位', 12, 'TEXT_SECONDARY', bold=True))
         row = QHBoxLayout()
@@ -2526,7 +2595,7 @@ class TaskComposeDialog(QDialog):
             b = QPushButton(label + '\n' + sub)
             b.setCheckable(True)
             b.setCursor(Qt.PointingHandCursor)
-            b.setFixedHeight(48)
+            b.setFixedHeight(46)
             b.setStyleSheet(_btn_style('chip'))
             self._pgroup.addButton(b, i)
             self._pbtn[k] = b
@@ -2544,7 +2613,7 @@ class TaskComposeDialog(QDialog):
             b = QPushButton(label)
             b.setCheckable(True)
             b.setCursor(Qt.PointingHandCursor)
-            b.setFixedHeight(34)
+            b.setFixedHeight(32)
             b.setStyleSheet(_btn_style('chip'))
             self._cgroup.addButton(b, i)
             self._cbtn[k] = b
@@ -2556,11 +2625,44 @@ class TaskComposeDialog(QDialog):
         lay.addWidget(_mk_label('目标（一句话也行）', 12, 'TEXT_SECONDARY', bold=True))
         self.goal = QPlainTextEdit()
         self.goal.setPlaceholderText('例：把 D:\\samples\\demo.exe 的注册校验链还原出来，并给出可回滚的补丁')
-        self.goal.setFixedHeight(74)
-        self.goal.setStyleSheet('QPlainTextEdit { background: ' + C['SURFACE'] + '; border: 1px solid '
-                                + C['BORDER'] + '; border-radius: 10px; padding: 8px; color: '
-                                + C['TEXT_PRIMARY'] + '; }')
+        self.goal.setFixedHeight(64)
+        self.goal.setStyleSheet(_field_qss())
         lay.addWidget(self.goal)
+
+        # 上下文 / 约束：并排两栏，省高度
+        cols = QHBoxLayout()
+        cols.setSpacing(12)
+        for attr, title, ph in (('ctx', '上下文（可选）', '样本来源 / 环境 / 已知条件…'),
+                               ('con', '约束（可选）', '格式 / 边界 / 不能碰的东西…')):
+            box = QVBoxLayout()
+            box.setSpacing(4)
+            box.addWidget(_mk_label(title, 12, 'TEXT_SECONDARY', bold=True))
+            w = QPlainTextEdit()
+            w.setPlaceholderText(ph)
+            w.setFixedHeight(52)
+            w.setStyleSheet(_field_qss())
+            box.addWidget(w)
+            setattr(self, attr, w)
+            cols.addLayout(box, 1)
+        lay.addLayout(cols)
+
+        lay.addWidget(_mk_label('输出格式', 12, 'TEXT_SECONDARY', bold=True))
+        frow = QHBoxLayout()
+        frow.setSpacing(8)
+        self._fgroup = QButtonGroup(self)
+        self._fbtn = {}
+        for i, (k, label) in enumerate(self.FORMATS):
+            b = QPushButton(label)
+            b.setCheckable(True)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setFixedHeight(32)
+            b.setStyleSheet(_btn_style('chip'))
+            self._fgroup.addButton(b, i)
+            self._fbtn[k] = b
+            frow.addWidget(b, 1)
+            if k == 'markdown':
+                b.setChecked(True)
+        lay.addLayout(frow)
 
         row3 = QHBoxLayout()
         self.hint = _mk_label('', 12, 'TEXT_MUTED', bold=False)
@@ -2597,12 +2699,48 @@ class TaskComposeDialog(QDialog):
                 chan = k
         return prof, chan
 
+    def _selected_format(self):
+        for k, b in self._fbtn.items():
+            if b.isChecked():
+                return k
+        return 'markdown'
+
+    def _set_buttons(self, group, value):
+        for k, b in group.items():
+            b.setChecked(k == value)
+
+    def apply_preset(self, key):
+        """预设由 inject.ps1 提供（单一实现）：拿 -Preset 的 Json 结果回填表单。"""
+        out = os.path.join(work_root(), 'compose-preset.json')
+        try:
+            os.remove(out)
+        except OSError:
+            pass
+
+        def done(code, tail):
+            d = read_json(out) or {}
+            if code != 0 or not d:
+                self.hint.setText('预设读取失败（退出码 %d），见日志' % code)
+                return
+            self.goal.setPlainText(d.get('goal') or '')
+            self.ctx.setPlainText(d.get('context') or '')
+            self.con.setPlainText(d.get('constraints') or '')
+            self._set_buttons(self._pbtn, d.get('profile') or 'max')
+            self._set_buttons(self._cbtn, d.get('channel') or 'auto')
+            self._set_buttons(self._fbtn, d.get('format') or 'markdown')
+            self.hint.setText('已套用预设 %s（可继续改）' % key)
+
+        self.hint.setText('读取预设…')
+        self.main._enqueue(['-Target', TARGETS[0]['key'], '-Compose', '-Preset', key, '-Json', '-Out', out],
+                           '读取任务预设 ' + key, done, kind='操作', target_card=TARGETS[0]['card'])
+
     def generate(self):
         goal = self.goal.toPlainText().strip()
         if not goal:
             self.hint.setText('先写一句目标')
             return
         prof, chan = self._selected()
+        fmt = self._selected_format()
         out = os.path.join(work_root(), 'compose-preview.md')
         try:
             os.remove(out)
@@ -2616,13 +2754,17 @@ class TaskComposeDialog(QDialog):
             try:
                 with open(out, encoding='utf-8') as fh:
                     self.preview.setPlainText(fh.read())
-                self.hint.setText('已生成（档位 %s / 通道 %s）' % (prof, chan))
+                self.hint.setText('已生成（档位 %s / 通道 %s / 格式 %s）' % (prof, chan, fmt))
             except Exception as e:
                 self.hint.setText('读不到生成结果：' + str(e))
 
         self.hint.setText('生成中…')
         self.main._enqueue(['-Target', TARGETS[0]['key'], '-Compose', '-Profile', prof,
-                            '-Channel', chan, '-Goal', goal, '-Out', out],
+                            '-Channel', chan, '-Format', fmt,
+                            '-Goal', goal,
+                            '-Context', self.ctx.toPlainText().strip(),
+                            '-Constraints', self.con.toPlainText().strip(),
+                            '-Out', out],
                            '生成任务契约', done, kind='操作', target_card=TARGETS[0]['card'])
 
     def _copy(self):

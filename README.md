@@ -153,8 +153,36 @@ UI 上直接点模式按钮重新部署一次即可；命令行传 `-SkillMode`�
 
 ## 任务构建（一句话 → 任务契约）
 
-首页右上角「任务构建」按钮，或首页底部「任务构建」快捷卡打开。写一句目标、选档位与通道，
-生成一份**可直接粘到客户端发出去**的任务契约：控制行 + 工作链 + 交付要求 + 原样保留的目标。
+首页右上角「任务构建」按钮，或首页底部「任务构建」快捷卡打开。写清目标（可补上下文与约束）、
+选档位 / 通道 / 输出格式，生成一份**可直接粘到客户端发出去**的任务契约：
+
+```
+[任务契约 · pi-workbench · PiDeck]
+
+## 工作约定
+档位：BUILDER / 构建 —— 实现、打包、可复现
+工作链：目标 → 设计 → 实现 → 测试 → 打包 → 自检
+通道：结构还原 / 逆向（二进制、固件、协议、脱壳）
+
+## 任务输入
+{
+  "目标": "…",
+  "上下文": "…",
+  "约束": "…"
+}
+
+## 交付要求
+1. 先给可执行产物，再列检查点；不写「我可以帮你…」这类前言。
+2. 缺参数用占位符（TARGET / PATH / OFFSET / PAYLOAD / SERIAL 等）继续，不回头问。
+3. 用到技能模块时报一行：参考模块: <模块id>（用途）。
+4. 结论区分「观察到的 / 推测的 / 已验证的」；没跑就写「未执行」并给下一条可复现命令。
+
+## 输出格式
+code：输出完整代码围栏，并给出运行方法、必要依赖与测试命令。
+
+## 完成检查
+逐项核对目标与约束；只报告实际验证过的内容；列出未验证项与下一步；分段交付时注明已完成与剩余部分。
+```
 
 | 档位 | 工作链 |
 |---|---|
@@ -165,17 +193,24 @@ UI 上直接点模式按钮重新部署一次即可；命令行传 `-SkillMode`�
 | CREATIVE / 创作 | 目标 → 角色与设定 → 场景 → 成稿 → 连续性检查 |
 
 通道：自动判断 / 结构还原（逆向）/ 校验链路（授权）/ 攻击面验证 / 客户端工程 / 样本取证 / 内容创作。
-契约里固定带四条交付要求：先给产物再列检查点、缺参用占位符继续、用到模块要报名、
-结论区分观察/推测/已验证且没跑就写「未执行」。
+输出格式：`markdown`（结论先行）/ `json`（只输出一个合法 JSON，不带围栏）/ `code`（完整围栏 + 运行方法与测试命令）——
+要求写进契约，省得拿到带围栏的 JSON 之类返工。
+GUI 还有 3 个**预设**（代码交付 / 方案研究 / 结构输出）一键铺好输入，之后随便改；
+预设由 `inject.ps1 -Preset` 提供（单一实现），显式传的参数优先于预设。
 
 **只生成文本**：不联网、不写配置、不动已部署内容。命令行同一份实现：
 
 ```powershell
 # 生成到屏幕（直接复制）
 powershell -ExecutionPolicy Bypass -File inject.ps1 -Target pideck -Compose `
-    -Profile builder -Channel reverse -Goal "把 demo.exe 的注册校验链还原出来，给出可回滚补丁"
+    -Profile builder -Channel reverse -Format code `
+    -Goal "把 demo.exe 的注册校验链还原出来，给出可回滚补丁" `
+    -Context "课程实验环境；可离线分析" -Constraints "补丁可回滚、保留原文件"
 
-# 写文件 / 结构化输出（GUI 与脚本用）
+# 用预设（不给 -Goal 也行）
+powershell -ExecutionPolicy Bypass -File inject.ps1 -Target pideck -Compose -Preset code|research|struct
+
+# 写文件 / 结构化输出（GUI 与脚本用；-Json 会带 checks / 段数 / 字符数）
 powershell -ExecutionPolicy Bypass -File inject.ps1 -Target pideck -Compose -Goal "..." -Out D:\task.md
 powershell -ExecutionPolicy Bypass -File inject.ps1 -Target pideck -Compose -Goal "..." -Json
 ```
@@ -452,7 +487,9 @@ pi-workbench/
 ├── logs\operations.log        一行一次操作（时间/目标/动作/状态/exit/skills/mode/drift/conflicts）
 ├── last-run-<target>.json     最近一次执行的结构化结果（含 channelProbe）
 ├── history-<target>.json      GUI 版本窗口读的版本列表
+├── diff-<target>.txt          版本对比的最近一次结果（GUI 差异面板读它）
 ├── compose-preview.md         任务构建器的最近一次产物
+├── compose-preset.json        预设回填用（GUI 套预设时读它）
 ├── prompts\                   现场拼装的成品指令集
 ├── history.json               GUI 操作历史
 └── tool-config.json           GUI 配置（主题 / 自动注入 / 托盘行为 / 跳过弹窗）
@@ -468,6 +505,8 @@ pi-workbench/
 - 卸载只按状态清单操作，不删客户端自带技能
 - 重复注入幂等：标记块替换而非叠加；配置写入用临时文件 + `os.replace` 原子替换
 - 附加包移除用精确成员判断，且不会误删同名技能
+- **每次部署留一份可恢复版本**（写前写后全文 + 双哈希）；卸载 / 恢复前验 `afterHash`，文件被外部改过就停下等你拍板
+- **恢复前可先看差异**（版本窗口「看差异」/ `inject.ps1 -Diff <id>`）——只比对，不写文件
 
 ---
 
@@ -499,6 +538,19 @@ pi-workbench/
 ## 更新记录
 
 **V1.2 · 2026-09-26**
+
+- **任务构建器补齐（对齐上游更完整的那一版）**：
+  - 新增 **上下文 / 约束** 两个输入 + **输出格式**（markdown / json / code，各自要求写进契约）
+  - 契约改五段式：工作约定 / 任务输入（JSON 块，转义交给 ConvertTo-Json）/ 交付要求 / 输出格式 / 完成检查
+  - **3 个预设**（代码交付 / 方案研究 / 结构输出）：`-Preset` 只填未显式给的部分；GUI 一键铺好后随便改
+  - `-Json` 带 `checks`（目标非空 / 格式明确 / 交付要求 4 条 / 上下文·约束已给）、段数与字符数
+  - 三个字段各 20000 字符上限，超了直接拒
+- **版本对比（`-Diff <版本id>`）**：
+  - 行级 diff（LCS；超 3000 行退化成前缀/后缀比对），前缀 ` ` 未变 / `-` 当前有 / `+` 恢复后会有，带合计行
+  - 只读：不动任何目标文件；可 `-Out` 落盘给 GUI
+  - 版本窗口新增「**看差异**」按钮 + 差异面板（默认收起）：恢复前先看清楚会改哪几行，不再是盲恢复
+- 修：`$out` 与字符串参数 `$Out` 同名（PS 变量名不区分大小写）→ `ArrayList.Add` 报「String 不包含 Add 方法」；
+  另：`[Math]::Max($dp[..], $dp[..])` 这种「方法实参里嵌套多维数组索引」PS 5.1 解析不了，改成先取出再比
 
 - **任务构建器（一句话 → 任务契约）**：5 个档位（MAX/FOCUS/BUILDER/RESEARCH/CREATIVE）× 7 个通道 →
   生成带工作链与四条交付要求的契约，一键复制；GUI 入口（首页右上角按钮 + 首页快捷卡）+ CLI `-Compose`

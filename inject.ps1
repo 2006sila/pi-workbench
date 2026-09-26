@@ -50,11 +50,20 @@ param(
     # 只生成文本，不联网、不写配置。
     [switch]$Compose,
     [string]$Goal = '',
+    [string]$Context = '',
+    [string]$Constraints = '',
+    [ValidateSet('markdown', 'json', 'code')]
+    [string]$Format = 'markdown',
+    [ValidateSet('', 'code', 'research', 'struct')]
+    [string]$Preset = '',
     [ValidateSet('max', 'focused', 'builder', 'research', 'creative')]
     [string]$Profile = 'max',
     [ValidateSet('auto', 'reverse', 'crack', 'pentest', 'game', 'sample', 'content')]
     [string]$Channel = 'auto',
-    [string]$Out = ''
+    [string]$Out = '',
+
+    # 版本对比：-Diff <版本id> 显示「当前内容 → 恢复后会变成什么」的行差异（只读，不写文件）。
+    [string]$Diff = ''
 )
 
 Set-StrictMode -Off
@@ -158,6 +167,8 @@ $Script:OpName = if ($Uninstall) { 'uninstall' }
     elseif ($RemoveAddons) { 'remove-addons' }
     elseif ($ListVersions) { 'list-versions' }
     elseif ($Restore) { 'restore' }
+    elseif ($Restore) { 'restore' }
+    elseif ($Diff) { 'diff' }
     elseif ($Compose) { 'compose' }
     elseif ($Probe) { 'probe' }
     elseif ($Check) { 'check' }
@@ -427,6 +438,49 @@ function Assert-Unchanged([string]$Path, [string]$ExpectedHash, [string]$Label) 
     if ($cur -ne $ExpectedHash) {
         Refuse ($Label + ' 在准备写入期间被其它程序改动（' + $cur.Substring(0, 12) + '… ≠ ' + $ExpectedHash.Substring(0, 12) + '…），已停下未写入')
     }
+}
+
+function Get-LineDiff([string[]]$Before, [string[]]$After) {
+    # 行级 diff（LCS 动态规划），输出带前缀的行：' ' 未变 / '-' 当前有 / '+' 恢复后有。
+    # 用途：恢复前先看清楚「会改哪几行」。文件都是几 KB 的文本，DP 绰绰有余；
+    # 超过 3000 行就退化成「公共前缀 + 公共后缀」，别把内存和时间吃光。
+    $n = @($Before).Count
+    $m = @($After).Count
+    $res = New-Object System.Collections.ArrayList
+    if ($n -gt 3000 -or $m -gt 3000) {
+        $s = 0
+        while ($s -lt $n -and $s -lt $m -and $Before[$s] -ceq $After[$s]) { $s++ }
+        $ea = $n; $eb = $m
+        while ($ea -gt $s -and $eb -gt $s -and $Before[$ea - 1] -ceq $After[$eb - 1]) { $ea--; $eb-- }
+        for ($i = 0; $i -lt $s; $i++) { [void]$res.Add(' ' + $Before[$i]) }
+        for ($i = $s; $i -lt $ea; $i++) { [void]$res.Add('-' + $Before[$i]) }
+        for ($i = $s; $i -lt $eb; $i++) { [void]$res.Add('+' + $After[$i]) }
+        for ($i = $ea; $i -lt $n; $i++) { [void]$res.Add(' ' + $Before[$i]) }
+        return $res
+    }
+    $dp = [int[,]]::new(($n + 1), ($m + 1))
+    for ($i = $n - 1; $i -ge 0; $i--) {
+        for ($j = $m - 1; $j -ge 0; $j--) {
+            if ($Before[$i] -ceq $After[$j]) {
+                $dp[$i, $j] = $dp[($i + 1), ($j + 1)] + 1
+            } else {
+                # 别写成 [Math]::Max($dp[..], $dp[..])：PS 5.1 解析不了「方法实参里嵌套多维索引」，
+                # 它会把索引里的逗号当成实参分隔符（报“索引表达式缺少 ]”）。先取出来再比。
+                $down = $dp[($i + 1), $j]
+                $right = $dp[$i, ($j + 1)]
+                if ($down -ge $right) { $dp[$i, $j] = $down } else { $dp[$i, $j] = $right }
+            }
+        }
+    }
+    $x = 0; $y = 0
+    while ($x -lt $n -and $y -lt $m) {
+        if ($Before[$x] -ceq $After[$y]) { [void]$res.Add(' ' + $Before[$x]); $x++; $y++ }
+        elseif ($dp[($x + 1), $y] -ge $dp[$x, ($y + 1)]) { [void]$res.Add('-' + $Before[$x]); $x++ }
+        else { [void]$res.Add('+' + $After[$y]); $y++ }
+    }
+    while ($x -lt $n) { [void]$res.Add('-' + $Before[$x]); $x++ }
+    while ($y -lt $m) { [void]$res.Add('+' + $After[$y]); $y++ }
+    return $res
 }
 
 function Test-SameContent([string]$Path, [byte[]]$Bytes) {
@@ -939,8 +993,8 @@ function Invoke-ChannelProbe([string]$Cli, [string]$Question, [int]$TimeoutSec) 
     # 用 Start-Job 而不是直接调用 —— 原生调用没法设超时，模型卡住会把整个 GUI 挂死。
     $job = Start-Job -ScriptBlock {
         param($c, $q)
-        $out = & $c --print $q 2>&1 | Out-String
-        [pscustomobject]@{ code = $LASTEXITCODE; out = $out }
+        $diffLines = & $c --print $q 2>&1 | Out-String
+        [pscustomobject]@{ code = $LASTEXITCODE; out = $diffLines }
     } -ArgumentList $Cli, $Question
     $done = Wait-Job -Job $job -Timeout $TimeoutSec
     if (-not $done) {
@@ -1376,9 +1430,9 @@ if ($Probe) {
         Say 'INFO' ('通道体检：真跑 ' + $cli + '（一次模型调用，超时 ' + $ProbeTimeout + 's）…')
         $r = Invoke-ChannelProbe -Cli $cli -Question $question -TimeoutSec $ProbeTimeout
         $code = $r[0]
-        $out = [string]$r[1]
+        $diffLines = [string]$r[1]
         $record.exit = $code
-        $flat = ($out.Trim() -replace '\s+', ' ')
+        $flat = ($diffLines.Trim() -replace '\s+', ' ')
         if ($flat.Length -gt 300) { $flat = $flat.Substring(0, 300) + '…' }
         $record.reply = $flat
         if ($code -eq 'timeout') {
@@ -1391,9 +1445,9 @@ if ($Probe) {
             $probeOk = $false
         } else {
             $hit = @()
-            foreach ($e in $expect) { if ($e -and $out -match [regex]::Escape($e)) { $hit += $e } }
+            foreach ($e in $expect) { if ($e -and $diffLines -match [regex]::Escape($e)) { $hit += $e } }
             $hid = @()
-            foreach ($h in $hidden) { if ($h -and $out -match [regex]::Escape($h)) { $hid += $h } }
+            foreach ($h in $hidden) { if ($h -and $diffLines -match [regex]::Escape($h)) { $hid += $h } }
             if ($hit.Count -gt 0) {
                 $record.status = 'pass'
                 $record.hit = @($hit)
@@ -1403,7 +1457,7 @@ if ($Probe) {
                 $record.hidden = @($hid | Select-Object -First 5)
                 $record.detail = '模型列出了本该被隐藏的模块（disable-model-invocation 未生效？）: ' + (($hid | Select-Object -First 3) -join ', ')
                 $probeOk = $false
-            } elseif ($out -match '(?i)(^|\s)(none|无|没有)(\s|$)') {
+            } elseif ($diffLines -match '(?i)(^|\s)(none|无|没有)(\s|$)') {
                 $record.status = 'fail'
                 $record.detail = '模型表示看不到任何已部署技能'
                 $probeOk = $false
@@ -1432,13 +1486,41 @@ if ($Probe) {
 
 # ---------------------------------------------------------------- 任务构建器（-Compose）
 
-# 只做一件事：把「写清楚的一句话」变成任务契约 —— 档位、工作链、通道、交付要求。
+# 只做一件事：把「写清楚的一句话」变成任务契约 ——
+# 工作约定（档位 / 工作链 / 通道）+ 任务输入（目标 / 上下文 / 约束）+ 交付要求 + 输出格式 + 完成检查。
 # 不联网、不写配置、不动任何已部署内容；产物是文本（stdout / -Out 文件 / -Json）。
 if ($Compose) {
+    # 预设：三个常见场景铺好的输入。只填用户没显式给的那些参数。
+    $Presets = [ordered]@{
+        'code'     = @{ goal = '实现一个可离线使用的小工具，带搜索与导出。'; context = '本机桌面环境；先做最小可用版本。'; constraints = '中文说明；列出改动文件与测试命令。'; format = 'code'; profile = 'builder'; channel = 'auto' }
+        'research' = @{ goal = '比较三种可行方案，给出适合当前规模的选择依据。'; context = '数据量约一万条，以中文为主。'; constraints = '区分已知事实与待验证假设；列出验证方法。'; format = 'markdown'; profile = 'research'; channel = 'auto' }
+        'struct'   = @{ goal = '为当前项目写一份发布前检查清单。'; context = '含桌面程序与说明文档。'; constraints = '每个条目包含 name / owner / status 三列。'; format = 'json'; profile = 'focused'; channel = 'auto' }
+    }
+    if ($Preset) {
+        $ps = $Presets[$Preset]
+        if (-not $ps) { Fail ('没有这个预设: ' + $Preset) }
+        if ([string]::IsNullOrWhiteSpace($Goal)) { $Goal = [string]$ps.goal }
+        if ([string]::IsNullOrWhiteSpace($Context)) { $Context = [string]$ps.context }
+        if ([string]::IsNullOrWhiteSpace($Constraints)) { $Constraints = [string]$ps.constraints }
+        if (-not $PSBoundParameters.ContainsKey('Format')) { $Format = [string]$ps.format }
+        if (-not $PSBoundParameters.ContainsKey('Profile')) { $Profile = [string]$ps.profile }
+        if ((-not $PSBoundParameters.ContainsKey('Channel')) -and $ps.channel) { $Channel = [string]$ps.channel }
+    }
+
+    # 长度上限：契约是要整段贴进客户端的，超长没有意义
+    $Limit = 20000
+    foreach ($pair in @(@('目标', $Goal), @('上下文', $Context), @('约束', $Constraints))) {
+        if ($pair[1] -and $pair[1].Length -gt $Limit) {
+            Fail ($pair[0] + ' 超过 ' + $Limit + ' 字符，先砍到重点')
+        }
+    }
     $GoalText = $Goal.Trim()
     if ([string]::IsNullOrWhiteSpace($GoalText)) {
-        Fail '先用 -Goal 给出目标（一句话就行）'
+        Fail '先用 -Goal 给出目标（一句话就行；或用 -Preset code|research|struct 套预设）'
     }
+    $ContextText = $Context.Trim()
+    $ConstraintsText = $Constraints.Trim()
+
     $Profiles = [ordered]@{
         'max'      = @{ label = 'MAX / 全开';      tone = '完整、直接、可继续';        stages = @('目标', '上下文', '产物', '自检') }
         'focused'  = @{ label = 'FOCUS / 聚焦';    tone = '短链路、少噪声';            stages = @('目标', '产物') }
@@ -1458,24 +1540,61 @@ if ($Compose) {
     $pf = $Profiles[$Profile]
     $chName = [string]$Channels[$Channel]
     $chain = ($pf.stages -join ' → ')
+    # 输出格式：要求写进契约，省得模型交出带围栏的 JSON 之类的返工
+    $fmtReq = switch ($Format) {
+        'json' { '只输出一个合法 JSON 值，不附带 Markdown 围栏与解释文字。' }
+        'code' { '输出完整代码围栏，并给出运行方法、必要依赖与测试命令。' }
+        default { '用 Markdown 标题 / 列表 / 表格，结论先行；长内容分节。' }
+    }
+
+    # JSON 转义交给 ConvertTo-Json：目标里带引号也不会把任务输入块弄坏
+    $goalJson = (ConvertTo-Json $GoalText -Compress)
+    $ctxJson = $(if ($ContextText) { (ConvertTo-Json $ContextText -Compress) } else { '"未提供"' })
+    $conJson = $(if ($ConstraintsText) { (ConvertTo-Json $ConstraintsText -Compress) } else { '"未提供"' })
+
     $lines = @()
     $lines += '[任务契约 · ' + $TOOL_TAG + ' · ' + $T.Label + ']'
+    $lines += ''
+    $lines += '## 工作约定'
     $lines += '档位：' + $pf.label + ' —— ' + $pf.tone
     $lines += '工作链：' + $chain
     $lines += '通道：' + $chName
-    $lines += '交付要求：'
+    $lines += ''
+    $lines += '## 任务输入'
+    $lines += '{'
+    $lines += '  "目标": ' + $goalJson + ','
+    $lines += '  "上下文": ' + $ctxJson + ','
+    $lines += '  "约束": ' + $conJson
+    $lines += '}'
+    $lines += ''
+    $lines += '## 交付要求'
     $lines += '1. 先给可执行产物，再列检查点；不写「我可以帮你…」这类前言。'
     $lines += '2. 缺参数用占位符（TARGET / PATH / OFFSET / PAYLOAD / SERIAL 等）继续，不回头问。'
     $lines += '3. 用到技能模块时报一行：参考模块: <模块id>（用途）。'
     $lines += '4. 结论区分「观察到的 / 推测的 / 已验证的」；没跑就写「未执行」并给下一条可复现命令。'
-    $lines += '目标：' + $GoalText
+    $lines += ''
+    $lines += '## 输出格式'
+    $lines += $Format + '：' + $fmtReq
+    $lines += ''
+    $lines += '## 完成检查'
+    $lines += '逐项核对目标与约束；只报告实际验证过的内容；列出未验证项与下一步；分段交付时注明已完成与剩余部分。'
     $text = ($lines -join "`r`n") + "`r`n"
+
+    # 契约自检：给生成者自己看的（缺上下文/约束会亮出来，不是错，是提醒）
+    $checks = @()
+    $checks += [ordered]@{ name = '目标非空'; ok = $true }
+    $checks += [ordered]@{ name = '输出格式明确'; ok = $true }
+    $checks += [ordered]@{ name = '交付要求 4 条'; ok = $true }
+    $checks += [ordered]@{ name = '上下文 / 约束已给'; ok = [bool]($ContextText -or $ConstraintsText) }
 
     if ($Json) {
         $payload = [ordered]@{
-            profile = $Profile; profileLabel = $pf.label; tone = $pf.tone
+            profile = $Profile; profileLabel = $pf.label; tone = $pf.tone; stages = @($pf.stages)
             channel = $Channel; channelLabel = $chName
-            stages = @($pf.stages); goal = $GoalText; text = $text
+            goal = $GoalText; context = $ContextText; constraints = $ConstraintsText
+            format = $Format; formatRequirement = $fmtReq; preset = $Preset
+            checks = @($checks); sections = 5; characters = $text.Length
+            text = $text
         }
         # 变量名别用 $json —— PowerShell 变量名不区分大小写，那会把字符串写进 [switch]$Json 参数，
         # 报“无法将 System.String 转换为 SwitchParameter”，而且看起来像参数绑定错了。
@@ -1524,7 +1643,7 @@ if ($ListVersions) {
         }
     }
     if ($Json) {
-        $out = Join-Path $WorkRoot ('history-' + $Target + '.json')
+        $listPath = Join-Path $WorkRoot ('history-' + $Target + '.json')
         # 包成对象：PS 5.1 的 ConvertTo-Json 对单元素数组会退化成对象，消费方没法统一处理
         $payload = [ordered]@{
             target = $Target
@@ -1532,8 +1651,8 @@ if ($ListVersions) {
             at = (Get-Date).ToString('o')
             versions = @($rows)
         }
-        Write-AtomicText $out (($payload | ConvertTo-Json -Depth 4) + "`r`n") $Utf8NoBom
-        Say 'INFO' ('版本列表已写入: ' + $out)
+        Write-AtomicText $listPath (($payload | ConvertTo-Json -Depth 4) + "`r`n") $Utf8NoBom
+        Say 'INFO' ('版本列表已写入: ' + $listPath)
     } else {
         Say 'INFO' ('可恢复版本 ' + @($rows).Count + ' 条，目录: ' + $HistoryDir)
         foreach ($r in $rows) {
@@ -1545,6 +1664,51 @@ if ($ListVersions) {
         }
         if (@($rows).Count -eq 0) { Say 'INFO' '还没有版本记录（本工具每次部署都会记一条）' }
     }
+    Finish 'OK'
+    exit 0
+}
+
+if ($Diff) {
+    # 只读：把「当前内容 → 恢复后会变成什么」逐文件列出来。恢复前先看一眼，别盲退。
+    $jid = $Diff.Trim().ToLowerInvariant()
+    if ($jid -notmatch '^[0-9a-f]{32}$') { Fail ('版本 id 格式不对（应为 32 位十六进制）: ' + $Diff) }
+    $jf = Join-Path $HistoryDir ($jid + '.json')
+    if (-not (Test-Path -LiteralPath $jf)) { Fail ('找不到这个版本记录: ' + $jf) }
+    $j = Read-Utf8 $jf | ConvertFrom-Json
+    $diffLines = New-Object System.Collections.ArrayList
+    [void]$diffLines.Add('# 版本对比 ' + $jid + '（' + [string]$j.action + ' / ' + [string]$j.status + '）')
+    [void]$diffLines.Add('# 前缀：空格=未变  - =当前有  + =恢复后会有')
+    [void]$diffLines.Add('# 恢复语义：退回那次写入之前的内容；技能库不在版本范围内')
+    [void]$diffLines.Add('')
+    $totalDel = 0
+    $totalAdd = 0
+    foreach ($fl in @($j.files)) {
+        $p = Resolve-Within $T.AgentDir ([string]$fl.path)
+        $curText = if (Test-Path -LiteralPath $p -PathType Leaf) { Read-Utf8 $p } else { '' }
+        $tgtText = if ($fl.existed -eq $true -and $fl.before) {
+            [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([string]$fl.before))
+        } else { '' }
+        [void]$diffLines.Add('## ' + $p)
+        if ($curText -ceq $tgtText) {
+            [void]$diffLines.Add('（一致：恢复不会改动这个文件）')
+            [void]$diffLines.Add('')
+            continue
+        }
+        $dl = Get-LineDiff ($curText -split "`r?`n") ($tgtText -split "`r?`n")
+        $shown = 0
+        foreach ($ln in @($dl)) {
+            if ($ln.StartsWith('-')) { $totalDel++ } elseif ($ln.StartsWith('+')) { $totalAdd++ }
+            if ($shown -lt 400) { [void]$diffLines.Add($ln); $shown++ }
+        }
+        if (@($dl).Count -gt $shown) { [void]$diffLines.Add('… 另有 ' + (@($dl).Count - $shown) + ' 行未显示') }
+        [void]$diffLines.Add('')
+    }
+    [void]$diffLines.Add('# 合计：- ' + $totalDel + ' 行 / + ' + $totalAdd + ' 行')
+    $diffText = (($diffLines -join "`r`n") + "`r`n")
+    if ($Out) {
+        Write-AtomicText $Out $diffText $Utf8NoBom
+        Say 'INFO' ('差异已写入: ' + $Out)
+    } else { Write-Output $diffText }
     Finish 'OK'
     exit 0
 }
