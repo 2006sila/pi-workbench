@@ -576,15 +576,24 @@ pi-workbench/
   [alicewe1/alice_skill](https://github.com/alicewe1/alice_skill)（GPL-3.0），
   读的是 `802bf17895fc9f0cb2dc0558d13af452d50a6bd8`（整仓 2399 个文件 / 424 个技能）。
   **仅借鉴设计思路与结构，未使用其代码、也未搬其技能正文**（clean-room：本仓库 MIT，
-  以自己的实现与措辞重写）。可核对的机器可读记录在
-  [deploy-contract.json](deploy-contract.json) 的 `cleanroom` 段，`skill_tool.py contract`
+  以自己的实现与措辞重写）。
+- **提示词模板与部署事务机制** 参考了
+  [3641397194-wq/gpt6-Astra](https://github.com/3641397194-wq/gpt6-Astra)（MIT，**允许复用正文**），
+  读的是 `e868f60`（208 个文件）。GPT 系模板正文收编自该仓库，
+  来源与改动逐项记在 [NOTICE.md](NOTICE.md)；部署事务、版本日志与按版本恢复、
+  口语归一表等机制按本仓库的形态重写（PowerShell + Python）。未搬其付费中转、
+  激活门与社群部分。
+- 以上两条的机器可读记录在 [deploy-contract.json](deploy-contract.json) 的 `cleanroom` 段
+  （含 repo / commit / 许可证 / 引用方式 / 具体借了什么），`py -X utf8 skill_tool.py contract`
   会核对 README 这里写的仓库 / 许可证 / commit 是否与契约一致 —— 口头致谢不算溯源。
 
-  借鉴到的机制：类目索引生成器（技能自报类目 → 脚本机械生成索引）、
-  只替换锚定节 + `--check` 只读比对生成物是否过期、技能指纹基线与消费方、
-  退出码分级（3 = 需人工确认而不是失败）、证据记录字段、沙箱演练不污染主库、
-  触发词交叉校验。没有抄的部分：越狱话术与话术替换表、封印/加密/水印、
-  技能正文（GPL 内容不进 MIT 仓库）。
+  从 alice 借到的机制：类目索引生成器、只替换锚定节 + `--check` 只读比对、技能指纹基线与消费方、
+  退出码分级（3 = 需人工确认）、证据记录字段、沙箱演练不污染主库。
+  从 gpt6-Astra 借到的机制：路径守卫与根内包含、原子写、
+  版本日志与按版本恢复（恢复前验 afterHash）、写入前 TOCTOU 复验、
+  配置根环境变量探测、口语归一表、发布前隐私检查文档结构。
+  两边都没抄的：越狱/拒答话术与话术替换表、封印/加密/水印、激活门与口令、
+  付费中转与社群内容、以及 alice 的 365 个技能正文（GPL 内容不进 MIT 仓库）。
 - 技能库内含第三方收集内容，署名与许可见 [NOTICE.md](NOTICE.md)。
 
 ---

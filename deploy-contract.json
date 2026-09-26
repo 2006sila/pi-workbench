@@ -68,6 +68,7 @@
       "repo": "https://github.com/alicewe1/alice_skill",
       "commit": "802bf17895fc9f0cb2dc0558d13af452d50a6bd8",
       "license": "GPL-3.0",
+      "mode": "clean-room",
       "method": "clean-room：只取机制与结构，不取文本。本仓库为 MIT，未复制其代码或技能正文；重写为自己的实现与措辞。",
       "read_at": "2026-09-26",
       "files_seen": 2399,
@@ -81,6 +82,24 @@
         "证据记录八字段：object / action / baseline_sha256 / verification / rollback",
         "生成物沙箱演练：CODEX_HOME=<临时目录>，主库零污染",
         "打包清单 + SHA-256 清单（未做封印/加密：与本仓库 MIT + 暂不发布定位冲突）"
+      ]
+    },
+    "gpt6_astra": {
+      "repo": "https://github.com/3641397194-wq/gpt6-Astra",
+      "commit": "e868f60",
+      "license": "MIT",
+      "mode": "reuse",
+      "method": "MIT 允许复用正文：收编其公开的提示词模板并在 NOTICE.md 标注来源；部署事务、版本日志与恢复、口语归一表等机制按本仓库形态重写。未搬其付费中转/社群与激活门部分。",
+      "read_at": "2026-09-26",
+      "files_seen": 208,
+      "borrowed": [
+        "部署事务：路径守卫（符号链接/硬链接拒绝）+ 根内包含 + 原子写 + 标记块单人一份",
+        "版本日志与按版本恢复：每版记 before/after 全文与双哈希，恢复前验 afterHash",
+        "写入前逐文件 TOCTOU 复验（validateCurrent）",
+        "配置根探测：环境变量优先（PI_CODING_AGENT_DIR / DSH_HOME）+ ~ 展开 + 强制绝对路径",
+        "口语归一表 TALKNORM（洗口 → 同音 → 对照 → 兜底）→ prompts/_ext-subst.md",
+        "发布前隐私检查文档结构（docs/SECURITY.md）",
+        "按 kind 分派写入（marked / file / toml / settings）与各自的可验证断言"
       ]
     }
   }

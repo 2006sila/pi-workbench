@@ -1324,6 +1324,11 @@ class TargetCard(QFrame):
         self.btn_probe.setStyleSheet(_btn_style('ghost'))
         self.btn_probe.setFixedHeight(36)
         btns.addWidget(self.btn_probe, 1)
+        # 版本历史：每次部署留一条可恢复版本（退回那次写入之前的指令文件）
+        self.btn_versions = QPushButton('版本')
+        self.btn_versions.setStyleSheet(_btn_style('ghost'))
+        self.btn_versions.setFixedHeight(36)
+        btns.addWidget(self.btn_versions, 1)
         lay.addLayout(btns)
         self._refresh_addons()
 
@@ -1448,6 +1453,7 @@ class HomePage(Page):
             card.btn_restart.clicked.connect(lambda _=False, tg=target: self.main._restart(tg))
             card.btn_uninstall.clicked.connect(lambda _=False, tg=target: self.main._uninstall(tg))
             card.btn_probe.clicked.connect(lambda _=False, tg=target: self.main._probe(tg))
+            card.btn_versions.clicked.connect(lambda _=False, tg=target: self.main._versions(tg))
             cards.addWidget(card, 1)
             self.cards[target['key']] = card
         lay.addLayout(cards, 1)
@@ -2329,6 +2335,130 @@ class LogPage(Page):
     def _copy_all(self):
         QApplication.clipboard().setText(self._box.toPlainText())
         self._status.setText('已复制到剪贴板')
+
+
+class VersionsDialog(QDialog):
+    """可恢复版本列表。
+
+    每一行 = 一次部署版本（backup\\<目标>\\history\\<id>.json）。
+    恢复的语义是「退回那一次写入之前的内容」（指令文件 / 补丁层），不是「跳到那一版」。
+    当前文件在那之后被改过时，inject.ps1 会先拦下（exit 3），这里再问一次要不要 -Force。
+    """
+
+    def __init__(self, main, target, parent=None):
+        super().__init__(parent)
+        self.main = main
+        self.target = target
+        self.setWindowTitle('版本历史 · ' + target['card'])
+        self.setMinimumSize(760, 480)
+        self.setStyleSheet('QDialog { background: ' + C['BG'] + '; }')
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(22, 20, 22, 18)
+        lay.setSpacing(10)
+        lay.addWidget(_mk_label('可恢复版本 · ' + target['card'], 18, 'TEXT_PRIMARY', bold=True))
+        lay.addWidget(_mk_label('恢复 = 退回「那一次写入之前」的指令文件 / 补丁层；技能库不动。'
+                                '文件在那之后被改过时会先拦下，确认后才覆盖（会另存现场）。',
+                                12, 'TEXT_SECONDARY', bold=False))
+        self.list = QListWidget()
+        self.list.setStyleSheet('QListWidget { background: ' + C['SURFACE'] + '; border: 1px solid '
+                                + C['BORDER'] + '; border-radius: 10px; color: ' + C['TEXT_PRIMARY']
+                                + '; font-family: Consolas, monospace; font-size: 12px; padding: 6px; }')
+        lay.addWidget(self.list, 1)
+        row = QHBoxLayout()
+        self.hint = _mk_label('', 12, 'TEXT_MUTED', bold=False)
+        row.addWidget(self.hint)
+        row.addStretch(1)
+        b_refresh = QPushButton('刷新')
+        b_refresh.setStyleSheet(_btn_style('ghost'))
+        b_refresh.setFixedHeight(34)
+        b_refresh.clicked.connect(self.refresh)
+        row.addWidget(b_refresh)
+        b_restore = QPushButton('恢复选中版本')
+        b_restore.setStyleSheet(_btn_style('primary'))
+        b_restore.setFixedHeight(34)
+        b_restore.clicked.connect(self._restore_selected)
+        row.addWidget(b_restore)
+        lay.addLayout(row)
+        self.reload()
+
+    def _path(self):
+        return os.path.join(work_root(), 'history-' + self.target['key'] + '.json')
+
+    def reload(self):
+        d = read_json(self._path()) or {}
+        self.rows = d.get('versions') or []
+        self.list.clear()
+        for r in self.rows:
+            at = str(r.get('at') or '')
+            if len(at) > 19:
+                at = at[:19].replace('T', ' ')
+            ok = '可恢复' if r.get('restorable') else '不可恢复'
+            item = QListWidgetItem('%s  %s  %-12s %-10s 文件%s  %s'
+                                   % (at, str(r.get('id') or '')[:12], str(r.get('action') or ''),
+                                      ok, r.get('files'), str(r.get('prompt') or '')))
+            item.setData(0x0100, r.get('id'))          # Qt.UserRole
+            if not r.get('restorable'):
+                item.setForeground(QColor(C['TEXT_MUTED']))
+            self.list.addItem(item)
+        self.hint.setText('共 %d 条 ｜ 目录 %s' % (len(self.rows), os.path.join(work_root(), 'backup',
+                                                                          self.target['key'], 'history')))
+
+    def refresh(self):
+        def done(code, tail):
+            self.reload()
+            self.main._set_status('版本列表已刷新（退出码 %d）' % code, 'ok' if code == 0 else 'warn')
+        self.main._enqueue(['-Target', self.target['key'], '-ListVersions', '-Json'],
+                           '读版本列表 ' + self.target['card'], done,
+                           kind='操作', target_card=self.target['card'])
+
+    def _restore_selected(self):
+        it = self.list.currentItem()
+        if it is None:
+            self.hint.setText('先选一条版本记录')
+            return
+        vid = str(it.data(0x0100) or '')
+        if QMessageBox.question(self, APP_NAME,
+                                '恢复版本 ' + vid[:12] + '？\n\n'
+                                '· 退回那次部署之前的内容（指令文件 / 补丁层）\n'
+                                '· 技能库不动\n'
+                                '· 那个版本之后被改过的文件会先拦下，确认才覆盖\n\n'
+                                '注意：恢复后需重启客户端才生效。',
+                                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+
+        def force():
+            def done2(code2, tail2):
+                self.main._set_status(target_msg(code2, True), 'ok' if code2 == 0 else 'error')
+                self.reload()
+            self.main._enqueue(['-Target', self.target['key'], '-Restore', vid, '-Force'],
+                               '强制恢复 ' + self.target['card'], done2,
+                               kind='操作', target_card=self.target['card'])
+
+        def target_msg(code, forced=False):
+            if code == 0:
+                return self.target['card'] + (' 已强制恢复版本 ' if forced else ' 已恢复版本 ') + vid[:12]
+            if code == 3:
+                return self.target['card'] + ' 恢复被拦下：文件在那之后被改过'
+            return self.target['card'] + ' 恢复失败（退出码 %d），见日志' % code
+
+        def done(code, tail):
+            if code == 3:
+                drift = [str(x) for x in (tail or []) if '漂移' in str(x) or '校验不通过' in str(x)]
+                msg = '恢复被拦下了。\n\n' + ((drift[-1][:400] + '\n\n') if drift else '')
+                msg += ('这些文件在那个版本之后被改动过，恢复会覆盖改动。\n'
+                        '继续会先把当前内容另存到备份区（backup\\drift\\…）。\n\n要强制恢复吗？')
+                self.main._set_status(self.target['card'] + ' 恢复已暂停：文件被外部改过', 'warn')
+                if QMessageBox.question(self, APP_NAME, msg,
+                                        QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes:
+                    force()
+                    return
+            else:
+                self.main._set_status(target_msg(code), 'ok' if code == 0 else 'error')
+            self.reload()
+
+        self.main._enqueue(['-Target', self.target['key'], '-Restore', vid],
+                           '恢复版本 ' + self.target['card'], done,
+                           kind='操作', target_card=self.target['card'])
 
 
 # ------------------------------------------------------------------ 历史页
@@ -3405,6 +3535,21 @@ class MainWindow(FramelessWindow):
         self._log_line('[提示] L4 会话层需人工验证：在客户端新开会话，直接给一个技术任务，'
                        '看是否第一行就给交付物（不出现「我不能/无法」类开场)')
         self.switch_page(3)
+
+    def _versions(self, target):
+        """打开版本历史：先让 inject.ps1 刷一份列表 JSON，再弹窗选。"""
+        def done(code, tail):
+            if code != 0:
+                self._set_status(target['card'] + ' 读版本列表失败（退出码 %d），见日志' % code, 'error')
+                return
+            try:
+                VersionsDialog(self, target).exec()
+            except Exception as e:
+                self._set_status('版本窗口打不开：' + str(e), 'error')
+
+        self._enqueue(['-Target', target['key'], '-ListVersions', '-Json'],
+                      '读版本列表 ' + target['card'], done,
+                      kind='操作', target_card=target['card'])
 
     def _probe(self, target):
         """通道体检：文件写对了不等于客户端真的读了。

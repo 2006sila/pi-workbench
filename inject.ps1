@@ -38,7 +38,13 @@ param(
     # 不加则只做加载层体检（不联网）。
     [switch]$Probe,
     [string]$ProbeCli = '',
-    [int]$ProbeTimeout = 180
+    [int]$ProbeTimeout = 180,
+
+    # 版本历史：每次部署会记一份可恢复的版本日志（backup\<目标>\history\<id>.json）。
+    # -ListVersions 列表；-Restore <id> 按版本恢复（恢复前验 afterHash）。
+    [switch]$ListVersions,
+    [string]$Restore = '',
+    [switch]$Json
 )
 
 Set-StrictMode -Off
@@ -64,20 +70,48 @@ function Get-HomeDir {
     return $HOME
 }
 
+function Expand-HomePath([string]$Path, [string]$HomeRoot) {
+    # 环境变量 / 命令行给的目录要先规范化：~ 展开、去引号、强制绝对路径。
+    # 直接拿去 Join-Path 会拼出「~/.pi」这种相对路径，最后写到当前工作目录去。
+    # 参数名不能用 $Home —— 那是 PowerShell 的只读自动变量，绑定就报错。
+    if ([string]::IsNullOrWhiteSpace($Path)) { return '' }
+    $p = $Path.Trim().Trim('"').Trim("'")
+    if ($p -eq '~') { return $HomeRoot }
+    if ($p.StartsWith('~/') -or $p.StartsWith('~\')) { $p = Join-Path $HomeRoot $p.Substring(2) }
+    return [System.IO.Path]::GetFullPath($p)
+}
+
+function Get-AgentDirFromEnv([string[]]$Keys, [string]$HomeRoot, [string]$Fallback) {
+    # 配置根探测：客户端自己的环境变量优先（用户可能把配置根挪到别的盘），
+    # 再退回约定目录。返回 @(目录, 来源说明) —— 来源要报给用户，
+    # 写错地方时这是第一条线索。
+    foreach ($k in $Keys) {
+        $v = [Environment]::GetEnvironmentVariable($k)
+        if (-not [string]::IsNullOrWhiteSpace($v)) {
+            return @((Expand-HomePath $v $HomeRoot), ('环境变量 ' + $k))
+        }
+    }
+    return @((Join-Path $HomeRoot $Fallback), ('约定目录 ' + $Fallback))
+}
+
 $HomeDir = Get-HomeDir
 
-# DSH 的配置根：$DSH_HOME 优先，否则 ~/.dsh（与 dsh-agent-instructions 的 dshHome 解析一致）
-$DshHomeDir = if ([string]::IsNullOrWhiteSpace($env:DSH_HOME)) { Join-Path $HomeDir '.dsh' } else { $env:DSH_HOME }
+# PiDeck 侧是 pi 的官方覆盖变量 PI_CODING_AGENT_DIR（默认 ~/.pi/agent）；
+# DSH 侧是 $DSH_HOME（与 dsh-agent-instructions 的 dshHome 解析一致）。
+# 忽略这两个变量会把配置写到用户根本没在用的目录里 —— 而自检还会报“通过”。
+$PiAgentDir = Get-AgentDirFromEnv @('PI_CODING_AGENT_DIR') $HomeDir '.pi\agent'
+$DshHomeDir = Get-AgentDirFromEnv @('DSH_HOME') $HomeDir '.dsh'
 
 $TARGETS = @{
     'pideck' = @{
         Label       = 'PiDeck'
-        AgentDir    = Join-Path $HomeDir '.pi\agent'
+        AgentDir    = $PiAgentDir[0]
+        AgentDirSource = $PiAgentDir[1]
         PromptName  = 'APPEND_SYSTEM.md'
         ProcNames   = @('PiDeck', 'pi-desktop')
         ProbeFiles  = @(
-            (Join-Path $HomeDir '.pi\agent\settings.json'),
-            (Join-Path $HomeDir '.pi\agent\models.json')
+            (Join-Path $PiAgentDir[0] 'settings.json'),
+            (Join-Path $PiAgentDir[0] 'models.json')
         )
         ExeHints    = @(
             (Join-Path $env:LOCALAPPDATA 'Programs\PiDeck\PiDeck.exe'),
@@ -91,12 +125,13 @@ $TARGETS = @{
         # 它把 $DSH_HOME/AGENTS.md 作为持久 user 消息（<system-reminder>）注入提示词；
         # 技能走 dsh-skill-filesystem 的 user-dsh 根（rank 400）= $DSH_HOME/skills，跳过 .system。
         Label       = 'DeepSeek Harness'
-        AgentDir    = $DshHomeDir
+        AgentDir    = $DshHomeDir[0]
+        AgentDirSource = $DshHomeDir[1]
         PromptName  = 'AGENTS.md'
         ProcNames   = @('DeepSeek Harness', 'DeepSeekHarness', 'deepseek-harness', 'dsh')
         ProbeFiles  = @(
-            (Join-Path $HomeDir '.dsh\settings.yaml'),
-            (Join-Path $HomeDir '.dsh\cordis.patch.yml')
+            (Join-Path $DshHomeDir[0] 'settings.yaml'),
+            (Join-Path $DshHomeDir[0] 'cordis.patch.yml')
         )
         ExeHints    = @(
             (Join-Path $env:LOCALAPPDATA 'Programs\DeepSeek Harness\DeepSeek Harness.exe'),
@@ -111,12 +146,15 @@ $T = $TARGETS[$Target]
 # 操作名（进 operations.log，一眼看出一行是干什么的）
 $Script:OpName = if ($Uninstall) { 'uninstall' }
     elseif ($RemoveAddons) { 'remove-addons' }
+    elseif ($ListVersions) { 'list-versions' }
+    elseif ($Restore) { 'restore' }
     elseif ($Probe) { 'probe' }
     elseif ($Check) { 'check' }
     elseif ($SkillsOnly) { 'skills-only' }
     else { 'deploy' }
 if (-not [string]::IsNullOrWhiteSpace($AgentDir)) {
-    $T.AgentDir = [System.IO.Path]::GetFullPath($AgentDir)
+    $T.AgentDir = Expand-HomePath $AgentDir $HomeDir
+    $T.AgentDirSource = '命令行 -AgentDir'
 } else {
     $T.AgentDir = [System.IO.Path]::GetFullPath($T.AgentDir)
 }
@@ -132,6 +170,8 @@ $LogPath    = Join-Path $LogDir ($Target + '.log')
 # 操作留痕：一行一次操作，附带退出码 / 技能数 / 模式 / 漂移数 / 冲突数。
 # 排障时先看这一行，再看 <目标>.log 全文。
 $OpLogPath  = Join-Path $LogDir 'operations.log'
+# 可恢复版本日志：backup\<目标>\history\<版本id>.json
+$HistoryDir = Join-Path (Join-Path $BackupRoot $Target) 'history'
 
 foreach ($d in @($WorkRoot, $StateDir, $BackupRoot, $LogDir)) {
     if (-not (Test-Path -LiteralPath $d)) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
@@ -324,6 +364,55 @@ function Test-BaselineDrift([string]$Path, $FileHashes, [string]$Kind) {
     $cur = Get-Sha256 ([System.IO.File]::ReadAllBytes($Path))
     if ($cur -eq $want) { return $null }
     return ($cur.Substring(0, 12) + '… ≠ 记录 ' + $want.Substring(0, 12) + '…')
+}
+
+# ---------------------------------------------------------------- 版本日志（可恢复的部署历史）
+# 每次部署把「写什么文件、写前写后长什么样、两个哈希」记一份 journal，
+# 就能回答两件事：① 现在这份配置是哪个版本写下去的；② 想退回上一版时怎么退。
+# 只记文本配置（prompt / patch）—— 它们是字节级的，存全文代价可忽略；
+# 技能库走 backup\<目标>\<时间戳>\ 的目录备份，不塞进 journal。
+$Script:Journal = New-Object System.Collections.ArrayList
+$Script:VersionId = [guid]::NewGuid().ToString('N')
+
+function Add-JournalFile([string]$Path, [string]$BeforeB64, [bool]$Existed, [string]$AfterB64, [string]$BeforeHash, [string]$AfterHash) {
+    [void]$Script:Journal.Add([ordered]@{
+        path = $Path; existed = $Existed; before = $BeforeB64; after = $AfterB64
+        beforeHash = $BeforeHash; afterHash = $AfterHash
+    })
+}
+
+function Write-Journal([string]$Status, [string]$Action) {
+    # 没写任何文本配置（NoSkills / SkillsOnly 等）就不建版本；返回版本 id 或 $null。
+    if ($Script:Journal.Count -eq 0) { return $null }
+    if (-not (Test-Path -LiteralPath $HistoryDir)) { New-Item -ItemType Directory -Force -Path $HistoryDir | Out-Null }
+    $rec = [ordered]@{
+        id = $Script:VersionId
+        target = $Target
+        action = $Action
+        status = $Status
+        at = (Get-Date).ToString('o')
+        toolVersion = $TOOL_VER
+        agentDir = $T.AgentDir
+        files = @($Script:Journal)
+        conflicts = @($Script:RollbackConflicts)
+    }
+    try {
+        Write-AtomicText (Join-Path $HistoryDir ($Script:VersionId + '.json')) (($rec | ConvertTo-Json -Depth 6) + "`r`n") $Utf8NoBom
+        return $Script:VersionId
+    } catch { return $null }
+}
+
+function Assert-Unchanged([string]$Path, [string]$ExpectedHash, [string]$Label) {
+    # 落盘前再验一次：从「算哈希」到「写下去」之间文件可能被别的程序改过（TOCTOU）。
+    # 不一致就停下等人拍板，而不是把别人刚写的内容覆盖掉。
+    if (-not $ExpectedHash) { return }
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        Refuse ($Label + ' 在准备写入期间消失，已停下：' + $Path)
+    }
+    $cur = Get-Sha256 ([System.IO.File]::ReadAllBytes($Path))
+    if ($cur -ne $ExpectedHash) {
+        Refuse ($Label + ' 在准备写入期间被其它程序改动（' + $cur.Substring(0, 12) + '… ≠ ' + $ExpectedHash.Substring(0, 12) + '…），已停下未写入')
+    }
 }
 
 function Test-SameContent([string]$Path, [byte[]]$Bytes) {
@@ -975,7 +1064,7 @@ $DshDefaultBudget = 65536
 # ---------------------------------------------------------------- 自检模式
 
 if ($Check) {
-    Say 'INFO' ('目标端: ' + $T.Label + ' | 配置根: ' + $T.AgentDir)
+    Say 'INFO' ('目标端: ' + $T.Label + ' | 配置根: ' + $T.AgentDir + '（' + $T.AgentDirSource + '）')
 
     # L1 需要两侧同时就位：指令集里的标记块 + 技能库。
     # 旧写法两侧各自置 $l1ok = $true，于是一侧缺失（例如指令集被清掉、
@@ -1178,7 +1267,7 @@ if ($Check) {
 #   ② 通道层（一次真实模型调用）：跑客户端 CLI，问模型「你现在能看见哪些技能」
 # 桌面端跑不了无头，但 CLI 读的是同一个配置根，所以拿 CLI 当探针。
 if ($Probe) {
-    Say 'INFO' ('目标端: ' + $T.Label + ' | 配置根: ' + $T.AgentDir)
+    Say 'INFO' ('目标端: ' + $T.Label + ' | 配置根: ' + $T.AgentDir + '（' + $T.AgentDirSource + '）')
     $state = $null
     if (Test-Path -LiteralPath $StatePath) {
         try { $state = Read-Utf8 $StatePath | ConvertFrom-Json } catch { $state = $null }
@@ -1297,6 +1386,135 @@ if ($Probe) {
     if ($probeOk) { Finish 'OK'; exit 0 }
     Finish 'PARTIAL'
     exit 1
+}
+
+# ---------------------------------------------------------------- 版本历史（可恢复的部署历史）
+
+# 每次部署在 backup\<目标>\history\ 留一份 json：写了哪些文件、写前写后全文、两个哈希。
+# -ListVersions 看列表；-Restore <版本id> 按版本退回（恢复前验 afterHash，不一致默认拦下）。
+if ($ListVersions) {
+    $rows = @()
+    if (Test-Path -LiteralPath $HistoryDir) {
+        foreach ($f in @(Get-ChildItem -LiteralPath $HistoryDir -Filter '*.json' -File | Sort-Object LastWriteTime -Descending)) {
+            try { $j = Read-Utf8 $f.FullName | ConvertFrom-Json } catch { continue }
+            $pm = ''
+            foreach ($fl in @($j.files)) {
+                if ($fl.path -and ([string]$fl.path).EndsWith($T.PromptName)) {
+                    $bh = [string]$fl.beforeHash
+                    $ah = [string]$fl.afterHash
+                    $pm = $(if ($bh) { $bh.Substring(0, 8) } else { '(新建)' }) + ' -> ' + $(if ($ah) { $ah.Substring(0, 8) } else { '-' })
+                }
+            }
+            $rows += [ordered]@{
+                id = [string]$j.id
+                at = [string]$j.at
+                action = [string]$j.action
+                status = [string]$j.status
+                files = @($j.files).Count
+                prompt = $pm
+                agentDir = [string]$j.agentDir
+                restorable = ([string]$j.status -eq 'applied')
+            }
+        }
+    }
+    if ($Json) {
+        $out = Join-Path $WorkRoot ('history-' + $Target + '.json')
+        # 包成对象：PS 5.1 的 ConvertTo-Json 对单元素数组会退化成对象，消费方没法统一处理
+        $payload = [ordered]@{
+            target = $Target
+            agentDir = $T.AgentDir
+            at = (Get-Date).ToString('o')
+            versions = @($rows)
+        }
+        Write-AtomicText $out (($payload | ConvertTo-Json -Depth 4) + "`r`n") $Utf8NoBom
+        Say 'INFO' ('版本列表已写入: ' + $out)
+    } else {
+        Say 'INFO' ('可恢复版本 ' + @($rows).Count + ' 条，目录: ' + $HistoryDir)
+        foreach ($r in $rows) {
+            # 注意：PS 5.1 在括号里不允许在 + 后面换行（会把行尾当成表达式结束），所以先拼到变量
+            $atd = [string]$r.at
+            if ($atd.Length -gt 19) { $atd = $atd.Substring(0, 19).Replace('T', ' ') }
+            $line = $atd.PadRight(21) + ([string]$r.id) + '  ' + ([string]$r.action).PadRight(13) + ([string]$r.status).PadRight(12) + '文件 ' + $r.files + '  ' + [string]$r.prompt
+            Say 'INFO' $line
+        }
+        if (@($rows).Count -eq 0) { Say 'INFO' '还没有版本记录（本工具每次部署都会记一条）' }
+    }
+    Finish 'OK'
+    exit 0
+}
+
+if ($Restore) {
+    $jid = $Restore.Trim().ToLowerInvariant()
+    if ($jid -notmatch '^[0-9a-f]{32}$') { Fail ('版本 id 格式不对（应为 32 位十六进制）: ' + $Restore) }
+    $jf = Join-Path $HistoryDir ($jid + '.json')
+    if (-not (Test-Path -LiteralPath $jf)) { Fail ('找不到这个版本记录: ' + $jf) }
+    $j = Read-Utf8 $jf | ConvertFrom-Json
+    if ([string]$j.status -ne 'applied') { Fail ('这个版本状态是「' + [string]$j.status + '」，只有 applied 的版本能恢复') }
+
+    # 恢复前验：文件当前内容必须还是「那次部署写下去的东西」。
+    # 之后被别的东西改过 → 直接覆盖会丢改动，所以默认停下（-Force 才继续，先另存现场）。
+    $drift = @()
+    foreach ($fl in @($j.files)) {
+        $p = Resolve-Within $T.AgentDir ([string]$fl.path)
+        if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { $drift += ($p + ': 文件已不存在'); continue }
+        $cur = Get-Sha256 ([System.IO.File]::ReadAllBytes($p))
+        $want = [string]$fl.afterHash
+        if ($want -and $cur -ne $want) {
+            $drift += ($p + ': ' + $cur.Substring(0, 12) + '… ≠ 记录 ' + $want.Substring(0, 12) + '…')
+        }
+    }
+    if ($drift.Count -gt 0) {
+        Say 'WARN' ('版本 ' + $jid + ' 恢复前校验不通过（文件在那之后被改过 ' + $drift.Count + ' 项）：' + ($drift -join '；'))
+        if (-not $Force) {
+            Refuse ('这些文件在版本 ' + $jid + ' 之后被改动过，恢复会覆盖改动。确认要退回就加 -Force（会先把当前内容另存一份）')
+        }
+        $driftDir = Join-Path (Join-Path $BackupRoot 'drift') ((Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + $Target + '-restore')
+        New-Item -ItemType Directory -Force -Path $driftDir | Out-Null
+        foreach ($fl in @($j.files)) {
+            $p = Resolve-Within $T.AgentDir ([string]$fl.path)
+            if (Test-Path -LiteralPath $p -PathType Leaf) {
+                Copy-Item -LiteralPath $p -Destination (Join-Path $driftDir (Split-Path -Leaf $p)) -Force -ErrorAction SilentlyContinue
+            }
+        }
+        Say 'WARN' ('已按 -Force 继续恢复；恢复前的改动另存于: ' + $driftDir)
+    }
+
+    $n = 0
+    foreach ($fl in @($j.files)) {
+        $p = Resolve-Within $T.AgentDir ([string]$fl.path)
+        if ($fl.existed -eq $true -and $fl.before) {
+            Write-Utf8NoBom $p ([System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([string]$fl.before)))
+        } else {
+            if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue }
+        }
+        $n++
+        Say 'INFO' ('已还原: ' + $p)
+    }
+    $j.status = 'restored'
+    $j | Add-Member -NotePropertyName restoredAt -NotePropertyValue ((Get-Date).ToString('o')) -Force
+    Write-AtomicText $jf (($j | ConvertTo-Json -Depth 6) + "`r`n") $Utf8NoBom
+    # 状态清单里的哈希跟着更新，否则下次卸载会把「刚恢复的内容」当成漂移
+    if (Test-Path -LiteralPath $StatePath) {
+        try {
+            $st = Read-Utf8 $StatePath | ConvertFrom-Json
+            $ph = ''
+            foreach ($fl in @($j.files)) {
+                if (([string]$fl.path).EndsWith($T.PromptName)) {
+                    $ph = $(if ($fl.existed -eq $true) { [string]$fl.beforeHash } else { '' })
+                }
+            }
+            if ($st.fileHashes) {
+                $st.fileHashes.prompt.after = $ph
+                $st.fileHashes.prompt.before = ''
+            }
+            $st | Add-Member -NotePropertyName restoredFrom -NotePropertyValue $jid -Force
+            Write-AtomicText $StatePath (($st | ConvertTo-Json -Depth 5) + "`r`n") $Utf8NoBom
+            Say 'INFO' ('状态清单已同步（restoredFrom=' + $jid + '）')
+        } catch { Say 'WARN' ('状态清单同步失败（不影响文件已恢复）: ' + $_.Exception.Message) }
+    }
+    Say 'INFO' ('已按版本 ' + $jid + ' 恢复 ' + $n + ' 个文件；技能库未动（需要时用 -Uninstall 或重新部署）')
+    Finish 'OK'
+    exit 0
 }
 
 # ---------------------------------------------------------------- 附加包移除（RemoveAddons）
@@ -1494,7 +1712,7 @@ if ($Uninstall) {
 
 # ---------------------------------------------------------------- 安装
 
-Say 'INFO' ('目标端: ' + $T.Label + ' | 配置根: ' + $T.AgentDir)
+Say 'INFO' ('目标端: ' + $T.Label + ' | 配置根: ' + $T.AgentDir + '（' + $T.AgentDirSource + '）')
 
 if (-not (Test-Path -LiteralPath $T.AgentDir)) {
     New-Item -ItemType Directory -Force -Path $T.AgentDir | Out-Null
@@ -1562,8 +1780,10 @@ $budgetVal     = $null
 $budgetSrcVal  = $null
 $promptBeforeHash = ''
 $promptAfterHash  = ''
+$promptBeforeB64  = ''
 $patchBeforeHash  = ''
 $patchAfterHash   = ''
+$patchBeforeB64   = ''
 $currentText   = ''
 if ($hadPromptFile) { $currentText = Read-Utf8 $PromptTarget }
 # 标记块健康检查。默认只报错不改文件 —— 用户文件里出现重复/颠倒的标记，
@@ -1624,14 +1844,22 @@ $newText     = ($baseText.TrimEnd() + "`r`n`r`n" + $block + "`r`n").TrimStart()
 # 旧写法每次重注入都整文件重写一遍，即使内容一模一样。
 $newBytes    = [System.Text.Encoding]::UTF8.GetBytes($newText)
 $promptFull  = Assert-Writable $T.AgentDir $PromptTarget
-$promptBeforeHash = if (Test-Path -LiteralPath $promptFull) { Get-Sha256 ([System.IO.File]::ReadAllBytes($promptFull)) } else { '' }
+$promptBeforeB64 = ''
+if (Test-Path -LiteralPath $promptFull) {
+    $pb = [System.IO.File]::ReadAllBytes($promptFull)
+    $promptBeforeHash = Get-Sha256 $pb
+    $promptBeforeB64 = [Convert]::ToBase64String($pb)
+} else { $promptBeforeHash = '' }
 if (Test-SameContent $promptFull $newBytes) {
     $promptAfterHash = $promptBeforeHash
     Say 'INFO' ('指令集已是目标内容，未重复写入: ' + $promptFull + '（版本 ' + $VersionLabel + '，模式 ' + $SkillMode + '）')
 } else {
+    # 从上面算哈希到这里之间可能被别的程序改过（TOCTOU），写之前再验一次
+    Assert-Unchanged $promptFull $promptBeforeHash $T.PromptName
     Register-FileRollback $promptFull
     Write-Utf8NoBom $promptFull $newText
     $promptAfterHash = Get-Sha256 $newBytes
+    Add-JournalFile $promptFull $promptBeforeB64 ($promptBeforeHash -ne '') ([Convert]::ToBase64String($newBytes)) $promptBeforeHash $promptAfterHash
     Say 'INFO' ('已写入指令集: ' + $promptFull + '（' + $promptBody.Length + ' 字符，版本 ' + $VersionLabel + '，模式 ' + $SkillMode + '）')
 }
 }
@@ -1667,10 +1895,16 @@ if (($Target -eq 'dsh') -and (-not $SkillsOnly)) {
     }
     $patchLayer = Get-PatchBody $budget
     $newPatch = ($patchBase.TrimEnd() + "`r`n`r`n" + $patchLayer + "`r`n").TrimStart()
-    if (Test-Path -LiteralPath $PatchFile) { $patchBeforeHash = Get-Sha256 ([System.IO.File]::ReadAllBytes($PatchFile)) }
+    if (Test-Path -LiteralPath $PatchFile) {
+        $pb2 = [System.IO.File]::ReadAllBytes($PatchFile)
+        $patchBeforeHash = Get-Sha256 $pb2
+        $patchBeforeB64 = [Convert]::ToBase64String($pb2)
+    }
+    Assert-Unchanged $PatchFile $patchBeforeHash 'cordis.patch.yml'
     Register-FileRollback $PatchFile
     Write-Utf8NoBom $PatchFile $newPatch
     $patchAfterHash = Get-Sha256 ([System.Text.Encoding]::UTF8.GetBytes($newPatch))
+    Add-JournalFile $PatchFile $patchBeforeB64 ($patchBeforeHash -ne '') ([Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($newPatch))) $patchBeforeHash $patchAfterHash
     $patchFileRel = $PatchFile
     $budgetVal    = $budget
     $budgetSrcVal = $budgetSource
@@ -1862,7 +2096,10 @@ $sourcePromptLeaf = (Split-Path -Leaf $SourcePrompt)
 if ($SkillsOnly -and $prevState -and $prevState.sourcePrompt) { $sourcePromptLeaf = [string]$prevState.sourcePrompt }
 # 回滚命令写进证据里：出事了不用猜怎么退回去（哈希表字面量里不放多行 if，先赋值）
 $rollbackCmd = 'inject.ps1 -Target ' + $Target + ' -Uninstall'
-if ($Script:BaselineDrift.Count -gt 0) { $rollbackCmd += ' -Force（当前有基线漂移，默认会被拦下）' }
+if ($Script:Journal.Count -gt 0) {
+    $rollbackCmd += '｜按版本恢复: inject.ps1 -Target ' + $Target + ' -Restore ' + $Script:VersionId
+}
+if ($Script:BaselineDrift.Count -gt 0) { $rollbackCmd += '（当前有基线漂移，默认会被拦下）' }
 $state = [ordered]@{
     version             = $TOOL_VER
     target              = $Target
@@ -1891,6 +2128,8 @@ $state = [ordered]@{
     # 本次写入的落地记录：能回答「这次到底写了什么、写前写后长什么样」
     status              = 'OK'
     conflicts           = @($Script:RollbackConflicts)
+    # 哪个版本写下去的（对应 backup\<目标>\history\<id>.json，可按版本恢复）
+    versionId           = $(if ($Script:Journal.Count -gt 0) { $Script:VersionId } else { $null })
     fileHashes          = [ordered]@{
         prompt = [ordered]@{ path = $PromptTarget; before = $promptBeforeHash; after = $promptAfterHash }
         patch  = [ordered]@{ path = $(if ($patchFileRel) { $PatchFile } else { $null }); before = $patchBeforeHash; after = $patchAfterHash }
@@ -1912,6 +2151,8 @@ $state = [ordered]@{
 }
 Write-Utf8NoBom $StatePath (($state | ConvertTo-Json -Depth 5) + "`r`n")
 $Script:OpSkills = @($installedSkills).Count
+# 版本日志：状态清单写成功后才落盘，避免「日志里有一个失败的版本」
+$Script:VersionId = Write-Journal 'applied' $(if ($SkillsOnly) { 'skills-only' } else { 'deploy' })
 # 状态清单已落盘，本次部署算完成 —— 清掉回滚日志，
 # 否则后续任何无关错误都会把已经记录在案的部署撤销掉。
 $Script:Rollback.Clear()

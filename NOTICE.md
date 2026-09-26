@@ -29,11 +29,15 @@
 | 文件 | 来源 |
 |---|---|
 | `prompts/_glm53f-kovak.md` | 收编自 `chiina66/glm5.3f-jailbreak`（仅保留正文与思考通道锚定部分，上游无量化数据） |
-| `prompts/_gpt6-astra-header.md` | 收编自上游开源仓库模板；**已删除上游的「中转站保护」商业条款段**，正文未改 |
-| `prompts/_gpt56sol-header.md` | 同上，收编自上游开源仓库模板；同样删除商业条款段 |
+| `prompts/_gpt6-astra-header.md` | 收编自 [3641397194-wq/gpt6-Astra](https://github.com/3641397194-wq/gpt6-Astra)（MIT）`e868f60`；**已删除上游的「中转站保护」商业条款段**，其余正文未改 |
+| `prompts/_gpt56sol-header.md` | 同 gpt6-Astra 仓库（MIT）`e868f60`；同样删除商业条款段 |
+| `prompts/_ext-subst.md` 的口语对照表 | 部分条目收编自 gpt6-Astra（MIT）`e868f60` 的路由归一表（`desktop/src/lib/packs/routes/NORMALIZER.md`），按本仓库形态重排为「归一 → 工程表述」 |
 
 其余模板（`_sandbox-v5-header.md` / `_v51b-header.md` / `_v52c-header.md` / `_glm-neutral-header.md` /
 `v5-body.md` / `glm-dshpurge.md`）为本仓库自研。
+
+机制层面的引用记录（含 repo / commit / 许可证 / 引用方式 / 具体借了什么）见
+[deploy-contract.json](deploy-contract.json) 的 `cleanroom` 段，`skill_tool.py contract` 会校验它与 README 一致。
 
 ---
 

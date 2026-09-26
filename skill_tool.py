@@ -760,16 +760,22 @@ def cmd_contract(args):
     readme = read(README_PATH) if os.path.isfile(README_PATH) else ''
     for name, src in (c.get('cleanroom') or {}).items():
         repo, commit, lic = src.get('repo'), src.get('commit'), src.get('license')
+        mode = src.get('mode') or ''
         if not (repo and commit and lic and src.get('method')):
             errors.append('cleanroom.%s 缺 repo/commit/license/method（溯源不能只写一句话）' % name)
             continue
-        if len(commit) != 40 or not all(ch in '0123456789abcdef' for ch in commit.lower()):
-            errors.append('cleanroom.%s.commit 不是 40 位 sha：%s' % (name, commit))
+        if mode not in ('clean-room', 'reuse'):
+            errors.append('cleanroom.%s.mode 必须是 clean-room 或 reuse（决定能不能复用正文）' % name)
+        if not re.fullmatch(r'[0-9a-f]{7,40}', str(commit).lower()):
+            errors.append('cleanroom.%s.commit 不像 commit（短哈希至少 7 位）：%s' % (name, commit))
         for label, needle in (('repo', repo), ('license', lic), ('commit', commit)):
             if needle not in readme:
                 errors.append('README 没写 cleanroom.%s 的 %s（%s）—— 口头致谢不算溯源' % (name, label, needle))
-        if not any(x in readme for x in ('未使用其代码', '未复制', 'clean-room', 'clean room')):
-            errors.append('README 没写明「只借设计、未取文本」（clean-room）')
+        # 非宽松许可只能借机制；宽松许可（MIT 这类）才能复用正文
+        if mode == 'clean-room' and not any(x in readme for x in ('未使用其代码', '未复制', 'clean-room', 'clean room')):
+            errors.append('cleanroom.%s 是 clean-room，但 README 没写明「只借设计、未取文本」' % name)
+        if mode == 'reuse' and '允许复用' not in readme:
+            errors.append('cleanroom.%s 是 reuse，README 里应说明「该许可允许复用正文」' % name)
     if 'GPL-3.0' in json.dumps(c, ensure_ascii=False) and not (c.get('cleanroom')):
         errors.append('契约里提到了第三方许可证，但没写 cleanroom 溯源段')
 
@@ -780,7 +786,7 @@ def cmd_contract(args):
           % (len(disk), lib.get('minSkills'), ncat))
     print('  目标端        %s' % '、'.join(t.get('label') or t.get('key') or '?' for t in c.get('targets') or []))
     print('  退出码        %s' % '、'.join(sorted((c.get('exitCodes') or {}).keys())))
-    print('  溯源          %s' % '、'.join('%s %s (%s)' % (k, v.get('commit', '')[:7], v.get('license'))
+    print('  溯源          %s' % '、'.join('%s %s (%s/%s)' % (k, str(v.get('commit', ''))[:7], v.get('license'), v.get('mode'))
                                           for k, v in (c.get('cleanroom') or {}).items()))
     for w in warnings:
         print('  ⚠ %s' % w)
