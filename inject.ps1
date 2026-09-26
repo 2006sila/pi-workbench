@@ -12,7 +12,13 @@ param(
     [switch]$Check,
     [switch]$NoSkills,
     [switch]$SkillsOnly,
-    [string]$RemoveAddons
+    [string]$RemoveAddons,
+
+    # 技能呈现模式：
+    #   full（默认）= 65 个模块全部进系统提示词，AI 按描述自选
+    #   menu         = 只留一个菜单技能进提示词，模块加 disable-model-invocation，按需 read
+    [ValidateSet('full', 'menu', 'auto')]
+    [string]$SkillMode = 'auto'
 )
 
 Set-StrictMode -Off
@@ -216,6 +222,146 @@ function Get-SkillDirs([string]$Root) {
         Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'SKILL.md') })
 }
 
+# ---------------------------------------------------------------- 极简模式（菜单路由）
+# 机制：给每个模块技能的 frontmatter 加一行 disable-model-invocation: true，
+# Pi 的 formatSkillsForSystemPrompt 会把它们整个滤除（不进系统提示词、不占每轮开销），
+# 只留一个菜单技能进提示词；agent 按菜单里的模块 id 直接 read 对应 SKILL.md。
+# 同一个技能仍可用 /skill:<名字> 手动强制加载，作为兜底。
+
+function Read-TextKeepBom([string]$Path) {
+    # 读文本并告诉调用方原文件是否有 BOM（写回时保持一致）
+    $raw = [System.IO.File]::ReadAllBytes($Path)
+    $hasBom = ($raw.Length -ge 3 -and $raw[0] -eq 0xEF -and $raw[1] -eq 0xBB -and $raw[2] -eq 0xBF)
+    $text = [System.Text.Encoding]::UTF8.GetString($raw)
+    if ($hasBom -and $text.Length -gt 0 -and [int]$text[0] -eq 0xFEFF) { $text = $text.Substring(1) }
+    return @($text, $hasBom)
+}
+
+function Get-FrontField([string]$Text, [string]$Key) {
+    # 读 SKILL.md frontmatter 字段值。支持四种写法：行内文本 / 双引号 / 单引号 /
+    # YAML 块标量（| 或 >）—— 本技能库有 8 个模块用块标量写 description，
+    # 裸正则会把它读成「| 开头的正文」。
+    $m = [regex]::Match($Text, '(?s)^---\r?\n(.*?)\r?\n---')
+    if (-not $m.Success) { return '' }
+    $fm = $m.Groups[1].Value
+    $mm = [regex]::Match($fm, '(?m)^' + [regex]::Escape($Key) + ':[ \t]*(.*)$')
+    if (-not $mm.Success) { return '' }
+    $first = $mm.Groups[1].Value.Trim()
+    if ($first -eq '|' -or $first -eq '>' -or $first -eq '|-' -or $first -eq '>-' -or $first -eq '|+' -or $first -eq '>+') {
+        $rest = $fm.Substring($mm.Index + $mm.Length)
+        $parts = @()
+        foreach ($ln in ($rest -split "\r?\n")) {
+            if ([string]::IsNullOrWhiteSpace($ln)) { continue }
+            if ($ln -match '^[ \t]+') { $parts += $ln.Trim() } else { break }
+        }
+        return ($parts -join ' ')
+    }
+    if ($first.Length -ge 2) {
+        $a = $first[0]; $b = $first[$first.Length - 1]
+        if (($a -eq '"' -or $a -eq "'") -and $a -eq $b) { return $first.Substring(1, $first.Length - 2) }
+    }
+    return $first
+}
+
+function Add-DisableModelInvocation([string]$Path) {
+    # 向 frontmatter 末尾插入 disable-model-invocation: true。
+    # 保原行尾（CRLF/LF）与 BOM —— 否则一注入就整文件重写，库文件全变成 LF。
+    # 返回 $true 表示已就位（本次插入或未已存在）。
+    $p = Read-TextKeepBom $Path
+    $text = $p[0]; $hasBom = $p[1]
+    $m = [regex]::Match($text, '(?s)^(---\r?\n)(.*?)(\r?\n---)')
+    if (-not $m.Success) { return $false }
+    if ($m.Groups[2].Value -match '(?m)^disable-model-invocation[ \t]*:') { return $true }
+    $nl = if ($m.Groups[1].Value.Contains("`r`n")) { "`r`n" } else { "`n" }
+    $new = $m.Groups[1].Value + $m.Groups[2].Value + $nl + 'disable-model-invocation: true' + $m.Groups[3].Value + $text.Substring($m.Index + $m.Length)
+    $enc = if ($hasBom) { New-Object System.Text.UTF8Encoding($true) } else { $Utf8NoBom }
+    [System.IO.File]::WriteAllText($Path, $new, $enc)
+    return $true
+}
+
+function Test-DisableModelInvocation([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path)) { return $false }
+    $t = (Read-TextKeepBom $Path)[0]
+    return [bool]([regex]::IsMatch($t, '(?m)^disable-model-invocation[ \t]*:[ \t]*true'))
+}
+
+function Shorten-Desc([string]$Desc) {
+    # 描述压成一行：去掉「触发词：」尾缀，取首句，过长在词边界截断
+    $d = ($Desc -replace '\s+', ' ').Trim()
+    $d = ($d -split '\s*(?:触发词|触发器)[:：]')[0].Trim()
+    $parts = [regex]::Split($d, '(?<=[。；;])')
+    if ($parts.Count -gt 0 -and $parts[0].Length -le 72) { $d = $parts[0] }
+    if ($d.Length -gt 72) {
+        $cut = $d.Substring(0, 72)
+        foreach ($sep in @(' ', '，', '、')) {
+            $i = $cut.LastIndexOf($sep)
+            if ($i -gt 36) { $cut = $cut.Substring(0, $i); break }
+        }
+        $d = $cut.TrimEnd() + '…'
+    }
+    return $d
+}
+
+function New-SkillMenu {
+    # 生成菜单技能：只列「有哪些模块 + 何时用」+ 取用纪律，正文按需读。
+    # 以类目表（skill-categories.json）分类；未登记的模块归入「其他」。
+    param([string]$Target, [string[]]$ModuleIds, [string]$CatFile, [string]$MenuName)
+    $cats = @()
+    if (Test-Path -LiteralPath $CatFile) {
+        try { $cats = @((Read-Utf8 $CatFile | ConvertFrom-Json).categories) } catch { $cats = @() }
+    }
+    $one = @{}
+    foreach ($id in $ModuleIds) {
+        $p = Join-Path (Join-Path $Target $id) 'SKILL.md'
+        if (-not (Test-Path -LiteralPath $p)) { continue }
+        $one[$id] = Shorten-Desc (Get-FrontField (Read-TextKeepBom $p)[0] 'description')
+    }
+    $placed = @{}
+    $lines = New-Object System.Collections.ArrayList
+    foreach ($c in $cats) {
+        $hit = @()
+        foreach ($m in $c.modules) { if ($one.ContainsKey([string]$m)) { $hit += [string]$m } }
+        if ($hit.Count -eq 0) { continue }
+        foreach ($h in $hit) { $placed[$h] = $true }
+        [void]$lines.Add('')
+        [void]$lines.Add('### ' + [string]$c.name)
+        [void]$lines.Add('')
+        [void]$lines.Add('| 模块 | 何时用 |')
+        [void]$lines.Add('|---|---|')
+        foreach ($h in $hit) { [void]$lines.Add('| `' + $h + '` | ' + $one[$h] + ' |') }
+    }
+    $rest = @($ModuleIds | Where-Object { -not $placed.ContainsKey($_) })
+    if ($rest.Count -gt 0) {
+        [void]$lines.Add('')
+        [void]$lines.Add('### 其他')
+        [void]$lines.Add('')
+        [void]$lines.Add('| 模块 | 何时用 |')
+        [void]$lines.Add('|---|---|')
+        foreach ($h in $rest) { [void]$lines.Add('| `' + $h + '` | ' + $one[$h] + ' |') }
+    }
+    $desc = '技能菜单与路由。任务需要专业技能时先读本文件，按类目定位到模块 id，再读该模块的 SKILL.md 全文后执行。触发：需要专业技能、找技能、技能菜单。'
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append("---`r`n")
+    [void]$sb.Append('name: ' + $MenuName + "`r`n")
+    [void]$sb.Append('description: ' + $desc + "`r`n")
+    [void]$sb.Append("---`r`n`r`n")
+    [void]$sb.Append('# 技能菜单 · ' + $one.Count + " 个模块`r`n`r`n")
+    [void]$sb.Append("本目录下每个模块都是一个技能目录：``<本技能根>/<模块 id>/SKILL.md``。`r`n")
+    [void]$sb.Append("本文件只给「有哪些模块 + 何时用」，正文按需读。`r`n`r`n")
+    [void]$sb.Append("## 取用纪律`r`n`r`n")
+    [void]$sb.Append("1. 初始只选 **1 个**最匹配的模块，读完 ``SKILL.md`` 再动手。`r`n")
+    [void]$sb.Append("2. 一个阶段内最多加载 **4 个**模块正文；确需跨领域时才取第二个。`r`n")
+    [void]$sb.Append("3. 找不到匹配模块就用自身知识继续执行，**不要为凑数读无关模块**。`r`n")
+    [void]$sb.Append("4. 动手前先报一行：``使用技能 N 个，取自: <模块id>.md | …``。`r`n`r`n")
+    [void]$sb.Append("## 模块清单`r`n")
+    [void]$sb.Append(($lines -join "`r`n"))
+    [void]$sb.Append("`r`n")
+    $menuDir = Join-Path $Target $MenuName
+    New-Item -ItemType Directory -Force -Path $menuDir | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $menuDir 'SKILL.md'), $sb.ToString(), $Utf8NoBom)
+    return $one.Count
+}
+
 function Get-ClientProcess {
     $found = @()
     foreach ($n in $T.ProcNames) {
@@ -377,6 +523,34 @@ if ($Check) {
         }
     }
     $l1ok = ($promptOk -and $skillsOk)
+
+    # 极简模式额外校验（仅当状态清单记录了 skillMode=menu）
+    if ($state -and $state.skillMode -eq 'menu') {
+        $mName = if ($state.menuSkill) { [string]$state.menuSkill } else { 'pi-workbench-menu' }
+        $mPath = Join-Path $SkillsTarget ($mName + '\SKILL.md')
+        if (Test-Path -LiteralPath $mPath) {
+            Say 'L1' ('极简模式：菜单技能就位 ' + $mName)
+        } else {
+            Say 'WARN' ('极简模式：菜单技能缺失 ' + $mName + '（AI 将看不到任何技能）')
+            $l1ok = $false
+        }
+        $unflagged = @()
+        $checkedMods = 0
+        foreach ($n in @($state.installedSkills)) {
+            if ($n -eq $mName) { continue }
+            $p = Join-Path $SkillsTarget ($n + '\SKILL.md')
+            if (-not (Test-Path -LiteralPath $p)) { continue }
+            $checkedMods++
+            if (-not (Test-DisableModelInvocation $p)) { $unflagged += $n }
+        }
+        if ($unflagged.Count -eq 0) {
+            Say 'L1' ('极简模式：' + $checkedMods + ' 个模块均不进系统提示词（占位符校验通过）')
+        } else {
+            Say 'WARN' ('极简模式：' + $unflagged.Count + ' 个模块未标记，仍会进系统提示词: ' + (($unflagged | Select-Object -First 5) -join ', '))
+            $l1ok = $false
+        }
+    }
+
     if (-not $l1ok) {
         Say 'L1' ('L1 未通过：' + $T.PromptName + ' 标记块与技能库需同时就位')
     }
@@ -809,9 +983,66 @@ if ($SkillsOnly -and $prevState) {
         }
     }
 }
+
+# 技能呈现模式：极简模式给模块加 disable-model-invocation（不进系统提示词）
+# + 生成一个菜单技能进提示词；agent 按菜单里的模块 id 直接 read 对应 SKILL.md。
+$MenuSkillName = 'pi-workbench-menu'
+$MenuModules   = 0
+# 未显式指定时沿用上次记录的模式——否则「部署附加包」这类局部操作
+# （不传 -SkillMode）会误走完整模式分支，把极简模式的菜单技能删掉。
+if ($SkillMode -eq 'auto') {
+    if ($prevState -and $prevState.skillMode -and (@('full', 'menu') -contains [string]$prevState.skillMode)) {
+        $SkillMode = [string]$prevState.skillMode
+    } else {
+        $SkillMode = 'full'
+    }
+}
+if (-not $NoSkills) {
+    if ($SkillMode -eq 'menu') {
+        $menuable = @($installedSkills | Where-Object { $_ -ne $MenuSkillName })
+        $flagged = 0
+        foreach ($n in $menuable) {
+            $p = Join-Path (Join-Path $SkillsTarget $n) 'SKILL.md'
+            if (-not (Test-Path -LiteralPath $p)) { continue }
+            if (Add-DisableModelInvocation $p) { $flagged++ }
+            else { Say 'WARN' ('frontmatter 异常，未能注入标记: ' + $n) }
+        }
+        # 菜单技能若已存在且不是上次我们部署的，先备份
+        $menuDest = Join-Path $SkillsTarget $MenuSkillName
+        if (Test-Path -LiteralPath $menuDest) {
+            $menuWasOurs = ($prevState -and $prevState.installedSkills -and ($prevState.installedSkills -contains $MenuSkillName))
+            if (-not $menuWasOurs) {
+                $bk = Join-Path (Join-Path $BackupDir 'skills') $MenuSkillName
+                New-Item -ItemType Directory -Force -Path (Split-Path -Parent $bk) | Out-Null
+                Copy-Tree $menuDest $bk
+                $overwrittenSkills[$MenuSkillName] = $bk
+                Say 'WARN' ('同名技能已存在，已备份原目录: ' + $MenuSkillName)
+            }
+            Remove-Item -LiteralPath $menuDest -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        $MenuModules = New-SkillMenu -Target $SkillsTarget -ModuleIds $menuable -CatFile (Join-Path $Base 'skill-categories.json') -MenuName $MenuSkillName
+        if ($MenuModules -gt 0) {
+            if ($installedSkills -notcontains $MenuSkillName) { $installedSkills += $MenuSkillName }
+            Say 'INFO' ('极简模式：已生成菜单技能 ' + $MenuSkillName + '（列 ' + $MenuModules + ' 个模块），' + $flagged + ' 个模块已标记不进提示词')
+        } else {
+            Say 'WARN' '极简模式：没有可列出的模块，菜单未生成，本次按完整模式呈现'
+            $SkillMode = 'full'
+        }
+    } else {
+        # 完整模式：清掉上次极简模式留下的菜单技能（否则它会成孤儿，卸载清不掉）
+        $menuDest = Join-Path $SkillsTarget $MenuSkillName
+        if (Test-Path -LiteralPath $menuDest) {
+            $menuWasOurs = ($prevState -and $prevState.installedSkills -and ($prevState.installedSkills -contains $MenuSkillName))
+            if ($menuWasOurs) {
+                Remove-Item -LiteralPath $menuDest -Recurse -Force -ErrorAction SilentlyContinue
+                $installedSkills = @($installedSkills | Where-Object { $_ -ne $MenuSkillName })
+                Say 'INFO' ('已移除上次极简模式留下的菜单技能: ' + $MenuSkillName)
+            }
+        }
+    }
+}
 $sourcePromptLeaf = (Split-Path -Leaf $SourcePrompt)
 if ($SkillsOnly -and $prevState -and $prevState.sourcePrompt) { $sourcePromptLeaf = [string]$prevState.sourcePrompt }
-
 $state = [ordered]@{
     version             = $TOOL_VER
     target              = $Target
@@ -828,6 +1059,8 @@ $state = [ordered]@{
     overwrittenSkills   = $overwrittenSkills
     skillsSource        = $SkillsSource
     skillsOnly          = $SkillsOnlyFlag
+    skillMode           = $SkillMode
+    menuSkill           = $(if ($SkillMode -eq 'menu') { $MenuSkillName } else { $null })
     skillsTarget        = $SkillsTarget
     hadSkillsDir        = $origSkillsDir
     patchFile           = $patchFileRel

@@ -17,6 +17,7 @@ DATAS = [
     ('inject-pideck.ps1', '.'),
     ('inject-dsh.ps1', '.'),
     ('app.ico', '.'),
+    ('skill-categories.json', '.'),
     ('prompts', 'prompts'),
     ('skills-v4', 'skills-v4'),
 ]

@@ -1,0 +1,101 @@
+{
+  "_comment": "极简模式的菜单技能按此分类生成。模块 id 必须与 skills-v4/<id>/SKILL.md 对应；未列出的模块归入「其他」。新增技能后在这里登记。",
+  "menu_skill_name": "pi-workbench-menu",
+  "menu_skill_title": "技能菜单",
+  "categories": [
+    {
+      "name": "逆向 / 二进制",
+      "modules": [
+        "reverse-engineering",
+        "binary-analysis",
+        "binary-diff",
+        "radare2",
+        "ida-reverse",
+        "dotnet-reverse",
+        "dsl-vm-reverse",
+        "dynamic-instrumentation",
+        "patch-diff-exploit",
+        "pwn-chain",
+        "firmware-pentest",
+        "protocol-reversing",
+        "protocol-reverse-engineering"
+      ]
+    },
+    {
+      "name": "移动端",
+      "modules": [
+        "apk-reverse",
+        "mobile-reverse",
+        "mobile-security",
+        "mobile-competitive-game-security"
+      ]
+    },
+    {
+      "name": "破解 / 授权",
+      "modules": [
+        "crack-keygen",
+        "full-crack"
+      ]
+    },
+    {
+      "name": "渗透 / 红队",
+      "modules": [
+        "network-pentest",
+        "full-pentest",
+        "attack-chain",
+        "pentest-tools",
+        "api-security",
+        "js-reverse",
+        "reverse-engineering-api",
+        "seagull-pentest",
+        "seagull-social-eng",
+        "phishing-kit"
+      ]
+    },
+    {
+      "name": "免杀 / 对抗",
+      "modules": [
+        "edr-bypass-re",
+        "seagull-evasion",
+        "anti-cheat",
+        "dma-attack"
+      ]
+    },
+    {
+      "name": "游戏安全",
+      "modules": [
+        "game-cheat",
+        "game-hacking",
+        "game-engine",
+        "graphics-api",
+        "seagull-game-hack",
+        "seagull-game-security",
+        "seagull-game-redteam",
+        "seagull-anticheat"
+      ]
+    },
+    {
+      "name": "样本 / 情报",
+      "modules": [
+        "seagull-malware",
+        "seagull-lab",
+        "seagull-memory",
+        "seagull-reverse",
+        "research-rigor"
+      ]
+    },
+    {
+      "name": "Windows 内核",
+      "modules": [
+        "windows-kernel"
+      ]
+    },
+    {
+      "name": "工程交付",
+      "modules": [
+        "code-quality-gate",
+        "task-boundary"
+      ]
+    }
+  ]
+}

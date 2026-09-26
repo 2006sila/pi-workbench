@@ -46,6 +46,9 @@ Pi 系客户端读两类东西：**系统提示词**（每轮都在上下文里�
 
 - 7 个指令集模板，按目标模型分组（见下）
 - 65 个技能模块，可在技能库里搜索、按来源筛选、一键禁用/启用（移到 `skills-disabled/`）
+- **技能呈现模式**（`-SkillMode`）：
+  - `full`（默认）= 65 个模块全部进系统提示词，AI 按描述自选
+  - `menu` = 只留一个菜单技能进提示词（约 90 tokens/轮），模块加 `disable-model-invocation` 不进提示词，AI 按菜单里的模块 id 按需 `read`
 - **附加技能包**：两个独立技能包可与模板一起部署，也可单独部署 / 单独移除
 - 启动时自动重注入开关（按上次记录的模板幂等覆盖）
 - 打包自检：验证单文件 exe 内的脚本、模板、技能库、图标都可寻址
@@ -63,6 +66,42 @@ Pi 系客户端读两类东西：**系统提示词**（每轮都在上下文里�
 | 模板库（深色） | 技能库（浅色） |
 |---|---|
 | ![模板库](docs/shot-templates-dark.png) | ![技能库](docs/shot-skills-light.png) |
+
+---
+
+## 技能呈现模式：完整 / 极简
+
+Pi 会在启动时把每个技能的**名字 + 描述 + 路径**写进系统提示词（只写这三样，不写正文）。
+65 个技能合计约 **28,900 字符 ≈ 7,000 tokens / 每轮** —— 这是固定开销，跟技能库大小线性相关。
+
+`-SkillMode menu` 把它压到 **1 条（约 90 tokens / 每轮）**：
+
+```text
+skills/
+├── pi-workbench-menu/SKILL.md   ← 唯一进提示词的技能：类目 + 65 个模块「何时用」+ 取用纪律
+├── pwn-chain/SKILL.md           ⎫
+├── ida-reverse/SKILL.md         ⎬ frontmatter 里多一行 disable-model-invocation: true
+└── …（其余 63 个）                ⎭ → Pi 的 formatSkillsForSystemPrompt 会把它们整个滤除
+```
+
+模块文件位置不变，AI 按菜单里的模块 id 直接 `read` 对应 `SKILL.md`（`/skill:<名字>` 也仍可手动强制加载，作为兜底）。
+类目由仓库根的 [skill-categories.json](skill-categories.json) 决定；未登记的模块归入「其他」。
+
+**两种模式对比**（用 Pi 自己的加载器实测）：
+
+| | 完整模式 `full` | 极简模式 `menu` |
+|---|---|---|
+| Pi 加载的技能 | 65 | 66 |
+| 进提示词 | 65 条 | **1 条** |
+| 提示词块 | 28,922 字符 | **609 字符（2.1%）** |
+| 每轮固定开销 | ≈7,000 tokens | ≈90 tokens |
+| 代价 | — | AI 多一跳（先读菜单再读正文）；依赖它遵守取用纪律 |
+
+**切换**：两种模式互相切换是幂等的 —— 切回 `full` 会自动删掉菜单技能、并用源文件覆盖掉模块上那行标记。
+切换时机：重注入时传 `-SkillMode` 即可（同一模式下重跑也是幂等替换）。
+
+> 提示：`disable-model-invocation` 是 Agent Skills 规范字段，已在 Pi 上实测；
+> 其他客户端（如 DSH）是否识别未验证 —— 不确定时先用 `full`。
 
 ---
 
@@ -180,6 +219,14 @@ powershell -ExecutionPolicy Bypass -File inject.ps1 -Target dsh -SkillsSource 's
 # 自检：L1 文件层 / L2 配置层 / L3 进程层（退出码 0=通过，1=有未通过项）
 powershell -ExecutionPolicy Bypass -File inject.ps1 -Target dsh -Check
 
+# 极简模式部署（只留一个菜单技能进提示词，65 个模块按需读）
+powershell -ExecutionPolicy Bypass -File inject.ps1 -Target pideck `
+    -SourcePrompt prompts\_v52c-header.md -SkillMode menu
+
+# 切回完整模式（自动删掉菜单技能、还原模块标记）
+powershell -ExecutionPolicy Bypass -File inject.ps1 -Target pideck `
+    -SourcePrompt prompts\_v52c-header.md -SkillMode full
+
 # 卸载还原
 powershell -ExecutionPolicy Bypass -File inject.ps1 -Target pideck -Uninstall
 
@@ -206,6 +253,7 @@ pi-workbench/
 ├── build.cmd                  一键构建
 ├── requirements.txt
 ├── app.ico                    应用图标（7 尺寸）
+├── skill-categories.json      技能类目表（极简模式的菜单按此分类生成）
 ├── inject.ps1                 注入器核心（双目标：安装 / 卸载 / 自检 / 附加包）
 ├── inject-pideck.ps1          PiDeck 便捷入口
 ├── inject-dsh.ps1             DeepSeek Harness 便捷入口
@@ -258,6 +306,14 @@ pi-workbench/
 ---
 
 ## 更新记录
+
+**V1.2 · 2026-09-26**
+
+- 新增技能呈现模式：`-SkillMode full|menu`
+  - `menu`（极简）：只留一个菜单技能进系统提示词，其余 65 个模块加 `disable-model-invocation` 不进提示词，AI 按需 `read`
+  - 提示词固定开销从 ≈7,000 tokens/轮降到 ≈90 tokens/轮（实测 2.1%）
+  - 注入保留原行尾与 BOM；两模式互相切换幂等（切回 `full` 自动清菜单技能与标记）
+  - 新增 `skill-categories.json` 类目表；`-Check` 增加极简模式专项校验
 
 **V1.1.1 · 2026-09-25**
 

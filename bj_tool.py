@@ -28,8 +28,8 @@ from PySide6.QtWidgets import (
 
 APP_NAME = 'pi用学习工作台'
 APP_SUBTITLE = 'PiDeck / DeepSeek Harness 一键部署 · 注入即用 · 卸载即还原'
-APP_VERSION = 'V1.1.1'
-APP_BUILD = '2026-09-25 · v1.1.1 文案清理'
+APP_VERSION = 'V1.2'
+APP_BUILD = '2026-09-26 · v1.2 极简模式'
 
 _ACTIVE_WINDOW = None
 _THEME_FILTER = None      # 系统主题监听器：必须持引用，否则可能被 GC 后悬垂
@@ -3188,6 +3188,7 @@ def bundle_check():
         'inject-pideck.ps1',
         'inject-dsh.ps1',
         'app.ico',
+        'skill-categories.json',
         os.path.join('prompts', '_sandbox-v5-header.md'),
         os.path.join('prompts', '_v51b-header.md'),
         os.path.join('prompts', '_gpt6-astra-header.md'),
