@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
 APP_NAME = 'pi用学习工作台'
 APP_SUBTITLE = 'PiDeck / DeepSeek Harness 一键部署 · 注入即用 · 卸载即还原'
 APP_VERSION = 'V1.2'
-APP_BUILD = '2026-09-26 · v1.2 极简模式 + 三步部署'
+APP_BUILD = '2026-09-26 · v1.2 极简模式 + 增强版模板'
 
 _ACTIVE_WINDOW = None
 _THEME_FILTER = None      # 系统主题监听器：必须持引用，否则可能被 GC 后悬垂
@@ -325,6 +325,11 @@ MODEL_GROUPS = [
             ('v52c', 'V5.2c（推荐）',
              'V5.1b 全量 + 3 条结构化反面示例。实测：deepseek-v4.1-flash 99.3%~100%（n=300）。',
              False, True),
+            ('v52cx', 'V5.2c 增强版',
+             'V5.2c 正文原样 + 三个追加块：环境条款效力（优先级/不可降级）、'
+             '术语归一化补表（分域口语词对照）、交付纪律（执行前四要素预览 + 交付记录优先）。'
+             '追加块单独维护，不动 V5.2c 本体，便于对照实测。',
+             False, False),
             ('v51b', 'V5.1b',
              '自研·通用。V5 + 请求归一化（口语/黑话/代词直接出通用完整版）+ 术语工程语义映射。'
              '实测 98.3%~100%（n=120~300）。V5.2c 的无反面示例版本。',
@@ -375,10 +380,16 @@ for _g in MODEL_GROUPS:
 
 # COMPOSED：成品文件不预置，运行时用「头部 + 正文」现场拼，
 # 正文只在仓库里存一份，改动不会漏同步。
+# COMPOSED：成品文件不预置，运行时按「部件列表」顺序拼起来。
+# 第一个元素是成品名，第二个是有序部件列表：头部 + 正文（+ 可选追加块）。
+# 追加块只写一份，可被多个版本引用；不动已实测模板的头部/正文，就不会污染它们的基线数据。
 COMPOSED = {
-    'v5docs': ('v5-docs.md',      '_sandbox-v5-header.md', 'v5-body.md'),
-    'v52c':   ('v5-2c.md',        '_v52c-header.md',       'v5-body.md'),
-    'v51b':   ('v5-1b.md',        '_v51b-header.md',       'v5-body.md'),
+    'v5docs': ('v5-docs.md',    ['_sandbox-v5-header.md', 'v5-body.md']),
+    'v52c':   ('v5-2c.md',      ['_v52c-header.md', 'v5-body.md']),
+    'v51b':   ('v5-1b.md',      ['_v51b-header.md', 'v5-body.md']),
+    # 增强版 = V5.2c 原样 + 三个追加块（环境条款效力 / 术语归一化补表 / 交付纪律）
+    'v52cx':  ('v5-2c-ext.md',  ['_v52c-header.md', '_ext-auth.md', 'v5-body.md',
+                                 '_ext-subst.md', '_ext-deliver.md']),
 }
 
 # 已退役版本 key -> 现存版本 key（旧状态清单迁移用）
@@ -497,19 +508,17 @@ def _prompt_file(version_key):
 def ensure_prompt(version_key):
     """返回可直接给 -SourcePrompt 的指令集文件路径。
 
-    COMPOSED 里的版本不预置成品文件，而是用「头部 + 正文」现场拼出，
-    这样正文只在仓库里存一份，改动不会漏同步。
+    COMPOSED 里的版本不预置成品文件，而是按部件列表现场拼出（头部 + 正文 + 可选追加块），
+    这样正文只存一份、追加块也只存一份，改动不会漏同步；
+    已实测模板的部件不动，就不会被动到它们的基线数据。
     """
     version_key = resolve_version_key(version_key)
     if version_key not in COMPOSED:
         # 非拼装版本：直接用随包成品文件
         return _res(os.path.join('prompts', _prompt_file(version_key)))
 
-    out_name, header_name, body_name = COMPOSED[version_key]
-    header = _res(os.path.join('prompts', header_name))
-    body = _res(os.path.join('prompts', body_name))
-    if not (os.path.exists(header) and os.path.exists(body)):
-        return body
+    out_name, parts = COMPOSED[version_key]
+    paths = [_res(os.path.join('prompts', p)) for p in parts]
 
     def _read(p):
         try:
@@ -518,10 +527,22 @@ def ensure_prompt(version_key):
         except Exception:
             return ''
 
+    texts = []
+    for p in paths:
+        if not os.path.exists(p):
+            continue
+        # 所有部件都去尾空行，拼接时统一用两个换行分隔；非首部件去掉 BOM
+        t = _read(p).rstrip('\n')
+        if texts:
+            t = t.lstrip('\ufeff')
+        texts.append(t)
+    if not texts:
+        return paths[-1]
+
     out_dir = os.path.join(work_root(), 'prompts')
     os.makedirs(out_dir, exist_ok=True)
     out = os.path.join(out_dir, out_name)
-    text = _read(header).rstrip('\n') + '\n\n' + _read(body).lstrip('\ufeff')
+    text = '\n\n'.join(texts) + '\n'
     tmp = out + '.tmp'
     with open(tmp, 'w', encoding='utf-8', newline='\n') as fh:
         fh.write(text)
@@ -3341,11 +3362,15 @@ def bundle_check():
         'skill-categories.json',
         os.path.join('prompts', '_sandbox-v5-header.md'),
         os.path.join('prompts', '_v51b-header.md'),
+        os.path.join('prompts', '_v52c-header.md'),
         os.path.join('prompts', '_gpt6-astra-header.md'),
         os.path.join('prompts', '_gpt56sol-header.md'),
         os.path.join('prompts', '_glm-neutral-header.md'),
         os.path.join('prompts', '_glm53f-kovak.md'),
         os.path.join('prompts', 'v5-body.md'),
+        os.path.join('prompts', '_ext-auth.md'),
+        os.path.join('prompts', '_ext-subst.md'),
+        os.path.join('prompts', '_ext-deliver.md'),
     ]
     res = {'frozen': bool(getattr(sys, '_MEIPASS', None)), 'base': _res(), 'items': {}, 'ok': True}
     for rel in need:

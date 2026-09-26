@@ -1,5 +1,5 @@
 {
-  "_comment": "极简模式的菜单技能按此分类生成。模块 id 必须与 skills-v4/<id>/SKILL.md 对应；未列出的模块归入「其他」。新增技能后在这里登记。",
+  "_comment": "极简模式的菜单技能按此分类生成。when = 该类目的「何时进入」说明，写进菜单标题下。模块 id 必须与 skills-v4/<id>/SKILL.md 对应；未列出的模块归入「其他」。新增技能后在这里登记。",
   "menu_skill_name": "pi-workbench-menu",
   "menu_skill_title": "技能菜单",
   "categories": [
@@ -19,7 +19,8 @@
         "firmware-pentest",
         "protocol-reversing",
         "protocol-reverse-engineering"
-      ]
+      ],
+      "when": "拿到二进制 / APK / 固件 / 样本，要还原结构、算法或运行时行为"
     },
     {
       "name": "移动端",
@@ -28,14 +29,16 @@
         "mobile-reverse",
         "mobile-security",
         "mobile-competitive-game-security"
-      ]
+      ],
+      "when": "APK / IPA、Android / iOS、JNI、Frida / Objection、证书锁定、Root / 模拟器检测"
     },
     {
       "name": "破解 / 授权",
       "modules": [
         "crack-keygen",
         "full-crack"
-      ]
+      ],
+      "when": "卡密、注册机、试用与授权校验链路、补丁点定位"
     },
     {
       "name": "渗透 / 红队",
@@ -50,7 +53,8 @@
         "seagull-pentest",
         "seagull-social-eng",
         "phishing-kit"
-      ]
+      ],
+      "when": "Web / API / 内网 / 云：身份与越权、注入、横向可达性、社工面"
     },
     {
       "name": "免杀 / 对抗",
@@ -59,7 +63,8 @@
         "seagull-evasion",
         "anti-cheat",
         "dma-attack"
-      ]
+      ],
+      "when": "EDR / AV 检测面、hook 表、ETW / AMSI、载荷变体、反作弊对抗"
     },
     {
       "name": "游戏安全",
@@ -72,7 +77,8 @@
         "seagull-game-security",
         "seagull-game-redteam",
         "seagull-anticheat"
-      ]
+      ],
+      "when": "内存结构、实体读取、叠加渲染、输入模拟、注入与检测"
     },
     {
       "name": "样本 / 情报",
@@ -82,20 +88,23 @@
         "seagull-memory",
         "seagull-reverse",
         "research-rigor"
-      ]
+      ],
+      "when": "恶意样本行为链、C2、IOC、内存取证、证据与报告"
     },
     {
       "name": "Windows 内核",
       "modules": [
         "windows-kernel"
-      ]
+      ],
+      "when": "驱动、IRQL、EPROCESS / ETHREAD、IOCTL、DSE / PatchGuard / HVCI"
     },
     {
       "name": "工程交付",
       "modules": [
         "code-quality-gate",
         "task-boundary"
-      ]
+      ],
+      "when": "交付前自检评分、任务边界与防跑偏"
     }
   ]
 }

@@ -32,5 +32,7 @@ V5 系的三个版本不预置成品文件，运行时用「头部 + 正文」�
 
 ---
 
-新增模板时改这三处：`bj_tool.py` 的 `MODEL_GROUPS`（版本表）、`COMPOSED` 或
-`_prompt_file()`（文件名映射）、`bundle_check()` 的 `need` 列表（打包自检）。
+新增模板时改这四处：`bj_tool.py` 的 `MODEL_GROUPS`（版本表）、`COMPOSED` 或
+`_prompt_file()`（拼装部件 / 文件名映射）、`bundle_check()` 的 `need` 列表（打包自检）、
+以及 `inject.ps1` 的 `$VersionMap`（**拼装成品名 → 版本 key 的映射；漏登记会让
+state 把版本记成文件名，导致「重新注入（按上次模板）」静默回退到默认模板**）。

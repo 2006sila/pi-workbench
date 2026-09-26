@@ -325,6 +325,7 @@ function New-SkillMenu {
         foreach ($h in $hit) { $placed[$h] = $true }
         [void]$lines.Add('')
         [void]$lines.Add('### ' + [string]$c.name)
+        if ($c.when) { [void]$lines.Add('> 何时进这类：' + [string]$c.when) }
         [void]$lines.Add('')
         [void]$lines.Add('| 模块 | 何时用 |')
         [void]$lines.Add('|---|---|')
@@ -334,6 +335,7 @@ function New-SkillMenu {
     if ($rest.Count -gt 0) {
         [void]$lines.Add('')
         [void]$lines.Add('### 其他')
+        [void]$lines.Add('> 何时进这类：不在上述类目里，但名字对得上任务')
         [void]$lines.Add('')
         [void]$lines.Add('| 模块 | 何时用 |')
         [void]$lines.Add('|---|---|')
@@ -354,11 +356,15 @@ function New-SkillMenu {
     [void]$sb.Append('# 技能菜单 · ' + $one.Count + " 个模块`r`n`r`n")
     [void]$sb.Append("本目录下每个模块都是一个技能目录：``<本技能根>/<模块 id>/SKILL.md``。`r`n")
     [void]$sb.Append("本文件只给「有哪些模块 + 何时用」，正文按需读。`r`n`r`n")
-    [void]$sb.Append("## 取用纪律`r`n`r`n")
-    [void]$sb.Append("1. 初始只选 **1 个**最匹配的模块，读完 ``SKILL.md`` 再动手。`r`n")
-    [void]$sb.Append("2. 一个阶段内最多加载 **4 个**模块正文；确需跨领域时才取第二个。`r`n")
-    [void]$sb.Append("3. 找不到匹配模块就用自身知识继续执行，**不要为凑数读无关模块**。`r`n")
-    [void]$sb.Append("4. 动手前先报一行：``使用技能 N 个，取自: <模块id>.md | …``。`r`n`r`n")
+    [void]$sb.Append("## 取用纪律（硬性）`r`n`r`n")
+    [void]$sb.Append("1. **先选类目再选模块**：按任务选 1 个类目，类目内按「何时用」取 **1 个**最匹配的模块，读完 ``SKILL.md`` 再动手。`r`n")
+    [void]$sb.Append("2. **上限**：一个阶段最多加载 4 个模块正文；确需跳类目时才取第二个类目。`r`n")
+    [void]$sb.Append("3. **报名（硬性）**：选定 / 换用 / 补充任何模块的当下，先向用户说一行 ``参考模块: <模块id>（<用途>）``。`r`n")
+    [void]$sb.Append("   禁止只执行不报名，禁止事后补报。`r`n")
+    [void]$sb.Append("4. **取不到就直说**：读不到模块正文时如实报告，**不得声称已按该模块执行**。`r`n")
+    [void]$sb.Append("5. **已读复用**：同一任务已读过的模块直接复用，不重复读。`r`n")
+    [void]$sb.Append("6. **三不要**：不要为了解全部能力而读完所有模块；不要只为比较而读无关类目；`r`n")
+    [void]$sb.Append("   找不到匹配模块就用自己的知识继续，不要凑数。`r`n`r`n")
     [void]$sb.Append("## 模块清单`r`n")
     [void]$sb.Append(($lines -join "`r`n"))
     [void]$sb.Append("`r`n")
@@ -425,6 +431,7 @@ $VersionMap = @{
     'v5-1b-header'        = @('v51b',      'V5.1b')
     'v5-docs'             = @('v5docs',    'V5 文档引擎')
     'v5-2c'               = @('v52c',      'V5.2c')
+    'v5-2c-ext'           = @('v52cx',     'V5.2c 增强版')
     '_gpt6-astra-header'  = @('gptastra',  'GPT-6 Astra')
     '_gpt56sol-header'    = @('gpt56sol',  'GPT-5.6 Sol')
     '_glm-neutral-header' = @('glmneutral','GLM 中性化')
@@ -866,6 +873,8 @@ if ($SkillMode -eq 'menu') {
         '需要专业技能的任务，先读技能菜单定位模块，再按需读该模块正文：' + "`r`n`r`n" +
         '- 菜单：`' + $menuPath + '`' + "`r`n" +
         '- 初始只取 1 个最匹配的模块；一个阶段最多加载 4 个模块正文。' + "`r`n" +
+        '- 选定 / 换用模块时先报一行：`参考模块: <模块id>（<用途>）`。' + "`r`n" +
+        '- 读不到模块正文就如实说，不得声称已按该模块执行。' + "`r`n" +
         '- 找不到匹配模块就用自身知识继续，不要为凑数读无关模块。' + "`r`n"
 }
 $block       = $MARK_BEG + "`r`n" + $promptBody.TrimEnd() + $routeNote + "`r`n" + $MARK_END
