@@ -152,10 +152,11 @@ function Finish([string]$Status) {
         agentDir  = $T.AgentDir
         lines     = @($Script:Report)
         modelStatus = $modelStatus
+        conflicts = @($Script:RollbackConflicts)
         finishedAt = (Get-Date).ToString('o')
     }
     try {
-        [System.IO.File]::WriteAllText($ResultPath, ($payload | ConvertTo-Json -Depth 4), $Utf8NoBom)
+        Write-AtomicText $ResultPath ($payload | ConvertTo-Json -Depth 4) $Utf8NoBom
     } catch { }
     try {
         Add-Content -LiteralPath $LogPath -Value ((Get-Date).ToString('s') + ' ' + $Status + "`n" + ($Script:Report -join "`n")) -Encoding UTF8
@@ -286,10 +287,88 @@ function Read-Own([string]$Path) {
     return (Read-Utf8 $Path -Strict:(Test-OwnFile $Path))
 }
 
-function Write-Utf8NoBom([string]$Path, [string]$Text) {
+$Script:Rollback          = New-Object System.Collections.ArrayList
+$Script:RollbackConflicts = @()
+
+function Write-AtomicText([string]$Path, [string]$Text, $Enc) {
+    # 原子写：先写同目录的临时文件，再替换目标。
+    # 直接 WriteAllText 覆写时，进程写到一半被杀会留下半截文件 ——
+    # 这条路径真实可达：GUI 退出时会 taskkill 整棵进程树。
     $dir = Split-Path -Parent $Path
-    if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
-    [System.IO.File]::WriteAllText($Path, $Text, $Utf8NoBom)
+    if ([string]::IsNullOrEmpty($dir)) { $dir = '.' }
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+    $tmp = Join-Path $dir ('.' + (Split-Path -Leaf $Path) + '.' + [guid]::NewGuid().ToString('N') + '.tmp')
+    try {
+        [System.IO.File]::WriteAllText($tmp, $Text, $Enc)
+        if (Test-Path -LiteralPath $Path) {
+            [System.IO.File]::Replace($tmp, $Path, $null)
+        } else {
+            [System.IO.File]::Move($tmp, $Path)
+        }
+    } catch {
+        # Replace 在部分卷（网络盘、某些虚拟盘）上会不可用，回退成覆盖拷贝
+        try {
+            [System.IO.File]::Copy($tmp, $Path, $true)
+        } catch {
+            if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+            throw
+        }
+        if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+function Write-Utf8NoBom([string]$Path, [string]$Text) {
+    Write-AtomicText $Path $Text $Utf8NoBom
+}
+
+function Register-Rollback([string]$Path, [string]$Mode, [string]$Backup, [bool]$Existed) {
+    # 记一笔「本次写了什么」，失败时逆序撤销。
+    #   Mode='delete'  → 本次新建（文件或目录），回滚时删掉
+    #   Mode='restore' → 本次覆盖了目录，回滚时从 Backup（目录）还原
+    #   Mode='bytes'   → 本次覆盖了文件，Backup 是原内容的 base64；Existed=false 则删掉
+    # 注意本函数无返回值，不要把它用在表达式里。
+    [void]$Script:Rollback.Add([ordered]@{
+        path = $Path; mode = $Mode; backup = $Backup; existed = $Existed
+    })
+}
+
+function Register-FileRollback([string]$Path) {
+    # 覆盖前调：把当前内容存进回滚日志（不存在就记成「新建」）。
+    if (Test-Path -LiteralPath $Path -PathType Leaf) {
+        $b64 = [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($Path))
+        Register-Rollback $Path 'bytes' $b64 $true
+    } else {
+        Register-Rollback $Path 'bytes' '' $false
+    }
+}
+
+function Invoke-Rollback {
+    # 逆序撤销本次已完成的写入。返回 @(已回滚数, 冲突路径数组)。
+    $done = 0
+    $conflicts = New-Object System.Collections.ArrayList
+    for ($i = $Script:Rollback.Count - 1; $i -ge 0; $i--) {
+        $e = $Script:Rollback[$i]
+        try {
+            if ($e.mode -eq 'delete') {
+                if (Test-Path -LiteralPath $e.path) { Remove-Item -LiteralPath $e.path -Recurse -Force -ErrorAction Stop }
+            } elseif ($e.mode -eq 'restore') {
+                if (Test-Path -LiteralPath $e.path) { Remove-Item -LiteralPath $e.path -Recurse -Force -ErrorAction Stop }
+                if ($e.backup -and (Test-Path -LiteralPath $e.backup)) { Copy-Tree $e.backup $e.path }
+                else { throw ('备份已不存在: ' + $e.backup) }
+            } elseif ($e.mode -eq 'bytes') {
+                if ($e.existed) {
+                    if ([string]::IsNullOrEmpty($e.backup)) { throw '回滚快照为空' }
+                    [System.IO.File]::WriteAllBytes($e.path, [Convert]::FromBase64String($e.backup))
+                } else {
+                    if (Test-Path -LiteralPath $e.path) { Remove-Item -LiteralPath $e.path -Force -ErrorAction Stop }
+                }
+            }
+            $done++
+        } catch {
+            [void]$conflicts.Add([string]$e.path)
+        }
+    }
+    return @($done, @($conflicts))
 }
 
 function Copy-Tree([string]$Src, [string]$Dest) {
@@ -469,7 +548,8 @@ function Add-DisableModelInvocation([string]$Path) {
     $nl = if ($m.Groups[1].Value.Contains("`r`n")) { "`r`n" } else { "`n" }
     $new = $m.Groups[1].Value + $m.Groups[2].Value + $nl + 'disable-model-invocation: true' + $m.Groups[3].Value + $text.Substring($m.Index + $m.Length)
     $enc = if ($hasBom) { New-Object System.Text.UTF8Encoding($true) } else { $Utf8NoBom }
-    [System.IO.File]::WriteAllText($Path, $new, $enc)
+    Register-FileRollback $Path
+    Write-AtomicText $Path $new $enc
     return $true
 }
 
@@ -487,7 +567,8 @@ function Remove-DisableModelInvocation([string]$Path) {
     if (-not [regex]::IsMatch($text, '(?m)^disable-model-invocation[ \t]*:')) { return $false }
     $new = [regex]::Replace($text, '(?m)^disable-model-invocation[ \t]*:[^\r\n]*\r?\n', '')
     $enc = if ($hasBom) { New-Object System.Text.UTF8Encoding($true) } else { $Utf8NoBom }
-    [System.IO.File]::WriteAllText($Path, $new, $enc)
+    Register-FileRollback $Path
+    Write-AtomicText $Path $new $enc
     return $true
 }
 
@@ -589,7 +670,7 @@ function New-SkillMenu {
     [void]$sb.Append("`r`n")
     $menuDir = Assert-Writable $Target $MenuName
     New-Item -ItemType Directory -Force -Path $menuDir | Out-Null
-    [System.IO.File]::WriteAllText((Join-Path $menuDir 'SKILL.md'), $sb.ToString(), $Utf8NoBom)
+    Write-AtomicText (Join-Path $menuDir 'SKILL.md') $sb.ToString() $Utf8NoBom
     return $one.Count
 }
 
@@ -607,6 +688,20 @@ function Find-ClientExe {
         if ($p -and (Test-Path -LiteralPath $p)) { return $p }
     }
     return $null
+}
+
+# 脚本级兵底：任何未捕获的异常都先逆序回滚本次已写入的内容，再按失败退出。
+# 不回滚的话，部署 65 个技能写到一半失败（GUI 退出就会 taskkill 整棵进程树），
+# 已经落盘但还没进状态清单的目录就成了孤儿——卸载是按状态清单走的，清不掉。
+trap {
+    $trapMsg = $_.Exception.Message
+    $rb = Invoke-Rollback
+    $Script:RollbackConflicts = @($rb[1])
+    if ($rb[0] -gt 0) { Say 'WARN' ('写入中断，已逆序回滚 ' + $rb[0] + ' 项') }
+    if ($Script:RollbackConflicts.Count -gt 0) {
+        Say 'ERROR' ('有 ' + $Script:RollbackConflicts.Count + ' 项回滚不成功，需人工检查：' + ($Script:RollbackConflicts -join '；'))
+    }
+    Fail ('写入中断：' + $trapMsg)
 }
 
 # ---------------------------------------------------------------- 参数默认值
@@ -629,7 +724,7 @@ if ([string]::IsNullOrWhiteSpace($SourcePrompt)) {
             $hdr = [System.IO.File]::ReadAllText($h, [System.Text.Encoding]::UTF8).TrimEnd()
             $body = [System.IO.File]::ReadAllText($b, [System.Text.Encoding]::UTF8)
             $enc = New-Object System.Text.UTF8Encoding($false)
-            [System.IO.File]::WriteAllText($v5, ($hdr + "`r`n`r`n" + $body), $enc)
+            Write-AtomicText $v5 ($hdr + "`r`n`r`n" + $body) $enc
             Say 'INFO' '已现场生成 V5.1b 指令集（CLI 首次运行）'
         }
     }
@@ -1069,6 +1164,10 @@ $patchBackup   = $null
 $patchFileRel  = $null
 $budgetVal     = $null
 $budgetSrcVal  = $null
+$promptBeforeHash = ''
+$promptAfterHash  = ''
+$patchBeforeHash  = ''
+$patchAfterHash   = ''
 $currentText   = ''
 if ($hadPromptFile) { $currentText = Read-Utf8 $PromptTarget }
 # 标记块健康检查。默认只报错不改文件 —— 用户文件里出现重复/颠倒的标记，
@@ -1129,10 +1228,14 @@ $newText     = ($baseText.TrimEnd() + "`r`n`r`n" + $block + "`r`n").TrimStart()
 # 旧写法每次重注入都整文件重写一遍，即使内容一模一样。
 $newBytes    = [System.Text.Encoding]::UTF8.GetBytes($newText)
 $promptFull  = Assert-Writable $T.AgentDir $PromptTarget
+$promptBeforeHash = if (Test-Path -LiteralPath $promptFull) { Get-Sha256 ([System.IO.File]::ReadAllBytes($promptFull)) } else { '' }
 if (Test-SameContent $promptFull $newBytes) {
+    $promptAfterHash = $promptBeforeHash
     Say 'INFO' ('指令集已是目标内容，未重复写入: ' + $promptFull + '（版本 ' + $VersionLabel + '，模式 ' + $SkillMode + '）')
 } else {
+    Register-FileRollback $promptFull
     Write-Utf8NoBom $promptFull $newText
+    $promptAfterHash = Get-Sha256 $newBytes
     Say 'INFO' ('已写入指令集: ' + $promptFull + '（' + $promptBody.Length + ' 字符，版本 ' + $VersionLabel + '，模式 ' + $SkillMode + '）')
 }
 }
@@ -1168,7 +1271,10 @@ if (($Target -eq 'dsh') -and (-not $SkillsOnly)) {
     }
     $patchLayer = Get-PatchBody $budget
     $newPatch = ($patchBase.TrimEnd() + "`r`n`r`n" + $patchLayer + "`r`n").TrimStart()
+    if (Test-Path -LiteralPath $PatchFile) { $patchBeforeHash = Get-Sha256 ([System.IO.File]::ReadAllBytes($PatchFile)) }
+    Register-FileRollback $PatchFile
     Write-Utf8NoBom $PatchFile $newPatch
+    $patchAfterHash = Get-Sha256 ([System.Text.Encoding]::UTF8.GetBytes($newPatch))
     $patchFileRel = $PatchFile
     $budgetVal    = $budget
     $budgetSrcVal = $budgetSource
@@ -1222,10 +1328,15 @@ if ($NoSkills) {
     } else {
         $seen = @{}
         $dirs = @($dirs | Where-Object { if ($seen.ContainsKey($_.Name)) { $false } else { $seen[$_.Name] = $true; $true } })
-        if (-not (Test-Path -LiteralPath $SkillsTarget)) { New-Item -ItemType Directory -Force -Path $SkillsTarget | Out-Null }
+        if (-not (Test-Path -LiteralPath $SkillsTarget)) {
+            New-Item -ItemType Directory -Force -Path $SkillsTarget | Out-Null
+            Register-Rollback $SkillsTarget 'delete' '' $false
+        }
         foreach ($d in $dirs) {
             $dest = Assert-Writable $SkillsTarget $d.Name
-            if (Test-Path -LiteralPath $dest) {
+            $destExisted = Test-Path -LiteralPath $dest
+            $backedUpNow = $false
+            if ($destExisted) {
                 $alreadyOurs = $false
                 if ($prevState -and $prevState.installedSkills -and ($prevState.installedSkills -contains $d.Name)) { $alreadyOurs = $true }
                 if (-not $alreadyOurs) {
@@ -1233,11 +1344,21 @@ if ($NoSkills) {
                     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $bk) | Out-Null
                     Copy-Tree $dest $bk
                     $overwrittenSkills[$d.Name] = $bk
+                    $backedUpNow = $true
                     Say 'WARN' ('同名技能已存在，已备份原目录: ' + $d.Name)
                 }
                 if ($prevState -and $prevState.overwrittenSkills -and $prevState.overwrittenSkills.$($d.Name)) {
                     $overwrittenSkills[$d.Name] = [string]$prevState.overwrittenSkills.$($d.Name)
                 }
+            }
+            # 回滚登记：
+            #  · 本次新建 → 删掉
+            #  · 本次把「不是我们的」原有目录备走 → 从刚做的备份还原
+            #  · 目标本来就是上次部署的同名技能 → 不登记（重复部署会写回正确内容）
+            if (-not $destExisted) {
+                Register-Rollback $dest 'delete' '' $false
+            } elseif ($backedUpNow) {
+                Register-Rollback $dest 'restore' ([string]$overwrittenSkills[$d.Name]) $true
             }
             Copy-Tree $d.FullName $dest
             $installedSkills += $d.Name
@@ -1302,16 +1423,22 @@ if (-not $NoSkills) {
         }
         # 菜单技能若已存在且不是上次我们部署的，先备份
         $menuDest = Join-Path $SkillsTarget $MenuSkillName
-        if (Test-Path -LiteralPath $menuDest) {
+        $menuExisted = Test-Path -LiteralPath $menuDest
+        if ($menuExisted) {
             $menuWasOurs = ($prevState -and $prevState.installedSkills -and ($prevState.installedSkills -contains $MenuSkillName))
             if (-not $menuWasOurs) {
                 $bk = Join-Path (Join-Path $BackupDir 'skills') $MenuSkillName
                 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $bk) | Out-Null
                 Copy-Tree $menuDest $bk
                 $overwrittenSkills[$MenuSkillName] = $bk
+                # 回滚时要把这个用户的原始目录还原回去（New-SkillMenu 会重建目录，
+                # 所以不能只登记 delete —— 那样等于把用户原有的技能删了）
+                Register-Rollback $menuDest 'restore' $bk $true
                 Say 'WARN' ('同名技能已存在，已备份原目录: ' + $MenuSkillName)
             }
             Remove-Item -LiteralPath $menuDest -Recurse -Force -ErrorAction SilentlyContinue
+        } else {
+            Register-Rollback $menuDest 'delete' '' $false
         }
         $MenuModules = New-SkillMenu -Target $SkillsTarget -ModuleIds $menuable -CatFile (Join-Path $Base 'skill-categories.json') -MenuName $MenuSkillName
         if ($MenuModules -gt 0) {
@@ -1362,8 +1489,18 @@ $state = [ordered]@{
     patchBackup         = $patchBackup
     budget              = $budgetVal
     budgetSource        = $budgetSrcVal
+    # 本次写入的落地记录：能回答「这次到底写了什么、写前写后长什么样」
+    status              = 'OK'
+    conflicts           = @($Script:RollbackConflicts)
+    fileHashes          = [ordered]@{
+        prompt = [ordered]@{ path = $PromptTarget; before = $promptBeforeHash; after = $promptAfterHash }
+        patch  = [ordered]@{ path = $(if ($patchFileRel) { $PatchFile } else { $null }); before = $patchBeforeHash; after = $patchAfterHash }
+    }
 }
 Write-Utf8NoBom $StatePath (($state | ConvertTo-Json -Depth 5) + "`r`n")
+# 状态清单已落盘，本次部署算完成 —— 清掉回滚日志，
+# 否则后续任何无关错误都会把已经记录在案的部署撤销掉。
+$Script:Rollback.Clear()
 Say 'INFO' ('状态清单: ' + $StatePath)
 
 $proc = Get-ClientProcess
