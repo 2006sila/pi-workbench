@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "version": "1.3.0",
+  "version": "1.4.0",
   "title": "pi-workbench 部署契约",
   "note": "这份文件是给 `py -X utf8 skill_tool.py contract --check` 用的，不是给人读的文档。里面每一条都能被脚本核对：加模板 / 加技能库 / 改标记块 / 改退出码时改这里，check 会指出哪一处忘了同步（打包资源、bj_tool.spec、README 溯源）。",
 
@@ -137,6 +137,24 @@
         "口语归一表 TALKNORM（洗口 → 同音 → 对照 → 兜底）→ prompts/_ext-subst.md",
         "发布前隐私检查文档结构（docs/SECURITY.md）",
         "按 kind 分派写入（marked / file / toml / settings）与各自的可验证断言"
+      ]
+    },
+    "alice_assistant": {
+      "repo": "https://github.com/alicewe1/alice-assistant",
+      "commit": "55bedd92fcd6fe06f3d359e3c3414f225e4e2a9e",
+      "license": "GPL-3.0",
+      "mode": "clean-room",
+      "method": "clean-room：只取机制与工程约定，不取文本。本仓库为 MIT，未复制其代码（Rust/Tauri 栈也不同），重写为 PowerShell + Python 实现。",
+      "read_at": "2026-09-30",
+      "files_seen": 82,
+      "borrowed": [
+        "标记块「只认关键串、版本/载荷可变」—— 旧版写的块能认出来并原地升级，不会追加第二块",
+        "备份保留策略：时间戳备份留最近 N 份；固定名备份 = 唯一原件，永不清理",
+        "渲染后断言无残留 {{...}} 占位符（Assert-HsRendered）",
+        "NOTICE 三段式（许可范围 / 第三方优先 / 再分发限制）+ 自动生成的第三方清单",
+        "Job Object（KILL_ON_JOB_CLOSE）回收整棵进程树，并保留 assign 失败时的 taskkill 兜底",
+        "自我部署脚本：-WhatIfOnly 只打印、备份命名 .rollback-<时间戳>、直接打印回滚命令",
+        "导入技能包的识别规则与两个踩坑记录（文件夹对话框不能选文件；blocking 对话框会卡死主线程）"
       ]
     }
   }

@@ -75,12 +75,29 @@ try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 
 $TOOL_TAG  = 'pi-workbench'
 $TOOL_VER  = '1.0.0'
-$MARK_BEG  = '<!-- BEGIN ' + $TOOL_TAG + ' v4 -->'
-$MARK_END  = '<!-- END '   + $TOOL_TAG + ' v4 -->'
+# 标记块分成「关键串 + 版本载荷」两段。定位只认关键串（$MARK_KEY_*），
+# 版本号只是载荷 —— 这样升级标记（v4 → v5）、或者历史上写过带别的东西的块
+#（旧版 install 脚本的 `BEGIN prompt=x.md` / `BEGIN pack=xxx`），
+# 都还能被认出来并在原地替换；如果拿写死的整串去匹配，旧块就变成「没有标记块」，
+# 重复注入会直接再追加第二份。
+$MARK_KEY_BEG  = '<!-- BEGIN ' + $TOOL_TAG
+$MARK_KEY_END  = '<!-- END '   + $TOOL_TAG
+$PATCH_KEY_BEG = '# BEGIN ' + $TOOL_TAG
+$PATCH_KEY_END = '# END '   + $TOOL_TAG
+$MARK_VER      = 'v4'
+
+$MARK_BEG  = $MARK_KEY_BEG + ' ' + $MARK_VER + ' -->'
+$MARK_END  = $MARK_KEY_END + ' ' + $MARK_VER + ' -->'
 
 # DSH 的 home 级 patch 层用 YAML 注释标记（YAML 不支持 HTML 注释）
-$PATCH_BEG = '# BEGIN ' + $TOOL_TAG + ' v4'
-$PATCH_END = '# END '   + $TOOL_TAG + ' v4'
+$PATCH_BEG = $PATCH_KEY_BEG + ' ' + $MARK_VER
+$PATCH_END = $PATCH_KEY_END + ' ' + $MARK_VER
+
+# 匹配正则：关键串 + 任意载荷（含旧版本号）
+$MARK_RE_BEG  = [regex]::Escape($MARK_KEY_BEG) + '[^>]*-->'
+$MARK_RE_END  = [regex]::Escape($MARK_KEY_END) + '[^>]*-->'
+$PATCH_RE_BEG = '(?m)^[ \t]*' + [regex]::Escape($PATCH_KEY_BEG) + '[^\r\n]*$'
+$PATCH_RE_END = '(?m)^[ \t]*' + [regex]::Escape($PATCH_KEY_END) + '[^\r\n]*$'
 
 # ---------------------------------------------------------------- 路径与环境
 
@@ -493,6 +510,82 @@ function Get-LineDiff([string[]]$Before, [string[]]$After) {
     return $res
 }
 
+function Assert-NoUnrendered([string]$Text, [string]$What) {
+    # 生成物里残留占位符 = 模板没渲染完 / 拼接写错了。宁可停下来报错，
+    # 也不要把它写进用户的配置文件（写进去之后用户只会看到一堆 {{...}}）。
+    $m = [regex]::Match($Text, '\{\{[^}\r\n]{0,60}\}\}')
+    if ($m.Success) {
+        Fail ($What + ' 里残留未展开的占位符：' + $m.Value + '（模板或拼接逻辑有问题，已停止写入）')
+    }
+    return $Text
+}
+
+function Get-PinnedBackupPaths {
+    # 被状态清单引用的备份路径（提定的"唯一原件"）：清理时永远不能碰。
+    # 删了它们 = 卸载再也回不到安装前，这是我们最不能接受的失败。
+    $pins = New-Object System.Collections.ArrayList
+    if (-not (Test-Path -LiteralPath $StatePath)) { return @($pins) }
+    try {
+        $st = Read-Utf8 $StatePath | ConvertFrom-Json
+        foreach ($k in @('promptBackup', 'patchBackup')) {
+            $v = [string]$st.$k
+            if ($v) { [void]$pins.Add($v) }
+        }
+        if ($st.overwrittenSkills) {
+            foreach ($p in $st.overwrittenSkills.PSObject.Properties) {
+                $v = [string]$p.Value
+                if ($v) { [void]$pins.Add($v) }
+            }
+        }
+    } catch { }
+    return @($pins)
+}
+
+function Test-PathPinned([string]$Path, [string[]]$Pins) {
+    $full = ([System.IO.Path]::GetFullPath($Path)).TrimEnd([char]92, [char]47)
+    foreach ($p in $Pins) {
+        $pf = ([System.IO.Path]::GetFullPath($p)).TrimEnd([char]92, [char]47)
+        if ($full -eq $pf) { return $true }
+        # 钉的可能是一个目录（如 backup\<目标>\<时间戳>），其下全部算钉住
+        if ($pf.StartsWith($full + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+        if ($full.StartsWith($pf + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    return $false
+}
+
+function Prune-Backups([int]$Keep = 10) {
+    # 时间戳备份（backup\<目标>\<时间戳>\）与 drift 目录都只保留最近 N 份。
+    # 旧写法只增不减：装几次就攒一堆副本（实测已经有多个 drift 目录）。
+    # 固定名的"唯一原件"不在这个目录里（它由状态清单指向），且会被 $pins 保护。
+    $removed = 0
+    $skipped = 0
+    $pins = Get-PinnedBackupPaths
+
+    $targetRoot = Join-Path $BackupRoot $Target
+    if (Test-Path -LiteralPath $targetRoot) {
+        $dirs = @(Get-ChildItem -LiteralPath $targetRoot -Directory -ErrorAction SilentlyContinue |
+                  Where-Object { $_.Name -match '^\d{8}-\d{6}$' } | Sort-Object Name -Descending)
+        foreach ($d in @($dirs | Select-Object -Skip $Keep)) {
+            if (Test-PathPinned $d.FullName $pins) { $skipped++; continue }
+            try { Remove-Item -LiteralPath $d.FullName -Recurse -Force -ErrorAction Stop; $removed++ } catch { }
+        }
+    }
+
+    $driftRoot = Join-Path $BackupRoot 'drift'
+    if (Test-Path -LiteralPath $driftRoot) {
+        $dd = @(Get-ChildItem -LiteralPath $driftRoot -Directory -ErrorAction SilentlyContinue |
+                Sort-Object Name -Descending)
+        foreach ($d in @($dd | Select-Object -Skip $Keep)) {
+            try { Remove-Item -LiteralPath $d.FullName -Recurse -Force -ErrorAction Stop; $removed++ } catch { }
+        }
+        # 卷飘目录里的临时文件也清掉
+        foreach ($f in @(Get-ChildItem -LiteralPath $driftRoot -File -ErrorAction SilentlyContinue)) {
+            try { Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop; $removed++ } catch { }
+        }
+    }
+    return @($removed, $skipped, $Keep)
+}
+
 function Test-SameContent([string]$Path, [byte[]]$Bytes) {
     # 落盘前比对：内容一致就不重复写（幂等短路）。
     if (-not (Test-Path -LiteralPath $Path)) { return $false }
@@ -615,23 +708,51 @@ function Copy-Tree([string]$Src, [string]$Dest) {
     if ($LASTEXITCODE -ge 8) { throw ("robocopy failed rc=" + $LASTEXITCODE + " for " + $Src) }
 }
 
+function Get-MarkerPayloadFromToken([string]$Token) {
+    # '<!-- BEGIN pi-workbench v4 -->'      -> 'v4'
+    # '<!-- BEGIN pi-workbench prompt=x.md -->' -> 'prompt=x.md'（旧版脚本写的形态）
+    if (-not $Token) { return '' }
+    $v = $Token.Substring($MARK_KEY_BEG.Length)
+    $v = ($v -replace '\s*-->\s*$', '')
+    return $v.Trim()
+}
+
 function Get-MarkerCounts([string]$Text) {
-    if ([string]::IsNullOrEmpty($Text)) { return @(0, 0) }
-    $b = ([regex]::Matches($Text, [regex]::Escape($MARK_BEG))).Count
-    $e = ([regex]::Matches($Text, [regex]::Escape($MARK_END))).Count
-    return @($b, $e)
+    # 按「关键串」计数：任何版本 / 任何载荷都算同一块，并回带载荷列表。
+    # 返回 @(开始数, 结束数, @(载荷...))
+    if ([string]::IsNullOrEmpty($Text)) { return @(0, 0, @()) }
+    $bm = [regex]::Matches($Text, $MARK_RE_BEG)
+    $em = [regex]::Matches($Text, $MARK_RE_END)
+    $vers = @()
+    foreach ($m in $bm) { $vers += (Get-MarkerPayloadFromToken $m.Value) }
+    return @($bm.Count, $em.Count, @($vers))
+}
+
+function Get-MarkerPayload([string]$Text) {
+    # 第一个开始标记的载荷（无标记返回空串）—— 用于报「标记块版本」
+    if ([string]::IsNullOrEmpty($Text)) { return '' }
+    $m = [regex]::Match($Text, $MARK_RE_BEG)
+    if (-not $m.Success) { return '' }
+    return (Get-MarkerPayloadFromToken $m.Value)
+}
+
+function Test-MarkerCurrent([string]$Text) {
+    # 恰好一对标记且载荷已是当前版本 → 内容无需因标记而重写
+    $c = Get-MarkerCounts $Text
+    if ($c[0] -ne 1 -or $c[1] -ne 1) { return $false }
+    return ((Get-MarkerPayload $Text) -eq $MARK_VER)
 }
 
 function Repair-MarkerBlocks([string]$Text) {
     # 只保留最后一对完整标记块（最后一对是最近写入的），其余标记全部清掉。
-    $pat = '(?s)' + [regex]::Escape($MARK_BEG) + '.*?' + [regex]::Escape($MARK_END)
+    $pat = '(?s)' + $MARK_RE_BEG + '.*?' + $MARK_RE_END
     $all = [regex]::Matches($Text, $pat)
     $keep = ''
     if ($all.Count -gt 0) { $keep = $all[$all.Count - 1].Value }
     $rest = [regex]::Replace($Text, $pat, '')
     # 清掉落单的标记（不成对的）
-    $rest = [regex]::Replace($rest, [regex]::Escape($MARK_BEG), '')
-    $rest = [regex]::Replace($rest, [regex]::Escape($MARK_END), '')
+    $rest = [regex]::Replace($rest, $MARK_RE_BEG, '')
+    $rest = [regex]::Replace($rest, $MARK_RE_END, '')
     $rest = $rest.TrimEnd()
     if ([string]::IsNullOrEmpty($keep)) { return $rest }
     if ([string]::IsNullOrEmpty($rest)) { return $keep }
@@ -646,7 +767,9 @@ function Assert-MarkerIntegrity([string]$Text, [switch]$Repair) {
     $b = $c[0]; $e = $c[1]
     if ($b -eq 0 -and $e -eq 0) { return $Text }
     if ($b -eq 1 -and $e -eq 1) {
-        if ($Text.IndexOf($MARK_END) -lt $Text.IndexOf($MARK_BEG)) {
+        $bi = [regex]::Match($Text, $MARK_RE_BEG)
+        $ei = [regex]::Match($Text, $MARK_RE_END)
+        if ($bi.Success -and $ei.Success -and $ei.Index -lt $bi.Index) {
             if ($Repair) { return (Repair-MarkerBlocks $Text) }
             Fail ('指令文件里标记块顺序颠倒（结束标记在开始标记之前），疑似被外部编辑过。' + "`r`n" +
                    '  文件: ' + $PromptTarget + "`r`n" +
@@ -661,20 +784,20 @@ function Assert-MarkerIntegrity([string]$Text, [switch]$Repair) {
 }
 
 function Strip-MarkerBlock([string]$Text) {
-    $pattern = '(?s)' + [regex]::Escape($MARK_BEG) + '.*?' + [regex]::Escape($MARK_END) + '\s*'
+    $pattern = '(?s)' + $MARK_RE_BEG + '.*?' + $MARK_RE_END + '\s*'
     return [regex]::Replace($Text, $pattern, '')
 }
 
 function Get-MarkerBlock([string]$PromptPath) {
     if (-not (Test-Path -LiteralPath $PromptPath)) { return $null }
     $txt = Read-Utf8 $PromptPath
-    $m = [regex]::Match($txt, '(?s)' + [regex]::Escape($MARK_BEG) + '.*?' + [regex]::Escape($MARK_END))
+    $m = [regex]::Match($txt, '(?s)' + $MARK_RE_BEG + '.*?' + $MARK_RE_END)
     if ($m.Success) { return $m.Value }
     return $null
 }
 
 function Strip-PatchBlock([string]$Text) {
-    $pattern = '(?ms)^[ \t]*' + [regex]::Escape($PATCH_BEG) + '.*?^[ \t]*' + [regex]::Escape($PATCH_END) + '[ \t]*\r?\n?'
+    $pattern = '(?s)' + $PATCH_RE_BEG + '.*?' + $PATCH_RE_END + '[ \t]*\r?\n?'
     return [regex]::Replace($Text, $pattern, '')
 }
 
@@ -909,6 +1032,8 @@ function Get-SkillMenuText {
     [void]$sb.Append("## 模块清单`r`n")
     [void]$sb.Append(($lines -join "`r`n"))
     [void]$sb.Append("`r`n")
+    # 生成物断言：残留占位符就别写进用户配置（渲染没完成 / 拼接写错）
+    [void](Assert-NoUnrendered $sb.ToString() ('菜单技能 ' + $MenuName))
     return @($sb.ToString(), $one.Count)
 }
 
@@ -1151,6 +1276,13 @@ if ($Check) {
     $block = Get-MarkerBlock $PromptTarget
     if ($block) {
         Say 'L1' ($T.PromptName + ' 已注入，标记块 ' + $block.Length + ' 字符')
+        # 标记块版本：旧版本的块能被认出来（定位只认关键串），但内容不是当前版本
+        $mv = Get-MarkerPayload $block
+        if ($mv -eq $MARK_VER) {
+            Say 'L1' ('标记块版本 ' + $mv + '（当前）')
+        } else {
+            Say 'WARN' ('标记块版本为「' + $mv + '」，当前工具写的是「' + $MARK_VER + '」—— 重新部署会原地升级（只换标记行，正文不变）')
+        }
         $promptOk = $true
     } elseif (Test-Path -LiteralPath $PromptTarget) {
         Say 'L1' ($T.PromptName + ' 存在，但未发现注入标记块')
@@ -2108,6 +2240,8 @@ if ($SkillsOnly) {
 } else {
 $baseText    = Strip-MarkerBlock $currentText
 $promptBody  = Read-Own $SourcePrompt
+# 模板自检：指令集模板里不该残留 {{...}} 占位符（换模板 / 手工改模板时最容易漏展开）
+[void](Assert-NoUnrendered $promptBody ('指令集模板 ' + $SourcePrompt))
 # 极简模式：模块技能不进系统提示词，全靠菜单技能带路。
 # 只在菜单描述里写领域词还不够（那只是一条可选的技能描述），这里在
 # APPEND_SYSTEM.md（系统级、每轮都在、优先级高于技能描述）里再硬性说一句。
@@ -2178,6 +2312,7 @@ if (($Target -eq 'dsh') -and (-not $SkillsOnly)) {
         Say 'WARN' $Script:PatchWarn
     }
     $patchLayer = Get-PatchBody $budget
+    [void](Assert-NoUnrendered $patchLayer 'DSH patch 层')
     $newPatch = ($patchBase.TrimEnd() + "`r`n`r`n" + $patchLayer + "`r`n").TrimStart()
     if (Test-Path -LiteralPath $PatchFile) {
         $pb2 = [System.IO.File]::ReadAllBytes($PatchFile)
@@ -2458,6 +2593,12 @@ Write-Utf8NoBom $StatePath (($state | ConvertTo-Json -Depth 5) + "`r`n")
 $Script:OpSkills = @($installedSkills).Count
 # 版本日志：状态清单写成功后才落盘，避免「日志里有一个失败的版本」
 $Script:VersionId = Write-Journal 'applied' $(if ($SkillsOnly) { 'skills-only' } else { 'deploy' })
+# 备份保留策略：时间戳备份与 drift 目录各留最近 10 份；
+# 被状态清单引用到的（唯一原件）一律跳过 —— 那些是卸载还原的命脉。
+$pr = Prune-Backups -Keep 10
+if ($pr[0] -gt 0 -or $pr[1] -gt 0) {
+    Say 'INFO' ('旧备份清理：删除 ' + $pr[0] + ' 份，保留最近 ' + $pr[2] + ' 份（跳过的唯一原件 ' + $pr[1] + ' 份）')
+}
 # 状态清单已落盘，本次部署算完成 —— 清掉回滚日志，
 # 否则后续任何无关错误都会把已经记录在案的部署撤销掉。
 $Script:Rollback.Clear()

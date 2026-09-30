@@ -28,8 +28,8 @@ from PySide6.QtWidgets import (
 
 APP_NAME = 'pi用学习工作台'
 APP_SUBTITLE = 'PiDeck / DeepSeek Harness 一键部署 · 注入即用 · 卸载即还原'
-APP_VERSION = 'V1.3'
-APP_BUILD = '2026-09-26 · v1.3 事务式部署 + 版本恢复 · 通道体检 · 任务构建'
+APP_VERSION = 'V1.4'
+APP_BUILD = '2026-09-30 · v1.4 标记升级兼容 + 备份保留 + 进程树回收 + 自我部署'
 
 _ACTIVE_WINDOW = None
 _THEME_FILTER = None      # 系统主题监听器：必须持引用，否则可能被 GC 后悬垂
@@ -659,6 +659,133 @@ def open_in_explorer(path):
 
 # ------------------------------------------------------------------ 免责声明
 
+# ------------------------------------------------------------------ 进程树回收（Job Object）
+# Windows 的 Job Object 能在「句柄关闭」时由内核杀掉整棵进程树 —— 比 taskkill /T 可靠：
+#   · 不要求父进程还活着（父进程退了、孙进程还在时，taskkill /T 已经找不到树根）
+#   · 由内核保证，不依赖命令可用
+#   · GUI 自己崩了也不会留孤儿（句柄随进程消失，内核顺手清树）
+# 已知坑（alice-assistant 的 winproc.rs 里专门写了）：宿主进程自己已经在某个 job 里、
+# 且那个 job 不允许嵌套时，AssignProcessToJobObject 会失败 ——
+# 所以必须能优雅降级回 taskkill，而不是让「进程回收」整个功能失效。
+if IS_WINDOWS:
+    import ctypes as _ct
+    from ctypes import wintypes as _wt
+
+    class _JOBOBJECT_BASIC_LIMIT_INFORMATION(_ct.Structure):
+        _fields_ = [('PerProcessUserTimeLimit', _ct.c_int64),
+                    ('PerJobUserTimeLimit', _ct.c_int64),
+                    ('LimitFlags', _wt.DWORD),
+                    ('MinimumWorkingSetSize', _ct.c_size_t),
+                    ('MaximumWorkingSetSize', _ct.c_size_t),
+                    ('ActiveProcessLimit', _wt.DWORD),
+                    ('Affinity', _ct.c_size_t),
+                    ('PriorityClass', _wt.DWORD),
+                    ('SchedulingClass', _wt.DWORD)]
+
+    class _IO_COUNTERS(_ct.Structure):
+        _fields_ = [('ReadOperationCount', _ct.c_uint64),
+                    ('WriteOperationCount', _ct.c_uint64),
+                    ('OtherOperationCount', _ct.c_uint64),
+                    ('ReadTransferCount', _ct.c_uint64),
+                    ('WriteTransferCount', _ct.c_uint64),
+                    ('OtherTransferCount', _ct.c_uint64)]
+
+    class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(_ct.Structure):
+        _fields_ = [('BasicLimitInformation', _JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                    ('IoInfo', _IO_COUNTERS),
+                    ('ProcessMemoryLimit', _ct.c_size_t),
+                    ('JobMemoryLimit', _ct.c_size_t),
+                    ('PeakProcessMemoryUsed', _ct.c_size_t),
+                    ('PeakJobMemoryUsed', _ct.c_size_t)]
+
+
+class JobObject:
+    """KILL_ON_JOB_CLOSE 作业对象。
+
+    任何一步不可用（非 Windows / 建对象失败 / 分配失败）都不报错，
+    只把 assign() 返回 False，调用方回退 taskkill —— 功能降级但不消失。
+    """
+
+    def __init__(self):
+        self._job = None
+        self._k32 = None
+        self.assigned = False
+        if not IS_WINDOWS:
+            return
+        try:
+            k32 = _ct.WinDLL('kernel32', use_last_error=True)
+            k32.CreateJobObjectW.restype = _wt.HANDLE
+            k32.CreateJobObjectW.argtypes = [_ct.c_void_p, _wt.LPCWSTR]
+            k32.SetInformationJobObject.restype = _wt.BOOL
+            k32.SetInformationJobObject.argtypes = [_wt.HANDLE, _ct.c_int, _ct.c_void_p, _wt.DWORD]
+            k32.AssignProcessToJobObject.restype = _wt.BOOL
+            k32.AssignProcessToJobObject.argtypes = [_wt.HANDLE, _wt.HANDLE]
+            k32.TerminateJobObject.restype = _wt.BOOL
+            k32.TerminateJobObject.argtypes = [_wt.HANDLE, _wt.UINT]
+            k32.OpenProcess.restype = _wt.HANDLE
+            k32.OpenProcess.argtypes = [_wt.DWORD, _wt.BOOL, _wt.DWORD]
+            k32.CloseHandle.restype = _wt.BOOL
+            k32.CloseHandle.argtypes = [_wt.HANDLE]
+
+            job = k32.CreateJobObjectW(None, None)
+            if not job:
+                return
+            info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+            info.BasicLimitInformation.LimitFlags = 0x00002000   # KILL_ON_JOB_CLOSE
+            if not k32.SetInformationJobObject(job, 9, _ct.byref(info), _ct.sizeof(info)):
+                k32.CloseHandle(job)
+                return
+            self._job = job
+            self._k32 = k32
+        except Exception:
+            self._job = None
+            self._k32 = None
+
+    @property
+    def available(self):
+        return self._job is not None
+
+    def assign(self, pid: int) -> bool:
+        """把已有进程挂到作业上（spawn 之后调用）。失败返回 False。"""
+        if not self._job or not self._k32 or not pid:
+            return False
+        PROCESS_SET_QUOTA, PROCESS_TERMINATE = 0x0100, 0x0001
+        h = None
+        try:
+            h = self._k32.OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, False, int(pid))
+            if not h:
+                return False
+            ok = bool(self._k32.AssignProcessToJobObject(self._job, h))
+            self.assigned = ok
+            return ok
+        except Exception:
+            return False
+        finally:
+            if h:
+                try:
+                    self._k32.CloseHandle(h)
+                except Exception:
+                    pass
+
+    def terminate(self) -> bool:
+        if not self._job or not self._k32:
+            return False
+        try:
+            return bool(self._k32.TerminateJobObject(self._job, 1))
+        except Exception:
+            return False
+
+    def close(self):
+        """关句柄 —— KILL_ON_JOB_CLOSE 生效：作业里剩下的进程全部由内核杀掉。"""
+        if self._job and self._k32:
+            try:
+                self._k32.CloseHandle(self._job)
+            except Exception:
+                pass
+        self._job = None
+        self._k32 = None
+
+
 class Runner(QThread):
     """在后台线程里跑 PowerShell。
 
@@ -677,11 +804,13 @@ class Runner(QThread):
     # 单任务输出行数上限：超了就只记不显示（子进程的 stdout 还得继续读，
     # 否则它写满管道会阻塞在原地）。防的是「某个环节卡在循环里往外刷」把界面刷死。
     STORM_LIMIT = 20000
+    _job_warned = False      # 「作业分配失败，回退 taskkill」只提醒一次，不刷屏
 
     def __init__(self, argv, parent=None):
         super().__init__(parent)
         self._argv = argv
         self._proc = None
+        self._job = JobObject()
         self._tail = []
         self._lines = 0
         self._stormed = False
@@ -698,6 +827,12 @@ class Runner(QThread):
             self.line.emit('[!] 无法启动 PowerShell: ' + str(e))
             self.done.emit(-1)
             return
+        # 把子进程挂进作业：它带出来的整棵树（robocopy / pi.cmd / 孙进程）都归内核管
+        if self._job.available:
+            if not self._job.assign(self._proc.pid) and not Runner._job_warned:
+                Runner._job_warned = True
+                self.line.emit('[WARN] 无法把子进程加入作业对象（宿主已在不允许嵌套的作业里？），'
+                               '进程树回收回退为 taskkill')
         pending = ''
         while True:
             try:
@@ -741,14 +876,26 @@ class Runner(QThread):
         return list(self._tail)
 
     def terminate_tree(self):
-        """杀掉整棵进程树（退出程序时用，避免 PowerShell 死在写文件中途）。"""
+        """杀掉整棵进程树（退出程序时用，避免 PowerShell 死在写文件中途）。
+
+        优先用作业对象（内核保证、连孙进程一起），失败或不可用时回退 taskkill。
+        """
         p = self._proc
         if p is None or p.poll() is not None:
+            return
+        if self._job.available and self._job.terminate():
             return
         try:
             subprocess.run(['taskkill', '/F', '/T', '/PID', str(p.pid)],
                            creationflags=CREATE_NO_WINDOW, timeout=10, check=False,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+    def close_job(self):
+        """线程结束后调用：关作业句柄，清掉任何漏下的孙进程（正常退出也清）。"""
+        try:
+            self._job.close()
         except Exception:
             pass
 
@@ -3587,6 +3734,10 @@ class MainWindow(FramelessWindow):
             pass
         if self._runner is runner:
             self._runner = None
+        try:
+            runner.close_job()      # 关作业句柄：漏下的孙进程由内核清掉
+        except Exception:
+            pass
         runner.deleteLater()
 
     def _on_finished(self, code, runner, label, on_done):

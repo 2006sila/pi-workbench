@@ -13,6 +13,7 @@
   py -X utf8 skill_tool.py gen --check              # 只读校验三方一致（可进 CI）
   py -X utf8 skill_tool.py contract                # 校验部署契约 ↔ 仓库实际状态（随包资源/spec/标记块/退出码/溯源）
   py -X utf8 skill_tool.py pack [--out X.zip] [--verify X.zip]   # 技能库打包（含 SHA-256 清单）/ 校验包
+  py -X utf8 skill_tool.py notice [--write]        # 生成/校验 THIRD-PARTY-NOTICES.md（第三方许可清单）
   py -X utf8 skill_tool.py add <目录|zip> --category <类目> [--name X] [--desc X] [--dry-run] [--force]
   py -X utf8 skill_tool.py add --batch <目录> --category <类目> [--dry-run]
   py -X utf8 skill_tool.py register <技能名> --category <类目>    # 只改登记，不动文件
@@ -816,17 +817,29 @@ def cmd_contract(args):
             warnings.append('模板 prompts/%s 没被任何版本引用、也不在随包清单里 —— 是要删，还是漏登记？' % f)
 
     # ③ 标记块 / 目标端 / 退出码 ↔ inject.ps1
-    # 标记块在源码里是拼出来的（'<!-- BEGIN ' + $TOOL_TAG + ' v4 -->'），
-    # 所以不能直接搜字面量：先把 $TOOL_TAG 取出来，按同一拼法还原期望值再比。
+    # 标记块在源码里是「关键串 + 版本载荷」拼出来的：
+    #   $MARK_KEY_BEG = '<!-- BEGIN ' + $TOOL_TAG
+    #   $MARK_BEG     = $MARK_KEY_BEG + ' ' + $MARK_VER + ' -->'
+    # 所以不能直接搜字面量：先把 $TOOL_TAG / $MARK_VER 取出来，按同一拼法还原期望值再比。
     tag_m = re.search(r"^\$TOOL_TAG\s*=\s*'([^']+)'", inject_txt, re.M)
     tag = tag_m.group(1) if tag_m else ''
+    ver_m = re.search(r"^\$MARK_VER\s*=\s*'([^']+)'", inject_txt, re.M)
+    ver = ver_m.group(1) if ver_m else ''
     if not tag:
         errors.append('读不到 inject.ps1 的 $TOOL_TAG')
-    for kind in ('BEGIN', 'END'):
-        # 源码里是 '<!-- BEGIN ' + $TOOL_TAG + ' v4 -->'（对齐空格数量会有变化，所以用正则）
-        pat = re.compile(r"'\x3c!-- " + kind + r" '\s*\+\s*\$TOOL_TAG\s*\+\s*' v4 --\x3e'")
-        if not pat.search(inject_txt):
-            errors.append('inject.ps1 里没有用 $TOOL_TAG 拼出标记块：%s' % kind)
+    if not ver:
+        errors.append('读不到 inject.ps1 的 $MARK_VER')
+    for var, word in (('$MARK_KEY_BEG', 'BEGIN'), ('$MARK_KEY_END', 'END')):
+        # 关键串必须用 $TOOL_TAG 拼（不许写死）；源码形如：
+        #   $MARK_KEY_BEG  = '<!-- BEGIN ' + $TOOL_TAG
+        pat_key = re.compile(re.escape(var) + r"\s*=\s*'\x3c!-- " + word + r" '\s*\+\s*\$TOOL_TAG")
+        if tag and not pat_key.search(inject_txt):
+            errors.append('inject.ps1 里 %s 没用 $TOOL_TAG 拼成关键串' % var)
+    # 定位正则必须基于关键串（而非写死的整串）—— 否则标记升级就认不出旧块
+    for var in ('$MARK_RE_BEG', '$MARK_RE_END'):
+        m2 = re.search(re.escape(var) + r"\s*=\s*[^\r\n]*", inject_txt)
+        if not m2 or ('MARK_KEY_BEG' not in m2.group(0) and 'MARK_KEY_END' not in m2.group(0)):
+            errors.append('inject.ps1 的 %s 不是基于关键串构造（旧版本标记会认不出）' % var)
     for t in c.get('targets') or []:
         key = t.get('key')
         if not key:
@@ -835,8 +848,9 @@ def cmd_contract(args):
         if ("'" + key + "' = @{") not in inject_txt:
             errors.append('inject.ps1 的 目标表里没有 %s' % key)
         if tag:
-            for f, want in (('markerBegin', '<!-- BEGIN ' + tag + ' v4 -->'),
-                            ('markerEnd', '<!-- END ' + tag + ' v4 -->')):
+            want_begin = '<!-- BEGIN ' + tag + ' ' + (ver or 'v?') + ' -->'
+            want_end = '<!-- END ' + tag + ' ' + (ver or 'v?') + ' -->'
+            for f, want in (('markerBegin', want_begin), ('markerEnd', want_end)):
                 got = t.get(f)
                 if got != want:
                     errors.append('targets.%s.%s 与 inject.ps1 的 $TOOL_TAG(%s) 拼出来的不一致：%s ≠ %s'
@@ -857,6 +871,25 @@ def cmd_contract(args):
 
     # ④ 溯源记录 ↔ README
     readme = read(README_PATH) if os.path.isfile(README_PATH) else ''
+    # ④b 合规清单：NOTICE 三段式 + THIRD-PARTY-NOTICES 与磁盘一致。
+    # 为什么放在契约里：发布前最容易漏的就是这两份说明，而它们直接决定「能不能再分发」。
+    notice_path = os.path.join(ROOT, 'NOTICE.md')
+    notice = read(notice_path) if os.path.isfile(notice_path) else ''
+    for sec in ('## 一、许可范围', '## 二、第三方组件', '## 三、再分发限制'):
+        if sec not in notice:
+            errors.append('NOTICE.md 缺小节「%s」（对外发布时的合规说明）' % sec)
+    tpn_path = os.path.join(ROOT, 'THIRD-PARTY-NOTICES.md')
+    n_bare = len(bare_skills())
+    if not os.path.isfile(tpn_path):
+        errors.append('缺 THIRD-PARTY-NOTICES.md（跑 skill_tool.py notice --write 生成）')
+    else:
+        tt = read(tpn_path)
+        if ('未声明来源或许可的技能（%d）' % n_bare) not in tt:
+            errors.append('THIRD-PARTY-NOTICES.md 的「未声明许可」数量与磁盘不一致（当前 %d），跑 notice --write 重新生成' % n_bare)
+        for _n in disk_skills():
+            lic_p, _l2, _a2 = skill_provenance(_n)
+            if lic_p and ('`%s`' % _n) not in tt:
+                errors.append('THIRD-PARTY-NOTICES.md 没登记带 LICENSE 的技能：%s' % _n)
     for name, src in (c.get('cleanroom') or {}).items():
         repo, commit, lic = src.get('repo'), src.get('commit'), src.get('license')
         mode = src.get('mode') or ''
@@ -889,6 +922,7 @@ def cmd_contract(args):
     print('  退出码        %s' % '、'.join(sorted((c.get('exitCodes') or {}).keys())))
     print('  溯源          %s' % '、'.join('%s %s (%s/%s)' % (k, str(v.get('commit', ''))[:7], v.get('license'), v.get('mode'))
                                           for k, v in (c.get('cleanroom') or {}).items()))
+    print('  合规          NOTICE 三段式 ✓ ｜ 第三方清单已同步 ｜ 未声明来源的技能 %d 个' % n_bare)
     for w in warnings:
         print('  ⚠ %s' % w)
     for e in errors:
@@ -908,6 +942,8 @@ def cmd_pack(args):
     import zipfile
 
     def collect():
+        skip_bare = bool(getattr(args, 'exclude_bare', False))
+        bare = set(bare_skills()) if skip_bare else set()
         files = []
         for cat in ('skill-categories.json', 'deploy-contract.json'):
             p = os.path.join(ROOT, cat)
@@ -915,6 +951,12 @@ def cmd_pack(args):
                 files.append((cat, p))
         for r, dirs, fs in os.walk(SKILLS_DIR):
             dirs[:] = [d for d in sorted(dirs) if d != '_removed']
+            # --exclude-bare：把未声明来源的技能目录整个跳过（保留仓库里的文件，只是不进包）
+            rel_dir = os.path.relpath(r, SKILLS_DIR).replace(os.sep, '/')
+            top = rel_dir.split('/')[0]
+            if skip_bare and top in bare:
+                dirs[:] = []
+                continue
             for f in sorted(fs):
                 p = os.path.join(r, f)
                 files.append((os.path.relpath(p, ROOT).replace(os.sep, '/'), p))
@@ -995,10 +1037,156 @@ def cmd_pack(args):
     print('已打包 %d 个文件 → %s（%s 字节）' % (len(files), os.path.relpath(out, ROOT), size))
     print('  包 sha256  %s' % zh)
     print('  清单       MANIFEST.sha256（%d 行）' % len(lines))
-    print('  技能数     %d' % len(disk_skills()))
+    packed_skills = len({rel.split('/')[1] for rel, _ in files if rel.startswith('skills-v4/')})
+    hidden = len(bare_skills()) if getattr(args, 'exclude_bare', False) else 0
+    if hidden:
+        print('  技能数     %d（已按 --exclude-bare 排除未声明来源的 %d 个）' % (packed_skills, hidden))
+    else:
+        print('  技能数     %d' % packed_skills)
     print()
     print('校验：py -X utf8 skill_tool.py pack --verify "%s"' % out)
     return 0
+
+
+def skill_provenance(name: str):
+    """一个技能的来源线索：@(许可文件绝对路径或 None, frontmatter license, frontmatter author)
+
+    notice 与 pack --exclude-bare 都用它，保证「清单里说未声明」与「打包时排除」是同一套判定。
+    """
+    d = os.path.join(SKILLS_DIR, name)
+    lic = None
+    for root2, dirs2, files2 in os.walk(d):
+        if os.path.relpath(root2, d).count(os.sep) > 1:
+            dirs2[:] = []
+            continue
+        hit = [x for x in files2
+               if os.path.splitext(x)[0].upper() in ('LICENSE', 'COPYING', 'LICENCE')
+               and os.path.splitext(x)[1].upper() in ('', '.MD', '.TXT', '.MARKDOWN')]
+        if hit:
+            lic = os.path.join(root2, hit[0])
+            break
+    fm = skill_info(name)['fm']
+    return (lic, fm_value(fm, 'license'), fm_value(fm, 'author'))
+
+
+def bare_skills():
+    """既无 LICENSE、也无 license / author 声明的技能名（再分发风险项）"""
+    return [n for n in disk_skills() if not any(skill_provenance(n))]
+
+
+def cmd_notice(args):
+    """生成 / 校验 THIRD-PARTY-NOTICES.md（第三方清单）
+
+    为什么自动生成：65 个技能里哪些带独立 LICENSE、哪些标了作者、哪些什么都没声明——
+    手写的清单一定会腐（改了技能库忘了改清单），而这份东西是**再分发**时的依据。
+    脚本只抽磁盘上真实存在的字段，不替你猜许可。
+    """
+    rows_lic, rows_author, rows_declared, rows_bare = [], [], [], []
+    for n in disk_skills():
+        lic_file, fm_lic, fm_author = skill_provenance(n)
+        if lic_file:
+            first = ''
+            try:
+                for ln in read(lic_file).splitlines():
+                    if ln.strip():
+                        first = ln.strip()[:80]
+                        break
+            except Exception:
+                pass
+            rows_lic.append((n, os.path.relpath(lic_file, ROOT).replace(os.sep, '/'),
+                             hashlib.sha256(open(lic_file, 'rb').read()).hexdigest()[:12], first))
+        if fm_author:
+            rows_author.append((n, fm_author))
+        if fm_lic:
+            rows_declared.append((n, fm_lic))
+        if not (lic_file or fm_lic or fm_author):
+            rows_bare.append(n)
+
+    contract = json.loads(read(CONTRACT_PATH)) if os.path.isfile(CONTRACT_PATH) else {}
+    clean = contract.get('cleanroom') or {}
+
+    L = []
+    L.append('# 第三方组件与许可清单')
+    L.append('')
+    L.append('> 本文件由 `py -X utf8 skill_tool.py notice --write` 生成，**不要手改**（改了下次生成会被覆盖）。')
+    L.append('> 它只记录磁盘上真实存在的字段：技能目录里的 `LICENSE` 文件、`SKILL.md` frontmatter 的')
+    L.append('> `license:` / `author:`。没有声明的就不写，不替上游猜许可。')
+    L.append('')
+    L.append('## 1. 随附原始许可文件的技能包（%d）' % len(rows_lic))
+    L.append('')
+    if rows_lic:
+        L.append('| 技能 | 许可文件 | sha256 | 首行 |')
+        L.append('|---|---|---|---|')
+        for n, rel, h, first in rows_lic:
+            L.append('| `%s` | `%s` | `%s` | %s |' % (n, rel, h, first))
+        L.append('')
+        L.append('这些目录内的 `LICENSE` 保持原样，请一并遵守。')
+    else:
+        L.append('（无）')
+    L.append('')
+    L.append('## 2. frontmatter 标注了作者的技能（%d）' % len(rows_author))
+    L.append('')
+    if rows_author:
+        L.append('| 技能 | author |')
+        L.append('|---|---|')
+        for n, a in rows_author:
+            L.append('| `%s` | %s |' % (n, a))
+    else:
+        L.append('（无）')
+    L.append('')
+    L.append('## 3. frontmatter 声明了许可的技能（%d）' % len(rows_declared))
+    L.append('')
+    if rows_declared:
+        L.append('| 技能 | license |')
+        L.append('|---|---|')
+        for n, lic in rows_declared:
+            L.append('| `%s` | %s |' % (n, lic))
+    else:
+        L.append('（无）')
+    L.append('')
+    L.append('## 4. 未声明来源或许可的技能（%d）' % len(rows_bare))
+    L.append('')
+    L.append('这些目录里既没有 `LICENSE`，frontmatter 也没有 `license:` / `author:`。')
+    L.append('本仓库把它们作为**整理收集的资料**随附；**再分发或商用前请自行确认权利人意愿**')
+    L.append('（本仓库不代为授权）。数量：%d / %d。' % (len(rows_bare), len(disk_skills())))
+    L.append('')
+    if rows_bare:
+        for i2 in range(0, len(rows_bare), 6):
+            L.append('- ' + '、'.join('`%s`' % x for x in rows_bare[i2:i2 + 6]))
+        L.append('')
+    L.append('## 5. 提示词模板与机制溯源')
+    L.append('')
+    L.append('逐项记录（仓库 / commit / 许可证 / 引用方式）在 `deploy-contract.json` 的 `cleanroom` 段，')
+    L.append('`py -X utf8 skill_tool.py contract` 会校对它们与 README 致谢一致。当前条目：')
+    L.append('')
+    L.append('| 来源 | commit | 许可证 | 方式 |')
+    L.append('|---|---|---|---|')
+    for k, v in clean.items():
+        L.append('| %s | `%s` | %s | %s |' % (v.get('repo'), str(v.get('commit') or '')[:12],
+                                                v.get('license'), v.get('mode')))
+    L.append('')
+    L.append('另：`prompts/_glm53f-kovak.md` 收编自上游仓库（其未声明许可）；`NOTICE.md` 的')
+    L.append('「再分发限制」节列出了不得随包分发的组件。')
+    L.append('')
+    text = '\n'.join(L) + '\n'
+    out = os.path.join(ROOT, 'THIRD-PARTY-NOTICES.md')
+
+    if args.write:
+        tmp = out + '.tmp'
+        with open(tmp, 'w', encoding='utf-8', newline='\n') as fh:
+            fh.write(text)
+        os.replace(tmp, out)
+        print('已写入 %s' % os.path.relpath(out, ROOT))
+        print('  带 LICENSE 的技能包 %d ｜ 标了作者 %d ｜ 声明许可 %d ｜ 未声明 %d'
+              % (len(rows_lic), len(rows_author), len(rows_declared), len(rows_bare)))
+        return 0
+
+    cur = read(out) if os.path.isfile(out) else ''
+    if cur.strip() == text.strip():
+        print('THIRD-PARTY-NOTICES.md 与技能库一致（%d 个技能）' % len(disk_skills()))
+        return 0
+    print('THIRD-PARTY-NOTICES.md 已过期或缺失 —— 跑 `py -X utf8 skill_tool.py notice --write` 重新生成')
+    return 1
 
 
 def _find_skill_root(base: str):
@@ -1235,7 +1423,13 @@ def main():
     p = sub.add_parser('pack', help='把技能库打成可分发压缩包（含 SHA-256 清单）')
     p.add_argument('--out', help='输出 zip 路径（默认 build/skill-library-<时间>.zip）')
     p.add_argument('--verify', help='校验一个已打好的包（不给则打新包）')
+    p.add_argument('--exclude-bare', action='store_true',
+                   help='排除未声明来源/许可的技能（再分发安全包）')
     p.set_defaults(func=cmd_pack)
+
+    p = sub.add_parser('notice', help='生成/校验 THIRD-PARTY-NOTICES.md（第三方许可清单）')
+    p.add_argument('--write', action='store_true', help='写入文件（不给则只校验是否过期）')
+    p.set_defaults(func=cmd_notice)
 
     p = sub.add_parser('add', help='加技能（目录或 zip）')
     p.add_argument('source', nargs='?', help='技能目录或 zip；--batch 时是父目录')

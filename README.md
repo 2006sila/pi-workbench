@@ -354,7 +354,7 @@ py -X utf8 skill_tool.py pack --verify build\skill-library.zip
 
 ### 方式一：用打包好的单文件 exe
 
-从 [Releases](https://github.com/2006sila/pi-workbench/releases/latest) 下载 `pi-workbench-v1.3.exe`（单文件，约 48MB），双击即用（无需 Python 环境）。
+从 [Releases](https://github.com/2006sila/pi-workbench/releases/latest) 下载 `pi-workbench-v1.4.exe`（单文件，约 48MB），双击即用（无需 Python 环境）。
 本地自己构建的产物名是 `pi用学习工作台.exe`，功能相同。
 首次启动会解压内置资源到临时目录，约 2~4 秒。
 
@@ -444,12 +444,31 @@ powershell -ExecutionPolicy Bypass -File inject.ps1 -Target pideck -AgentDir D:\
 
 ```powershell
 # 打包自检：验证随包资源可寻址（清单来自 deploy-contract.json，不再写死在这里）
-$env:PJ_BUNDLE_CHECK='1'; .\dist\pi-workbench-v1.3.exe
+$env:PJ_BUNDLE_CHECK='1'; .\dist\pi-workbench-v1.4.exe
 # 结果：%LOCALAPPDATA%\pi-workbench\bundle-check.json
 
 # 构建身份自检：确认你跑的是不是这个构建（升级排查第一步）
-$env:PJ_VERSION_CHECK='1'; .\dist\pi-workbench-v1.3.exe
+$env:PJ_VERSION_CHECK='1'; .\dist\pi-workbench-v1.4.exe
 # 结果：%LOCALAPPDATA%\pi-workbench\version-check.json（版本号 / APP_BUILD / frozen）
+```
+
+自我部署（把构建好的 exe 装进分发目录，带 dry-run 与回滚备份）：
+
+```powershell
+# 只打印计划，不动手
+powershell -ExecutionPolicy Bypass -File deploy-self.ps1 -WhatIfOnly
+
+# 实际部署（默认：dist\ 下最新的 pi-workbench-v*.exe → 仓库上一级目录）
+powershell -ExecutionPolicy Bypass -File deploy-self.ps1 -Pkg 'D:\Agent\workplace' -NoStart
+
+# 回滚：脚本会把命令直接打印出来，形如
+#   Copy-Item -LiteralPath '<目标>.rollback-<时间戳>' -Destination '<目标>' -Force
+```
+
+一次性跑完全部验收（沙箱，不碰真实配置）：
+
+```powershell
+py -X utf8 tests\run_all.py
 ```
 
 ---
@@ -469,11 +488,14 @@ pi-workbench/
 ├── inject.ps1                 注入器核心（双目标：安装 / 卸载 / 自检 / 附加包）
 ├── inject-pideck.ps1          PiDeck 便捷入口
 ├── inject-dsh.ps1             DeepSeek Harness 便捷入口
+├── deploy-self.ps1            自我部署：停进程 → 备份 .rollback-<时间戳> → 覆盖 → 重启
 ├── prompts/                   指令集模板（头部 + 正文分离，详见 prompts/README.md）
 │   └── archive/               已退役的历史头部
 ├── skills-v4/                 65 个技能模块（Agent Skills 标准）
+├── tests/                     验收脚本（沙箱，不碰真实配置；tests/run_all.py 一次跑完）
 ├── docs/                      README 截图 · docs/SECURITY.md（发布前安全检查）· docs/releases/（发布说明）
-├── NOTICE.md                  第三方内容署名
+├── NOTICE.md                  许可范围 / 第三方组件 / 再分发限制（人读）
+├── THIRD-PARTY-NOTICES.md     第三方清单（由 skill_tool.py notice 生成，勿手改）
 └── dist/                      构建产物（.gitignore）
 ```
 
@@ -544,6 +566,34 @@ pi-workbench/
 ---
 
 ## 更新记录
+
+**V1.4 · 2026-09-30**
+
+从 [alicewe1/alice-assistant](https://github.com/alicewe1/alice-assistant)（GPL-3.0，clean-room，只借机制）学到的六件事，全部落地并带验收：
+
+- **标记块只认「关键串」**（修一个真实的升级兼容缺口）：
+  - 定位改成 `<!-- BEGIN pi-workbench` + 任意载荷，版本号只是载荷
+  - 旧版本块（`v3`）、旧版脚本写的变体（`BEGIN pi-workbench prompt=x.md`）都能被认出来，重新部署**原地升级**
+  - 此前标记写死整串：改版本号后旧块会被当成「没有标记块」→ 重复注入会**追加第二块**
+  - `-Check` 会报出当前标记块版本，旧版本给 WARN 提示「重新部署会原地升级」
+  - `contract` 新增断言：定位正则必须基于关键串（改回写死就报错）
+- **备份保留策略**：时间戳备份与 `backup\drift\` 各留最近 10 份；
+  **被状态清单引用的「唯一原件」永不清理**（删了就等于失去卸载还原能力）
+- **渲染后占位符断言**：指令集模板 / 菜单技能 / DSH patch 层里残留 `{{...}}` → 直接拒绝写入
+- **合规三段式**（发布合规缺口）：`NOTICE.md` 拆成「许可范围 / 第三方组件（各自许可优先）/ **再分发限制**」，
+  并新增 **`THIRD-PARTY-NOTICES.md`（由 `skill_tool.py notice` 自动生成）**：
+  带独立 LICENSE 的技能包（含子目录）、标注作者的技能、声明许可的技能，以及
+  **未声明来源的技能 59 个**（如实列出 —— 再分发前须自行确认权利人）
+  - `skill_tool.py pack --exclude-bare`：打「再分发安全包」时排除这些未声明来源的技能
+  - `contract` 会校验 NOTICE 三段式存在 + 第三方清单与磁盘一致（数量不符即报错）
+- **Job Object 回收整棵进程树**（`bj_tool.py`）：子进程一 spawn 就挂进
+  `KILL_ON_JOB_CLOSE` 作业，句柄关闭时由**内核**清掉整棵树（含孙进程），
+  GUI 崩了也不留孤儿；宿主已在别的作业导致 assign 失败时优雅回退到 `taskkill /T`
+- **`deploy-self.ps1`**（自我部署）：停进程 → 备份 `.rollback-<时间戳>` → 覆盖 → 校验 SHA256 → 重启；
+  `-WhatIfOnly` 只打印不动手，结束时**直接打印回滚命令**，回滚备份按 `-KeepRollbacks` 清理；
+  路径按脚本位置推导（不写死盘符），构建产物==目标时拒绝
+- **测试进仓库**：`tests/` 两个套件 + `tests/run_all.py`（注入核心 13 项 / 工程件 13 项 / 仓库门禁），
+  以前放 `%TEMP%` 被系统清理过一次，现在跟代码走
 
 **V1.3 · 2026-09-26**
 
@@ -695,7 +745,17 @@ pi-workbench/
   来源与改动逐项记在 [NOTICE.md](NOTICE.md)；部署事务、版本日志与按版本恢复、
   口语归一表等机制按本仓库的形态重写（PowerShell + Python）。未搬其付费中转、
   激活门与社群部分。
-- 以上两条的机器可读记录在 [deploy-contract.json](deploy-contract.json) 的 `cleanroom` 段
+- **部署器工程机制（标记 / 备份 / 进程 / 发布）** 参考了
+  [alicewe1/alice-assistant](https://github.com/alicewe1/alice-assistant)（GPL-3.0，
+  同类产品：提示词 × 技能库 × 客户端部署器，Rust + Tauri）。
+  读的是 `55bedd92fcd6fe06f3d359e3c3414f225e4e2a9e`（82 个文件）。
+  **仅借鉴机制与工程约定，未使用其代码**（clean-room：本仓库 MIT，且栈也不同 ——
+  它是 Rust/Tauri，这里是 PowerShell + Python，以自己的实现与措辞重写）。
+  借到的机制：标记块「只认关键串、版本/载荷可变」（旧块能认出并原地升级）、
+  备份保留策略（时间戳备份限份 / 固定名备份永不清）、渲染后断言无残留 `{{...}}`、
+  NOTICE 三段式与自动生成的第三方清单、Job Object 回收整棵进程树（含 assign 失败的兜底）、
+  自我部署脚本（`-WhatIfOnly` + `.rollback-<时间戳>` + 打印回滚命令）。
+- 以上三条的机器可读记录在 [deploy-contract.json](deploy-contract.json) 的 `cleanroom` 段
   （含 repo / commit / 许可证 / 引用方式 / 具体借了什么），`py -X utf8 skill_tool.py contract`
   会核对 README 这里写的仓库 / 许可证 / commit 是否与契约一致 —— 口头致谢不算溯源。
 
@@ -706,7 +766,8 @@ pi-workbench/
   配置根环境变量探测、口语归一表、发布前隐私检查文档结构。
   两边都没抄的：越狱/拒答话术与话术替换表、封印/加密/水印、激活门与口令、
   付费中转与社群内容、以及 alice 的 365 个技能正文（GPL 内容不进 MIT 仓库）。
-- 技能库内含第三方收集内容，署名与许可见 [NOTICE.md](NOTICE.md)。
+- 技能库内含第三方收集内容，署名、完整清单与**再分发限制**见 [NOTICE.md](NOTICE.md)
+  与自动生成的 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。
 
 ---
 
