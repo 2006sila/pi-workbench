@@ -24,6 +24,8 @@ def run(cmd, label):
 def main():
     results = []
     for f, label in (('verify_inject.py', '注入核心（标记兼容 / 备份保留 / 占位符断言 / 漂移）'),
+                     ('verify_import.py', '技能来源识别（集合 / 包装 / zip / 同名冲突 / 上限）'),
+                     ('verify_readonly.py', '只读保护 + 客户端路径探测'),
                      ('verify_job_and_deploy.py', '工程件（Job Object 进程树 / 自我部署脚本）')):
         ok = run([PY, '-X', 'utf8', os.path.join(HERE, f)], label)
         results.append((label, ok))

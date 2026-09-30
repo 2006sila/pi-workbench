@@ -63,7 +63,15 @@ param(
     [string]$Out = '',
 
     # 版本对比：-Diff <版本id> 显示「当前内容 → 恢复后会变成什么」的行差异（只读，不写文件）。
-    [string]$Diff = ''
+    [string]$Diff = '',
+
+    # 只解析目标客户端 exe 路径并输出（GUI 的「重启」按钮复用同一套探测逻辑，找不到退出码 1）。
+    [switch]$FindExe,
+
+    # 部署完成后把技能库设为只读（防客户端 / AI 误改技能库）。
+    # 注意：这不是防恶意 —— AI 可以自己清掉只读位；它防的是「顺手改坏」。
+    # 本工具自己的写入（重新部署 / 极简模式打标记 / 卸载）会先自动解锁。
+    [switch]$Readonly
 )
 
 Set-StrictMode -Off
@@ -153,6 +161,10 @@ $TARGETS = @{
             (Join-Path $env:LOCALAPPDATA 'Programs\PiDeck\PiDeck.exe'),
             (Join-Path $env:ProgramFiles 'PiDeck\PiDeck.exe')
         )
+        # 安装路径探测用的匹配式（注册表 DisplayName / 快捷方式名）。
+        # 只靠写死的 ExeHints 不够：用户完全可以把 PiDeck 装到 D:\Agent\PiDeck（实测就是）。
+        RegPattern      = '*PiDeck*'
+        ShortcutPattern = '*PiDeck*'
         # 通道体检用的 CLI：PiDeck 桌面端不能跑无头，但 pi CLI 读的是同一个配置根。
         ProbeCli    = @('pi.cmd', 'pi')
     }
@@ -174,6 +186,8 @@ $TARGETS = @{
             (Join-Path $env:ProgramFiles 'DeepSeek Harness\DeepSeek Harness.exe'),
             (Join-Path $env:LOCALAPPDATA 'Programs\dsh\dsh.exe')
         )
+        RegPattern      = '*DeepSeek Harness*'
+        ShortcutPattern = '*DeepSeek*'
         ProbeCli    = @('dsh.cmd', 'dsh')
     }
 }
@@ -186,6 +200,7 @@ $Script:OpName = if ($Uninstall) { 'uninstall' }
     elseif ($Restore) { 'restore' }
     elseif ($Restore) { 'restore' }
     elseif ($Diff) { 'diff' }
+    elseif ($FindExe) { 'find-exe' }
     elseif ($Compose) { 'compose' }
     elseif ($Probe) { 'probe' }
     elseif ($Check) { 'check' }
@@ -703,6 +718,31 @@ function Invoke-Rollback {
     return @($done, @($conflicts))
 }
 
+function Set-ReadonlyTree([string]$Path, [bool]$On) {
+    # 把一棵树里的文件设为 / 取消只读，返回处理的文件数。
+    # Windows 上目录的只读位不阻止往里写新文件，所以这里只对文件生效 ——
+    # 保护强度是「防误改」，如实说明，不吹成「防篡改」。
+    if (-not (Test-Path -LiteralPath $Path)) { return 0 }
+    $n = 0
+    foreach ($f in @(Get-ChildItem -LiteralPath $Path -Recurse -File -Force -ErrorAction SilentlyContinue)) {
+        try {
+            if ($f.IsReadOnly -ne $On) { $f.IsReadOnly = $On; $n++ }
+        } catch { }
+    }
+    return $n
+}
+
+function Unlock-SkillTrees([string[]]$Names, [string]$Root) {
+    # 本工具自己动手前先解锁（robocopy 覆盖 / 删除 / 打标记都可能被只读位挡住）。
+    $n = 0
+    foreach ($nm in @($Names)) {
+        if ([string]::IsNullOrWhiteSpace($nm)) { continue }
+        $p = Join-Path $Root $nm
+        if (Test-Path -LiteralPath $p) { $n += (Set-ReadonlyTree $p $false) }
+    }
+    return $n
+}
+
 function Copy-Tree([string]$Src, [string]$Dest) {
     robocopy $Src $Dest /E /MT:16 /R:1 /W:1 /NFL /NDL /NJH /NJS /NC /NS /NP | Out-Null
     if ($LASTEXITCODE -ge 8) { throw ("robocopy failed rc=" + $LASTEXITCODE + " for " + $Src) }
@@ -845,6 +885,51 @@ function Get-DshBudget {
         }
     }
     return @($DshDefaultBudget, 'dsh 默认值', $false)
+}
+
+function Expand-SkillRoot([string]$Root, [int]$MaxDepth = 3, [int]$MaxSkills = 64) {
+    # 从一个技能来源里收出**所有**技能目录（学习 alice-assistant 的导入识别规则）：
+    #   · 直接子目录带 SKILL.md      → 常规技能库 / 附加包，逐个收
+    #   · 一个都没有但更深处有       → 「技能集合」或 zip 常见的一层包装，自动下钻
+    #   · 找到技能的目录不再下钻（技能目录里的 references/ scripts/ 不是技能）
+    #   · 封顶：深度 ≤ MaxDepth、数量 ≤ MaxSkills（误选巨型目录时不至于卡死）
+    # 返回对象数组：@{ Dir = <DirectoryInfo>; Source = <来源根> }，Source 用于报同名冲突。
+    $out = New-Object System.Collections.ArrayList
+    if (-not (Test-Path -LiteralPath $Root)) {
+        SayHost 'WARN' ('技能来源不存在: ' + $Root)
+        return $out
+    }
+    $direct = @(Get-SkillDirs $Root)
+    if ($direct.Count -gt 0) {
+        foreach ($d in $direct) { [void]$out.Add([pscustomobject]@{ Dir = $d; Source = $Root }) }
+        return $out
+    }
+    $rootFull = [System.IO.Path]::GetFullPath($Root)
+    $queue = New-Object System.Collections.Queue
+    $queue.Enqueue(@($rootFull, 0))
+    $hit = 0
+    $capped = $false
+    while ($queue.Count -gt 0) {
+        $cur = $queue.Dequeue()
+        $path = [string]$cur[0]
+        $depth = [int]$cur[1]
+        if ($depth -gt 0 -and (Test-Path -LiteralPath (Join-Path $path 'SKILL.md'))) {
+            [void]$out.Add([pscustomobject]@{ Dir = (Get-Item -LiteralPath $path); Source = $Root })
+            $hit++
+            if ($hit -ge $MaxSkills) { $capped = $true; break }
+            continue
+        }
+        if ($depth -ge $MaxDepth) { continue }
+        foreach ($sd in @(Get-ChildItem -LiteralPath $path -Directory -ErrorAction SilentlyContinue | Sort-Object Name)) {
+            if ($sd.Name.StartsWith('.')) { continue }
+            $queue.Enqueue(@($sd.FullName, ($depth + 1)))
+        }
+    }
+    if ($capped) { SayHost 'WARN' ('技能来源 ' + $Root + ' 收满 ' + $MaxSkills + ' 个后停止（数量上限）') }
+    if ($out.Count -eq 0) {
+        SayHost 'WARN' ('技能来源里没找到 SKILL.md（已下钻 ' + $MaxDepth + ' 层）: ' + $Root)
+    }
+    return $out
 }
 
 function Get-SkillDirs([string]$Root) {
@@ -1056,7 +1141,83 @@ function Get-ClientProcess {
     return $found
 }
 
+function Get-RunningClientExe {
+    # 在跑的进程自己就带着真实路径 —— 最强证据（便携版 / 非默认安装目录都能认）。
+    foreach ($n in $T.ProcNames) {
+        try {
+            $p = @(Get-Process -Name $n -ErrorAction SilentlyContinue | Where-Object { $_.Path } | Select-Object -First 1)
+            if ($p.Count -gt 0 -and $p[0].Path -and (Test-Path -LiteralPath $p[0].Path -PathType Leaf)) {
+                return [string]$p[0].Path
+            }
+        } catch { }
+    }
+    return $null
+}
+
+function Get-ExeFromRegistry([string]$Pattern) {
+    # 安装器（NSIS）会写 DisplayIcon = "<exe>,0"；比写死路径可靠（用户可装到任意盘）。
+    $roots = @('HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+               'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*')
+    foreach ($root in $roots) {
+        $items = @()
+        try { $items = @(Get-ItemProperty -Path $root -ErrorAction SilentlyContinue) } catch { }
+        foreach ($it in $items) {
+            if (-not $it.DisplayName -or ([string]$it.DisplayName -notlike $Pattern)) { continue }
+            $cands = @()
+            if ($it.DisplayIcon) {
+                $cands += (([string]$it.DisplayIcon) -replace ',\s*\d+\s*$', '').Trim().Trim('"')
+            }
+            if ($it.InstallLocation) {
+                $loc = ([string]$it.InstallLocation).Trim().Trim('"')
+                foreach ($nm in @('PiDeck.exe', 'DeepSeek Harness.exe', 'dsh.exe')) { $cands += (Join-Path $loc $nm) }
+            }
+            foreach ($c in $cands) {
+                if ($c -and (Test-Path -LiteralPath $c -PathType Leaf)) { return $c }
+            }
+        }
+    }
+    return $null
+}
+
+function Get-ExeFromShortcut([string]$Pattern) {
+    # 便携版没有注册表项，快捷方式（桌面 / 开始菜单）是次优线索。
+    $dirs = @()
+    foreach ($k in @('Desktop', 'DesktopDirectory', 'Programs', 'CommonPrograms')) {
+        try {
+            $d = [Environment]::GetFolderPath($k)
+            if ($d -and (Test-Path -LiteralPath $d)) { $dirs += $d }
+        } catch { }
+    }
+    $sh = $null
+    try { $sh = New-Object -ComObject WScript.Shell } catch { return $null }
+    foreach ($d in ($dirs | Sort-Object -Unique)) {
+        $lnks = @()
+        try { $lnks = @(Get-ChildItem -LiteralPath $d -Filter '*.lnk' -File -ErrorAction SilentlyContinue) } catch { }
+        foreach ($l in $lnks) {
+            if (([string]$l.Name) -notlike $Pattern) { continue }
+            try {
+                $tgt = [string]$sh.CreateShortcut($l.FullName).TargetPath
+                if ($tgt -and (Test-Path -LiteralPath $tgt -PathType Leaf)) { return $tgt }
+            } catch { }
+        }
+    }
+    return $null
+}
+
 function Find-ClientExe {
+    # 四级探测（旧写法只看写死的 ExeHints：用户装到 D:\Agent\PiDeck 就找不到 exe，
+    # GUI 的「重启」按钮会报「未找到安装路径」）：
+    #   在跑的进程 → 注册表 → 快捷方式 → 写死路径
+    $p = Get-RunningClientExe
+    if ($p) { return $p }
+    if ($T.RegPattern) {
+        $p = Get-ExeFromRegistry $T.RegPattern
+        if ($p) { return $p }
+    }
+    if ($T.ShortcutPattern) {
+        $p = Get-ExeFromShortcut $T.ShortcutPattern
+        if ($p) { return $p }
+    }
     foreach ($p in $T.ExeHints) {
         if ($p -and (Test-Path -LiteralPath $p)) { return $p }
     }
@@ -1244,6 +1405,18 @@ if ([string]::IsNullOrWhiteSpace($SkillsSource)) {
         $p = $p.Trim()
         if ([string]::IsNullOrWhiteSpace($p)) { continue }
         if (-not [System.IO.Path]::IsPathRooted($p)) { $p = Join-Path $Base $p }
+        # 允许直接给一个 .zip（用户在 GUI 里挑的就是压缩包）：解压到临时目录再当来源
+        if ((Test-Path -LiteralPath $p -PathType Leaf) -and ($p -like '*.zip')) {
+            $tmpZip = Join-Path $env:TEMP ('pj-skill-' + [guid]::NewGuid().ToString('N'))
+            try {
+                Expand-Archive -LiteralPath $p -DestinationPath $tmpZip -Force
+                Say 'INFO' ('技能包已解压: ' + (Split-Path -Leaf $p) + ' -> ' + $tmpZip)
+                $p = $tmpZip
+            } catch {
+                Say 'WARN' ('技能包解压失败（跳过）: ' + $p + ' —— ' + $_.Exception.Message)
+                continue
+            }
+        }
         $srcParts += $p
     }
     if ($srcParts.Count -eq 0) { $srcParts = @(Join-Path $Base 'skills-v4') }
@@ -1391,6 +1564,25 @@ if ($Check) {
         foreach ($b in ($loadBad | Select-Object -First 5)) { Say 'L1' ('加载层问题：' + $b) }
         if ($loadBad.Count -gt 5) { Say 'L1' ('加载层问题另有 ' + ($loadBad.Count - 5) + ' 条') }
         Say 'WARN' '加载层未通过：有技能写了但客户端会跳过（无 description / frontmatter 坏）'
+    }
+
+    # L1b2 只读保护：状态说只读，实际文件也得是只读（否则是「保护悄悄失效」）
+    if ($state -and $state.readonly -and $state.installedSkills) {
+        $roCnt = 0
+        $allCnt = 0
+        foreach ($nm in @($state.installedSkills)) {
+            $p = Join-Path $SkillsTarget $nm
+            if (-not (Test-Path -LiteralPath $p)) { continue }
+            foreach ($f in @(Get-ChildItem -LiteralPath $p -Recurse -File -Force -ErrorAction SilentlyContinue)) {
+                $allCnt++
+                if ($f.IsReadOnly) { $roCnt++ }
+            }
+        }
+        if ($allCnt -gt 0 -and $roCnt -eq $allCnt) {
+            Say 'L1' ('只读保护生效：' + $roCnt + ' 个文件全部只读')
+        } else {
+            Say 'WARN' ('只读保护失效：状态里记着只读，但只有 ' + $roCnt + '/' + $allCnt + ' 个文件是只读（重新部署会重新设上）')
+        }
     }
 
     # L1c 生成物一致性：菜单技能是从技能库 + 类目表现场生成的，
@@ -1628,6 +1820,21 @@ if ($Probe) {
     if ($probeOk) { Finish 'OK'; exit 0 }
     Finish 'PARTIAL'
     exit 1
+}
+
+# ---------------------------------------------------------------- 客户端路径探测（-FindExe）
+
+# 给 GUI 的「重启」按钮用：只解析路径并输出，不做任何写入。
+# 这样探测逻辑只有一份（本文件），GUI 不再维护自己那套写死的 exe_hints。
+if ($FindExe) {
+    $exe = Find-ClientExe
+    if (-not $exe) {
+        Say 'WARN' ('未找到 ' + $T.Label + ' 的安装路径（进程未运行，注册表与快捷方式也没有线索）')
+        Finish 'FAIL'
+        exit 1
+    }
+    Write-Output $exe
+    exit 0
 }
 
 # ---------------------------------------------------------------- 任务构建器（-Compose）
@@ -2081,6 +2288,11 @@ if ($Uninstall) {
     # 2) 移除清单内的技能，并还原被覆盖的同名技能
     $removed = 0
     if ($state -and $state.installedSkills) {
+        # 只读保护过的技能先解锁，否则删除 / 还原会被只读位挡住
+        if ($state.readonly) {
+            $un3 = Unlock-SkillTrees @($state.installedSkills) $SkillsTarget
+            if ($un3 -gt 0) { Say 'INFO' ('卸载：已先解除 ' + $un3 + ' 个文件的只读') }
+        }
         foreach ($n in $state.installedSkills) {
             $dest = Assert-Writable $SkillsTarget $n
             $overwrittenBackup = $null
@@ -2370,20 +2582,42 @@ if ($NoSkills) {
     $dirs = @()
     foreach ($srcPart in $SkillsSource -split '[;]') {
         if ([string]::IsNullOrWhiteSpace($srcPart)) { continue }
-        $dirs += @(Get-SkillDirs $srcPart)
+        $dirs += @(Expand-SkillRoot $srcPart)
     }
     if ($dirs.Count -eq 0) {
         Say 'WARN' ('技能源目录为空: ' + $SkillsSource)
     } else {
+        # 同名冲突：以前是 silently 取第一个；现在把冲突名字与两边来源都报出来
         $seen = @{}
-        $dirs = @($dirs | Where-Object { if ($seen.ContainsKey($_.Name)) { $false } else { $seen[$_.Name] = $true; $true } })
+        $dups = @()
+        $unique = @()
+        foreach ($it in $dirs) {
+            $nm = $it.Dir.Name
+            if ($seen.ContainsKey($nm)) {
+                $dups += ($nm + '（' + (Split-Path -Leaf ([string]$seen[$nm])) + ' vs ' + (Split-Path -Leaf ([string]$it.Source)) + '）')
+                continue
+            }
+            $seen[$nm] = [string]$it.Source
+            $unique += $it
+        }
+        if ($dups.Count -gt 0) {
+            Say 'WARN' ('同名技能冲突（取先出现的那个，其余跳过）: ' + ($dups -join '；'))
+        }
+        $dirs = $unique
+        # 上次部署设过只读 → 先解锁，否则 robocopy 覆盖 / 打标记会被挡住
+        if ($prevState -and $prevState.readonly -and $prevState.installedSkills) {
+            $un = Unlock-SkillTrees @($prevState.installedSkills) $SkillsTarget
+            if ($un -gt 0) { Say 'INFO' ('上次部署设了只读，已先解锁 ' + $un + ' 个文件') }
+        }
         if (-not (Test-Path -LiteralPath $SkillsTarget)) {
             New-Item -ItemType Directory -Force -Path $SkillsTarget | Out-Null
             Register-Rollback $SkillsTarget 'delete' '' $false
         }
-        foreach ($d in $dirs) {
+        foreach ($dItem in $dirs) {
+            $d = $dItem.Dir
             $dest = Assert-Writable $SkillsTarget $d.Name
             $destExisted = Test-Path -LiteralPath $dest
+            if ($destExisted) { [void](Set-ReadonlyTree $dest $false) }   # 只读目标先解锁再覆盖
             $backedUpNow = $false
             if ($destExisted) {
                 $alreadyOurs = $false
@@ -2462,6 +2696,7 @@ if (-not $NoSkills) {
         foreach ($n in $menuable) {
             $p = Join-Path (Join-Path $SkillsTarget $n) 'SKILL.md'
             if (-not (Test-Path -LiteralPath $p)) { continue }
+            if ($prevState -and $prevState.readonly) { [void](Set-ReadonlyTree (Split-Path -Parent $p) $false) }
             if ($keep -contains $n) {
                 # 例外：去掉可能残留的标记，保持进提示词
                 if (Remove-DisableModelInvocation $p) { $unflagged++ }
@@ -2589,6 +2824,26 @@ $state = [ordered]@{
         rollback       = $rollbackCmd
     }
 }
+# 只读保护（opt-in）：技能库是本工具管理的资产，防止客户端 / AI 顺手改坏。
+# 放在最后做：这样菜单技能的 disable-model-invocation 标记已经写完。
+if ($Readonly -and -not $NoSkills -and @($installedSkills).Count -gt 0) {
+    $roFiles = 0
+    foreach ($nm in @($installedSkills)) {
+        $roFiles += (Set-ReadonlyTree (Join-Path $SkillsTarget $nm) $true)
+    }
+    # 括号里不能在 + 后换行（PS 5.1 会把行尾当表达式结束），先拼到变量
+    $roMsg = '只读保护：' + @($installedSkills).Count + ' 个技能目录 / ' + $roFiles + ' 个文件已设为只读'
+    $roMsg += '（重新部署或卸载会自动解除；这是防误改，不是防篡改）'
+    Say 'INFO' $roMsg
+} elseif (-not $NoSkills -and @($installedSkills).Count -gt 0) {
+    # 未开只读：如果上次是只读，这次要显式解除（用户把开关关掉的场景）
+    if ($prevState -and $prevState.readonly) {
+        $un2 = Unlock-SkillTrees @($installedSkills) $SkillsTarget
+        if ($un2 -gt 0) { Say 'INFO' ('已解除只读（本次未开启只读保护）：' + $un2 + ' 个文件') }
+    }
+}
+$state.readonly = [bool]$Readonly
+
 Write-Utf8NoBom $StatePath (($state | ConvertTo-Json -Depth 5) + "`r`n")
 $Script:OpSkills = @($installedSkills).Count
 # 版本日志：状态清单写成功后才落盘，避免「日志里有一个失败的版本」

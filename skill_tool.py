@@ -1189,6 +1189,55 @@ def cmd_notice(args):
     return 1
 
 
+# 导入识别：深度上限与数量上限
+# 来自 alice-assistant 的 import_skill.rs：不依赖用户说明，按 SKILL.md 的位置自己认；
+# 但必须封顶 —— 用户误选 C:\ 这种巨型目录时不能无限下钻、不能把命令卡死。
+IMPORT_MAX_DEPTH = 3        # 相对来源根的层数
+IMPORT_MAX_SKILLS = 64      # 单次收集上限
+
+
+def collect_skill_roots(base: str, max_depth: int = IMPORT_MAX_DEPTH,
+                        max_count: int = IMPORT_MAX_SKILLS):
+    """把一个来源（目录 / 解压后的 zip）里**所有**技能目录收出来。
+
+    识别规则（不依赖用户说明）：
+      · 目录里直接有 SKILL.md          → 这个目录就是一个技能
+      · 目录里 父级/子级 有 SKILL.md   → 该目录是「技能集合」，逐个收进去
+      · zip 常见的一层包装             → 自动下钻（如 my-skill-main/my-skill/SKILL.md）
+      · 找到技能后不再往下钻（技能目录里的 references/ scripts/ 不是技能）
+
+    返回 (roots, notes)：notes 记录被截断 / 跳过的原因，调用方要如实打印，
+    而不是默默少装几个。
+    """
+    notes = []
+    if not os.path.isdir(base):
+        return [], ['不是目录：%s' % base]
+    if os.path.isfile(os.path.join(base, 'SKILL.md')):
+        return [base], notes
+    roots = []
+    seen = set()
+    hit_cap = False
+    for r, dirs, files in os.walk(base):
+        dirs[:] = sorted(x for x in dirs if not x.startswith('.'))
+        rel = os.path.relpath(r, base)
+        depth = 0 if rel == '.' else rel.count(os.sep) + 1
+        if depth >= max_depth and dirs:
+            notes.append('到达深度上限 %d，未继续下钻：%s' % (max_depth, rel))
+            dirs[:] = []
+        if 'SKILL.md' in files:
+            key = os.path.abspath(r)
+            if key not in seen:
+                seen.add(key)
+                roots.append(r)
+                if len(roots) >= max_count:
+                    hit_cap = True
+                    break
+            dirs[:] = []          # 技能目录内部不再下钻
+    if hit_cap:
+        notes.append('已收满 %d 个技能后停止（上限）—— 来源目录太大时会这样，建议按包分别导入' % max_count)
+    return roots, notes
+
+
 def _find_skill_root(base: str):
     """在解包/给定目录里找含 SKILL.md 的那个技能目录（支持纵深一层）"""
     if os.path.isfile(os.path.join(base, 'SKILL.md')):
@@ -1287,6 +1336,9 @@ def cmd_add(args):
                 print('目录下没有子目录：%s' % src)
                 return 2
             print('批量：发现 %d 个子目录' % len(cands))
+            if len(cands) > IMPORT_MAX_SKILLS:
+                print('⚠ 子目录超过上限 %d，只处理前 %d 个' % (IMPORT_MAX_SKILLS, IMPORT_MAX_SKILLS))
+                cands = cands[:IMPORT_MAX_SKILLS]
             for c in cands:
                 ok, msg, nm = _install_one(c, args.category, None, None, args.dry_run, args.force, cats)
                 if ok:
@@ -1294,12 +1346,26 @@ def cmd_add(args):
                 else:
                     print('  ✗ %s：%s' % (os.path.basename(c), msg))
         else:
-            ok, msg, nm = _install_one(src, args.category, args.name, args.desc,
-                                       args.dry_run, args.force, cats)
-            if not ok:
-                print('✗ %s' % msg)
+            # 自动识别：单技能 / 技能集合（一包多技能）/ 带一层包装的 zip
+            roots, notes = collect_skill_roots(src)
+            for n in notes:
+                print('  ⚠ %s' % n)
+            if not roots:
+                print('✗ 没找到 SKILL.md：%s' % src)
+                print('  来源目录里既没有技能（本级 SKILL.md），也没有子技能。')
+                print('  如果是 zip：确认它里面真的含 <技能名>/SKILL.md。')
                 return 2
-            added.append(nm)
+            if len(roots) > 1:
+                print('识别为技能集合：%d 个技能（来源 %s）' % (len(roots), src))
+            for c in roots:
+                ok, msg, nm = _install_one(c, args.category, args.name, args.desc,
+                                           args.dry_run, args.force, cats)
+                if ok:
+                    added.append(nm)
+                else:
+                    print('  ✗ %s：%s' % (os.path.basename(c), msg))
+            if not added:
+                return 2
 
         # 登记类目
         if added and not args.dry_run:
