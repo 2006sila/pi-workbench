@@ -1244,6 +1244,273 @@ class AgreementDialog(QDialog):
         lay.addLayout(row)
 
 
+# ------------------------------------------------------------------ 教程（挖孔高亮 + 分步）
+
+class TourBubble(QFrame):
+    """教程气泡：标题 + 说明 + 步骤计数 + 跳过 / 上一步 / 下一步。"""
+
+    def __init__(self, overlay, parent=None):
+        super().__init__(parent)
+        self.overlay = overlay
+        self.setObjectName('tourBubble')
+        self.setStyleSheet(
+            'QFrame#tourBubble { background: ' + C['CARD_BG'] + '; border: 1px solid ' + C['ACCENT'] + ';'
+            ' border-radius: 12px; }')
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 12, 16, 12)
+        lay.setSpacing(6)
+        head = QHBoxLayout()
+        self._title = _mk_label('', 14, 'TEXT_PRIMARY', bold=True)
+        head.addWidget(self._title)
+        head.addStretch(1)
+        self._count = _mk_label('', 11, 'TEXT_MUTED', bold=False)
+        head.addWidget(self._count)
+        lay.addLayout(head)
+        self._text = _mk_label('', 12, 'TEXT_SECONDARY', bold=False)
+        self._text.setWordWrap(True)
+        lay.addWidget(self._text)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        b_skip = QPushButton('跳过')
+        b_skip.setStyleSheet(_btn_style('ghost'))
+        b_skip.setFixedHeight(30)
+        b_skip.clicked.connect(self.overlay.close_tour)
+        row.addWidget(b_skip)
+        self._b_prev = QPushButton('上一步')
+        self._b_prev.setStyleSheet(_btn_style('ghost'))
+        self._b_prev.setFixedHeight(30)
+        self._b_prev.clicked.connect(self.overlay.prev_step)
+        row.addWidget(self._b_prev)
+        self._b_next = QPushButton('下一步')
+        self._b_next.setStyleSheet(_btn_style('primary'))
+        self._b_next.setFixedHeight(30)
+        self._b_next.clicked.connect(self.overlay.next_step)
+        row.addWidget(self._b_next)
+        lay.addLayout(row)
+
+    def fill(self, step, index, total):
+        self._title.setText(step.get('title') or '')
+        self._text.setText(step.get('text') or '')
+        self._count.setText('%d / %d' % (index + 1, total))
+        self._b_prev.setEnabled(index > 0)
+        self._b_next.setText('完成' if index >= total - 1 else '下一步')
+        self.adjustSize()
+
+
+class TourOverlay(QWidget):
+    """整窗遮罩：围出高亮区 + 浮一个气泡。不看被遮住的元素本身也能操作（跳过/前后）。"""
+
+    DIM = (0, 0, 0, 150)
+    PAD = 6
+
+    def __init__(self, host, steps, on_close=None):
+        super().__init__(host)
+        self.host = host
+        self.steps = list(steps or [])
+        self.on_close = on_close
+        self.index = 0
+        self._hole = None
+        self.setGeometry(host.rect())
+        # 遮罩本身不接收鼠标，让下面所有点击都落到气泡上
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+        self.bubble = TourBubble(self, self)
+        self.raise_()
+        self.show()
+        self._render()
+
+    # ---- 步骤推进
+
+    def _resolved(self, i):
+        """返回第 i 步的目标控件（不可见/取不到就返回 None）。"""
+        if i < 0 or i >= len(self.steps):
+            return None
+        w = self.steps[i].get('target')
+        if callable(w):
+            try:
+                w = w()
+            except Exception:
+                w = None
+        if w is None:
+            return None
+        try:
+            if not w.isVisible():
+                return None
+            w = w.window() if False else w
+        except Exception:
+            return None
+        return w
+
+    def _skip_hidden(self):
+        """当前步的目标控件不可见（例如缩放后没渲染）→ 往后找第一个可见的。"""
+        i = self.index
+        while i < len(self.steps) and self.steps[i].get('target') is not None and self._resolved(i) is None:
+            i += 1
+        return i
+
+    def _render(self):
+        if not self.steps:
+            self.close_tour()
+            return
+        self.index = self._skip_hidden()
+        if self.index >= len(self.steps):
+            self.index = len(self.steps) - 1
+        step = self.steps[self.index]
+        w = self._resolved(self.index)
+        if w is not None:
+            try:
+                tl = w.mapTo(self.host, w.rect().topLeft())
+                self._hole = QRect(tl.x() - self.PAD, tl.y() - self.PAD,
+                                   w.width() + self.PAD * 2, w.height() + self.PAD * 2)
+            except Exception:
+                self._hole = None
+        else:
+            self._hole = None
+        self.bubble.fill(step, self.index, len(self.steps))
+        self._place_bubble()
+        self.update()
+
+    def next_step(self):
+        if self.index >= len(self.steps) - 1:
+            self.close_tour()
+            return
+        self.index += 1
+        self._render()
+
+    def prev_step(self):
+        if self.index > 0:
+            self.index -= 1
+            self._render()
+            while self.index > 0 and self.steps[self.index].get('target') is not None and self._resolved(self.index) is None:
+                self.index -= 1
+            self._render()
+
+    def close_tour(self):
+        if self.on_close:
+            try:
+                self.on_close()
+            except Exception:
+                pass
+        self.hide()
+        self.deleteLater()
+
+    # ---- 布局
+
+    def _place_bubble(self):
+        self.bubble.adjustSize()
+        bw, bh = self.bubble.width(), self.bubble.height()
+        area = self.rect()
+        if self._hole is None:
+            x = (area.width() - bw) // 2
+            y = (area.height() - bh) // 2
+        else:
+            h = self._hole
+            # 优先放下面，放不下放上面；再不行贴底部
+            x = h.center().x() - bw // 2
+            if h.bottom() + 12 + bh <= area.height():
+                y = h.bottom() + 12
+            elif h.top() - 12 - bh >= 0:
+                y = h.top() - 12 - bh
+            else:
+                y = min(area.height() - bh - 8, h.bottom() + 12)
+        x = max(8, min(x, area.width() - bw - 8))
+        y = max(8, min(y, area.height() - bh - 8))
+        self.bubble.move(x, y)
+
+    def paintEvent(self, _ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, False)
+        dim = QColor(*self.DIM)
+        area = self.rect()
+        if self._hole is None:
+            p.fillRect(area, dim)
+            return
+        h = self._hole
+        # 四块暗底围出高亮区（等价于打洞，但比合成清除可靠）
+        p.fillRect(QRect(0, 0, area.width(), max(0, h.top())), dim)
+        p.fillRect(QRect(0, h.bottom(), area.width(), max(0, area.height() - h.bottom())), dim)
+        p.fillRect(QRect(0, h.top(), max(0, h.left()), h.height()), dim)
+        p.fillRect(QRect(h.right(), h.top(), max(0, area.width() - h.right()), h.height()), dim)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(QColor(C['ACCENT']), 2))
+        p.drawRoundedRect(h.adjusted(1, 1, -1, -1), 8, 8)
+
+    def keyPressEvent(self, ev):
+        k = ev.key()
+        if k == Qt.Key_Escape:
+            self.close_tour()
+        elif k in (Qt.Key_Right, Qt.Key_Down, Qt.Key_Return, Qt.Key_Enter):
+            self.next_step()
+        elif k in (Qt.Key_Left, Qt.Key_Up):
+            self.prev_step()
+        else:
+            super().keyPressEvent(ev)
+
+
+def tour_steps(page_index, win):
+    """每个功能页的教程步骤。取不到控件就传 None（气泡居中，只讲不指）。"""
+    home, tpl, sk, logp, hist, settings = (win.page_home, win.page_tpl, win.page_skills,
+                                           win.page_log, win.page_history, win.page_settings)
+    pideck_card = (home.cards or {}).get('pideck')
+    if page_index == 0:
+        return [
+            {'target': lambda: getattr(pideck_card, 'btn_go', None),
+             'title': '① 部署', 'text': '选好客户端与模板后点这里注入。首次使用就先点它（会带你到模板页）。'},
+            {'target': lambda: getattr(pideck_card, 'btn_probe', None),
+             'title': '② 体检', 'text': '文件写对 ≠ 客户端真的读到了。体检会真跑一次客户端 CLI，问模型「能看见哪些技能」。'},
+            {'target': lambda: getattr(pideck_card, 'btn_versions', None),
+             'title': '③ 版本', 'text': '每次部署都留一条可恢复版本；退回前还能先「看差异」，不会盲退。'},
+            {'target': lambda: getattr(pideck_card, 'btn_uninstall', None),
+             'title': '④ 卸载', 'text': '按状态清单精确移除本工具装的技能，并还原被覆盖的同名技能。文件被外部改过时会先拦下确认。'},
+            {'target': None,
+             'title': '⑤ 快捷入口', 'text': '底部四张卡：模板库 / 技能库 / 运行日志 / 任务构建。任务构建能把一句话变成可执行的任务契约。'},
+        ]
+    if page_index == 1:
+        return [
+            {'target': lambda: list(getattr(tpl, '_tgt_btns', {}).values())[0] if getattr(tpl, '_tgt_btns', None) else None,
+             'title': '① 选客户端', 'text': '注入到哪个客户端。配置根是按「环境变量 → 约定目录」探测出来的，界面里会显示实际路径。'},
+            {'target': lambda: list(getattr(tpl, '_mode_btns', {}).values())[0] if getattr(tpl, '_mode_btns', None) else None,
+             'title': '② 选模式', 'text': '完整模式：65 个模块全进提示词（每轮约 7k tokens）。极简模式：只留一条菜单技能，按需读取。'},
+            {'target': lambda: getattr(tpl, '_ro_chk', None),
+             'title': '③ 只读保护', 'text': '勾上后，部署完把技能库设为只读，防客户端或 AI 顺手改坏。本工具自己的写入会先自动解锁。'},
+            {'target': None,
+             'title': '④ 点卡片部署', 'text': '卡片是按目标模型分组的模板；每张卡上的「部署」按钮就是注入。同一模板重注入是幂等的。'},
+        ]
+    if page_index == 2:
+        return [
+            {'target': lambda: list(getattr(sk, '_tabs', None).buttons())[0] if getattr(sk, '_tabs', None) else None,
+             'title': '① 切客户端', 'text': '技能库按客户端分开看：她/他各自装了哪些技能、哪些被禁用。'},
+            {'target': lambda: getattr(sk, '_search_box', None),
+             'title': '② 搜索与筛选', 'text': '搜技能名；筛选可看「启用 / 已禁用 / 本工具部署」。'},
+            {'target': lambda: getattr(sk, '_import_btn', None),
+             'title': '③ 导入技能', 'text': '从文件夹或 zip 导入：支持技能集合（一包多技能）与带一层包装的压缩包，同名会报出来并先备份。'},
+            {'target': lambda: getattr(sk, '_table', None),
+             'title': '④ 列表', 'text': '「禁用」是把技能移出扫描路径（skills-disabled），随时可移回，不删文件。'},
+        ]
+    if page_index == 3:
+        return [
+            {'target': lambda: getattr(logp, '_box', None),
+             'title': '运行日志', 'text': '注入 / 自检 / 体检 / 卸载的实时输出。中文不会乱码，退出码每条都写。'},
+            {'target': lambda: getattr(logp, '_box', None),
+             'title': '操作记录', 'text': '右上「操作记录」打开 logs\\operations.log：一行一次操作，带技能数、模式、漂移与冲突计数。'},
+        ]
+    if page_index == 4:
+        return [
+            {'target': lambda: getattr(hist, '_list', None),
+             'title': '操作历史', 'text': '最近做过什么：时间、动作、目标、退出码。排查「上次到底改了什么」看这里。'},
+        ]
+    if page_index == 5:
+        return [
+            {'target': lambda: list(getattr(settings, '_theme_btns', {}).values())[0] if getattr(settings, '_theme_btns', None) else None,
+             'title': '主题', 'text': '深色 / 浅色 / 跟随系统。切换会立刻生效，不需要重启。'},
+            {'target': lambda: getattr(settings, '_auto', None),
+             'title': '自动注入', 'text': '启动时若检测到「已部署过但客户端重启了」，自动重新注入一次。'},
+            {'target': lambda: getattr(settings, '_exit_tray', None),
+             'title': '托盘与退出', 'text': '关窗口是最小化到托盘还是直接退出。托盘图标里也有注入 / 自检 / 卸载入口。'},
+        ]
+    return []
+
+
 # ------------------------------------------------------------------ 侧边导航
 
 # ------------------------------------------------------------------ 动效组件
@@ -1456,6 +1723,18 @@ class SideBar(QFrame):
         self._btns[0].set_selected(True)
 
         lay.addStretch(1)
+        self.tour_clicked = None
+        self._tour_btn = QPushButton('教程')
+        self._tour_btn.setCursor(Qt.PointingHandCursor)
+        _set_px_font(self._tour_btn, 11, bold=True)
+        self._tour_btn.setFixedSize(56, 26)
+        self._tour_btn.setStyleSheet(
+            'QPushButton { background: transparent; color: ' + C['TEXT_SECONDARY'] + ';'
+            ' border: 1px solid ' + C['BORDER'] + '; border-radius: 8px; }'
+            'QPushButton:hover { color: ' + C['TEXT_PRIMARY'] + '; border-color: ' + C['ACCENT'] + '; }')
+        self._tour_btn.clicked.connect(lambda: self.tour_clicked and self.tour_clicked())
+        lay.addWidget(self._tour_btn, 0, Qt.AlignHCenter)
+        lay.addSpacing(6)
         ver = QLabel(APP_VERSION.replace('V', 'v'))
         ver.setAlignment(Qt.AlignCenter)
         _set_px_font(ver, 10)
@@ -1798,7 +2077,12 @@ class HomePage(Page):
         b_tut = QPushButton('查看教程')
         b_tut.setStyleSheet(_btn_style('link'))
         b_tut.setCursor(Qt.PointingHandCursor)
-        b_tut.clicked.connect(lambda: TutorialDialog(self).exec())
+
+        def _tut():
+            # 优先用分步教程（挖孔高亮）；分步教程不可用时回落到全文弹窗
+            if self.main._start_tour(0) is None:
+                TutorialDialog(self).exec()
+        b_tut.clicked.connect(_tut)
         foot.addWidget(b_tut)
         lay.addLayout(foot)
 
@@ -3699,6 +3983,8 @@ class MainWindow(FramelessWindow):
 
         self.sidebar = SideBar()
         self.sidebar.switched = self.switch_page
+        self.sidebar.tour_clicked = self._start_tour
+        self._tour = None
         body.addWidget(self.sidebar)
 
         self.stack = FadeStack()
@@ -3725,6 +4011,22 @@ class MainWindow(FramelessWindow):
             QTimer.singleShot(400, self._auto_reinject)
 
     # ---------------------------------------------------------- 导航
+
+    def _start_tour(self, page_index=None):
+        """启动当前页的教程（没有步骤的页面不启动）。"""
+        idx = self.stack.currentIndex() if page_index is None else page_index
+        steps = tour_steps(idx, self)
+        if not steps:
+            self._set_status('这一页还没有教程', 'warn')
+            return None
+        if getattr(self, '_tour', None) is not None:
+            try:
+                self._tour.close_tour()
+            except Exception:
+                pass
+            self._tour = None
+        self._tour = TourOverlay(self, steps, on_close=lambda: setattr(self, '_tour', None))
+        return self._tour
 
     def switch_page(self, idx):
         self.stack.setCurrentIndex(idx)

@@ -48,6 +48,10 @@ def chk(label, cond, extra=''):
     print('%s %-46s %s' % ('✓' if cond else '✗', label, extra))
 
 
+def tour_steps_unknown(win):
+    return len(m.tour_steps(99, win))
+
+
 def run_task(timeout=180000):
     loop = QEventLoop()
 
@@ -231,6 +235,34 @@ chk('重启：改为走 -FindExe 探测', any('-FindExe' in a for a, _ in enq), 
 m.QMessageBox.question = old_q
 w._enqueue = _old_enq
 app.processEvents()
+
+print('=== 9 教程引擎（挖孔高亮 + 分步）===')
+app.processEvents()
+chk('侧栏有教程入口', hasattr(w.sidebar, '_tour_btn') and w.sidebar._tour_btn.text() == '教程')
+chk('教程入口已接线', w.sidebar.tour_clicked is not None)
+chk('未知页没有步骤', tour_steps_unknown(w) == 0)
+w.sidebar.select(1)
+app.processEvents()
+tour = w._start_tour()
+chk('模板页教程可启动', tour is not None and len(tour.steps) >= 4,
+    '步骤数=%s' % (len(tour.steps) if tour else 0))
+chk('气泡计步正确', tour is not None and tour.bubble._count.text().startswith('1 /'),
+    tour.bubble._count.text() if tour else '')
+if tour is not None:
+    n0 = tour.index
+    tour.next_step()
+    chk('下一步推进', tour.index == n0 + 1, 'index %d -> %d' % (n0, tour.index))
+    tour.prev_step()
+    chk('上一步回退', tour.index == n0, 'index -> %d' % tour.index)
+    tour.close_tour()
+    app.processEvents()
+    chk('关闭后引用清空（on_close 回调）', w._tour is None)
+tour2 = w._start_tour(2)          # 技能库页
+chk('技能库页教程可启动', tour2 is not None and len(tour2.steps) >= 4,
+    '步骤数=%s' % (len(tour2.steps) if tour2 else 0))
+if tour2 is not None:
+    tour2.close_tour()
+    app.processEvents()
 
 print()
 print('回归结果:', 'PASS' if ok else 'FAIL')
