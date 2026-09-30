@@ -26,6 +26,15 @@ py -X utf8 tests\verify_job_and_deploy.py   # Job Object / 自我部署脚本
 这些脚本以前放在 `%TEMP%`（`D:\tmp`）下，被系统清理过一次——测试跟着一起没了。
 放进仓库后它们可复现、可随代码走，也方便发版前跑一遍。
 
+## 安全约定（硬性）
+
+**测试不得杀任何真实进程。** 所有套件在导入时设 `PJ_TEST_NO_KILL=1`，
+`bj_tool.kill_procs` / `safe_kill_procs` 在该环境下直接空转并返回说明。
+
+> 事故记录：一次自检真的把 PiDeck 的 3 个进程杀了（宿主进程靠 `ancestor_pids()` 才保住）。
+> 产品侧据此加了「绝不杀自己的祖先进程」；测试侧加了上面这道硬闸。
+> Job Object 的**内核级**回收不受影响 —— 那测的是作业隔离，只影响测试自己 spawn 的子进程。
+
 ## 写新用例时的两条约定
 
 1. **沙箱**：用 `%TEMP%\pj<名字>` 造 `USERPROFILE`/`LOCALAPPDATA` 再调 `inject.ps1`，别碰真实配置。

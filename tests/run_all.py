@@ -8,6 +8,10 @@ import os
 import subprocess
 import sys
 
+# 硬闸：禁止一切杀进程动作（子进程继承）。
+# 事故背景：一次自检真的杀掉了 PiDeck 的 3 个进程 —— 自动化测试不该有能力碰真实客户端。
+os.environ['PJ_TEST_NO_KILL'] = '1'
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 PY = sys.executable or 'python'
@@ -26,6 +30,7 @@ def main():
     for f, label in (('verify_inject.py', '注入核心（标记兼容 / 备份保留 / 占位符断言 / 漂移）'),
                      ('verify_import.py', '技能来源识别（集合 / 包装 / zip / 同名冲突 / 上限）'),
                      ('verify_readonly.py', '只读保护 + 客户端路径探测'),
+                     ('verify_ui.py', '界面回归（页面 / 模式 / 只读 / 版本窗 / 任务构建）'),
                      ('verify_job_and_deploy.py', '工程件（Job Object 进程树 / 自我部署脚本）')):
         ok = run([PY, '-X', 'utf8', os.path.join(HERE, f)], label)
         results.append((label, ok))

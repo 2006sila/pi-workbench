@@ -23,6 +23,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SB = os.path.join(ROOT, 'inject.ps1')
 SP = os.path.join(ROOT, 'prompts', '_v52c-header.md')
 SK = os.path.join(ROOT, 'skills-v4')
+os.environ['PJ_TEST_NO_KILL'] = '1'   # 硬闸：测试禁止杀进程
 SBX = os.path.join(os.environ.get('TEMP', r'C:\Windows\Temp'), 'pjro')
 HOME = os.path.join(SBX, 'home')
 LOCAL = os.path.join(SBX, 'local')

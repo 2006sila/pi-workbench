@@ -22,7 +22,7 @@ from PySide6.QtGui import (QAction, QColor, QDesktopServices, QFont, QIcon,
 from PySide6.QtWidgets import (
     QAbstractButton, QApplication, QButtonGroup, QCheckBox, QDialog, QFrame, QHBoxLayout,
     QGridLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu, QMessageBox,
-    QPlainTextEdit, QPushButton, QScrollArea, QStackedWidget, QSystemTrayIcon,
+    QFileDialog, QPlainTextEdit, QPushButton, QScrollArea, QStackedWidget, QSystemTrayIcon,
     QTableWidget, QTextBrowser, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
@@ -631,7 +631,137 @@ def list_procs(names):
     return running
 
 
+def _proc_parent_map():
+    """返回 {pid: ppid}（Toolhelp32 快照）。不依赖 psutil —— 本项目零第三方运行依赖。"""
+    if not IS_WINDOWS:
+        return {}
+    import ctypes
+    from ctypes import wintypes
+
+    class PROCESSENTRY32(ctypes.Structure):
+        _fields_ = [('dwSize', wintypes.DWORD), ('cntUsage', wintypes.DWORD),
+                    ('th32ProcessID', wintypes.DWORD),
+                    ('th32DefaultHeapID', ctypes.POINTER(ctypes.c_ulong)),
+                    ('th32ModuleID', wintypes.DWORD), ('cntThreads', wintypes.DWORD),
+                    ('th32ParentProcessID', wintypes.DWORD),
+                    ('pcPriClassBase', ctypes.c_long), ('dwFlags', wintypes.DWORD),
+                    ('szExeFile', ctypes.c_char * 260)]
+    try:
+        k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        snap = k32.CreateToolhelp32Snapshot(0x2, 0)      # TH32CS_SNAPPROCESS
+        if not snap or snap == wintypes.HANDLE(-1).value:
+            return {}
+        out = {}
+        try:
+            e = PROCESSENTRY32()
+            e.dwSize = ctypes.sizeof(PROCESSENTRY32)
+            ok = k32.Process32First(snap, ctypes.byref(e))
+            while ok:
+                out[int(e.th32ProcessID)] = int(e.th32ParentProcessID)
+                ok = k32.Process32Next(snap, ctypes.byref(e))
+        finally:
+            k32.CloseHandle(snap)
+        return out
+    except Exception:
+        return {}
+
+
+def ancestor_pids():
+    """从当前进程往上直到根，返回「不能杀」的祖先进程集合。
+
+    为什么需要它：GUI 的「重启」是 taskkill 目标客户端进程树。
+    如果本工具跑在那个客户端托管的会话里（或由它启动），重启 = 自杀。
+    """
+    if not IS_WINDOWS:
+        return set()
+    parent = _proc_parent_map()
+    out = set()
+    pid = os.getpid()
+    guard = 0
+    while pid and pid not in out and guard < 64:
+        out.add(pid)
+        pid = parent.get(pid) or 0
+        guard += 1
+    return out
+
+
+def _pids_of_image(names):
+    """按镜像名列出 pid（Toolhelp32 里有可执行名，省一次 tasklist）。"""
+    if not IS_WINDOWS:
+        return []
+    import ctypes
+    from ctypes import wintypes
+
+    class PROCESSENTRY32(ctypes.Structure):
+        _fields_ = [('dwSize', wintypes.DWORD), ('cntUsage', wintypes.DWORD),
+                    ('th32ProcessID', wintypes.DWORD),
+                    ('th32DefaultHeapID', ctypes.POINTER(ctypes.c_ulong)),
+                    ('th32ModuleID', wintypes.DWORD), ('cntThreads', wintypes.DWORD),
+                    ('th32ParentProcessID', wintypes.DWORD),
+                    ('pcPriClassBase', ctypes.c_long), ('dwFlags', wintypes.DWORD),
+                    ('szExeFile', ctypes.c_char * 260)]
+    want = {n.lower() for n in names}
+    pids = []
+    try:
+        k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        snap = k32.CreateToolhelp32Snapshot(0x2, 0)
+        if not snap or snap == wintypes.HANDLE(-1).value:
+            return []
+        try:
+            e = PROCESSENTRY32()
+            e.dwSize = ctypes.sizeof(PROCESSENTRY32)
+            ok = k32.Process32First(snap, ctypes.byref(e))
+            while ok:
+                exe = e.szExeFile.decode('utf-8', 'replace')
+                if exe.rsplit('.', 1)[0].lower() in want:
+                    pids.append(int(e.th32ProcessID))
+                ok = k32.Process32Next(snap, ctypes.byref(e))
+        finally:
+            k32.CloseHandle(snap)
+    except Exception:
+        return []
+    return pids
+
+
+def kill_is_blocked():
+    """PJ_TEST_NO_KILL=1 时禁止一切杀进程动作（测试专用硬闸）。
+
+    为什么要有这层：自动化测试不该有能力杀真实客户端。
+    内核级回收（Job Object）不受影响 —— 那测试作业隔离，只影响测试自己 spawn 的子进程。
+    """
+    return (os.environ.get('PJ_TEST_NO_KILL') or '') in ('1', 'true', 'yes')
+
+
+def safe_kill_procs(names):
+    """杀进程，但**跳过自己的祖先进程**（并如实报告跳过了什么）。
+
+    返回 @(实际杀掉的进程名列表, 被保护而未杀的说明列表)。
+    """
+    if kill_is_blocked():
+        return [], ['PJ_TEST_NO_KILL=1：测试环境禁止杀进程（本次未执行）']
+    protect = ancestor_pids()
+    me = os.getpid()
+    killed, protected = [], []
+    for pid in _pids_of_image(names):
+        if pid == me or pid in protect:
+            protected.append('pid %d（本工具的祖先进程，不杀）' % pid)
+            continue
+        try:
+            r = subprocess.run(['taskkill', '/F', '/T', '/PID', str(pid)],
+                               capture_output=True, text=True, encoding='utf-8', errors='replace',
+                               creationflags=CREATE_NO_WINDOW, timeout=20, check=False)
+            if r.returncode == 0:
+                killed.append(pid)
+        except Exception:
+            pass
+    return killed, protected
+
+
 def kill_procs(names):
+    if kill_is_blocked():
+        return []
     killed = []
     for n in names:
         try:
@@ -1853,6 +1983,14 @@ class TemplatePage(Page):
             self._mode_group.addButton(b)
             self._mode_btns[key] = b
             r2.addWidget(b)
+        self._ro_chk = QCheckBox('部署后设只读（防误改技能库）')
+        self._ro_chk.setCursor(Qt.PointingHandCursor)
+        self._ro_chk.setStyleSheet('QCheckBox { color: ' + C['TEXT_SECONDARY'] + '; font-size: 12px; }'
+                                   'QCheckBox::indicator { width: 14px; height: 14px; }')
+        _cfg_ro = (read_app_config() or {}).get('readonlySkills')
+        self._ro_chk.setChecked(bool(_cfg_ro))
+        self._ro_chk.toggled.connect(self._on_readonly_toggle)
+        r2.addWidget(self._ro_chk)
         r2.addStretch(1)
         self._mode_hint = _mk_label('', 11, 'TEXT_MUTED', bold=False)
         r2.addWidget(self._mode_hint)
@@ -1878,6 +2016,12 @@ class TemplatePage(Page):
             b.setChecked(k == key)      # 程序化调用也要同步分段按钮
         self._refresh_setup()
         self._rerender()
+
+    def _on_readonly_toggle(self, on):
+        # 只读保护：部署后把技能库设为只读（本工具自己的写入会先自动解锁）
+        write_app_config('readonlySkills', bool(on))
+        self._set_status('只读保护：' + ('已开启（下次部署生效）' if on else '已关闭（下次部署会解除只读）'),
+                         'warn' if on else 'ok')
 
     def _set_mode(self, key):
         self._sel_mode = key
@@ -2196,6 +2340,12 @@ class SkillsPage(Page):
         hdr.addStretch(1)
         self._stat = _mk_label('', 12, 'TEXT_SECONDARY', bold=False)
         hdr.addWidget(self._stat)
+        self._import_btn = QPushButton('导入技能')
+        self._import_btn.setStyleSheet(_btn_style('ghost'))
+        self._import_btn.setFixedHeight(32)
+        self._import_btn.setCursor(Qt.PointingHandCursor)
+        self._import_btn.clicked.connect(self._import_skills)
+        hdr.addWidget(self._import_btn)
         outer.addLayout(hdr)
 
         # 目标 tab + 搜索
@@ -2315,6 +2465,42 @@ class SkillsPage(Page):
         t = TARGETS[self._target_index]
         base = resolve_agent_dir(t)
         return base, os.path.join(base, 'skills'), os.path.join(base, 'skills-disabled')
+
+    def _import_skills(self):
+        """把技能导入**当前客户端**：先问类型，再弹对应对话框。
+
+        为什么必须先问类型：Windows 上「选文件夹」与「选文件」是两套对话框
+        （Qt 里 getExistingDirectory 只能选目录、getOpenFileName 只能选文件）。
+        写成「先弹文件夹、取消后再弹 zip」的话，用户只会看到文件夹对话框，
+        永远走不到 zip 那条路（alice-assistant 的 import_skill.rs 专门记了这个坑）。
+
+        识别与安装都由 inject.ps1 做（集合 / 一层包装 / zip 解压 / 深度与数量上限），
+        GUI 不重复实现一套。
+        """
+        tgt = self._target_obj()
+        m = QMenu(self)
+        act_dir = m.addAction('从文件夹导入（目录里含 SKILL.md）')
+        act_zip = m.addAction('从 zip 导入（技能包压缩包）')
+        act = m.exec(self._import_btn.mapToGlobal(self._import_btn.rect().bottomLeft()))
+        path = ''
+        if act is act_dir:
+            path = QFileDialog.getExistingDirectory(self, '选择技能文件夹', home_dir())
+        elif act is act_zip:
+            path, _ = QFileDialog.getOpenFileName(self, '选择技能 zip', home_dir(), '压缩包 (*.zip)')
+        if not path:
+            return
+
+        def done(code, tail):
+            if code == 0:
+                self._set_status('已导入到 ' + tgt['card'] + '：' + os.path.basename(path.rstrip('\\/')), 'ok')
+            else:
+                self._set_status('导入失败（退出码 %d），见日志' % code, 'error')
+            self._reload()
+
+        self.main._enqueue(['-Target', tgt['key'], '-SkillsOnly', '-SkillsSource', path],
+                           '导入技能 -> ' + tgt['card'], done,
+                           kind='注入', target_card=tgt['card'])
+        self.main.switch_page(3)
 
     def switch_target(self, idx):
         self._target_index = idx
@@ -3777,6 +3963,9 @@ class MainWindow(FramelessWindow):
             args += ['-SkillMode', skill_mode]
             args += ['-MenuKeepAdvertised', ';'.join(a['skill_name'] for a in ADDONS)]
             mode_note = ' · ' + ('极简模式' if skill_mode == 'menu' else '完整模式')
+            if (read_app_config() or {}).get('readonlySkills'):
+                args.append('-Readonly')
+                mode_note += ' · 只读保护'
 
         def done(code, tail):
             if code == 0:
@@ -3902,27 +4091,42 @@ class MainWindow(FramelessWindow):
     def _restart(self, target):
         running = list_procs(target['procs'])
         if running:
-            killed = kill_procs(target['procs'])
+            # 走 safe_kill_procs：绝不杀本工具自己的祖先进程。
+            # 事故背景：本工具如果跑在被它管理的客户端托管的会话里，重启 = 自杀。
+            killed, protected = safe_kill_procs(target['procs'])
             time.sleep(0.6)
-            self._set_status('已结束 ' + target['card'] + ' 进程' if killed
-                             else '结束进程失败，请手动关闭 ' + target['card'],
-                             'ok' if killed else 'warn')
+            if protected:
+                self._log_line('[WARN] 有进程属于本工具的祖先进程，已跳过不杀：' + '；'.join(protected))
+            if killed:
+                self._set_status('已结束 ' + target['card'] + ' ' + str(len(killed)) + ' 个进程'
+                                 + ('（跳过了 %d 个祖先进程）' % len(protected) if protected else ''), 'ok')
+            elif protected:
+                self._set_status('目标进程是本工具的祖先进程，已跳过（不自杀）', 'warn')
+            else:
+                self._set_status('结束进程失败，请手动关闭 ' + target['card'], 'warn')
         else:
             self._set_status(target['card'] + ' 未在运行', 'ok')
 
-        exe = None
-        for p in target['exe_hints']:
-            if p and os.path.exists(p):
-                exe = p
-                break
-        if exe:
-            try:
-                subprocess.Popen([exe])
-                self._set_status('已重新启动 ' + target['card'], 'ok')
-            except Exception:
-                self._set_status('已结束进程，自动启动失败，请手动打开 ' + target['card'], 'warn')
-        else:
-            self._set_status('未找到 ' + target['card'] + ' 的安装路径，请手动打开', 'warn')
+        # 安装路径探测改走 inject.ps1 -FindExe：四级探测（进程 → 注册表 → 快捷方式 → 写死路径）
+        # 只留一份实现。旧写法只看写死的 exe_hints，用户把 PiDeck 装到 D:\Agent\PiDeck 就找不到。
+        def done(code, tail):
+            exe = ''
+            for line in reversed(tail or []):
+                s = str(line).strip()
+                if s.lower().endswith('.exe') and os.path.exists(s):
+                    exe = s
+                    break
+            if exe:
+                try:
+                    subprocess.Popen([exe], cwd=os.path.dirname(exe))
+                    self._set_status('已重新启动 ' + target['card'] + '（' + exe + '）', 'ok')
+                except Exception as e:
+                    self._set_status('已结束进程，自动启动失败（%s），请手动打开' % e, 'warn')
+            else:
+                self._set_status('未找到 ' + target['card'] + ' 的安装路径，请手动打开（可用「体检」看探测结果）', 'warn')
+
+        self._enqueue(['-Target', target['key'], '-FindExe'], '探测 ' + target['card'] + ' 安装路径', done,
+                      kind='操作', target_card=target['card'])
 
     # ---------------------------------------------------------- 托盘
 

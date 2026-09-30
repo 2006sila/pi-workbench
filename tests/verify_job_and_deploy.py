@@ -23,6 +23,7 @@ import subprocess
 import sys
 import time
 
+os.environ['PJ_TEST_NO_KILL'] = '1'      # 硬闸：只允许 Job Object 的内核级回收（那测的是作业隔离）
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SBX = os.path.join(os.environ.get('TEMP', r'C:\Windows\Temp'), 'pjjob')
 PKG = os.path.join(SBX, 'pkg')
