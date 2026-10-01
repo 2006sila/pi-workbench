@@ -1462,7 +1462,7 @@ def tour_steps(page_index, win):
              'title': '③ 版本', 'text': '每次部署都留一条可恢复版本；退回前还能先「看差异」，不会盲退。'},
             {'target': lambda: getattr(pideck_card, 'btn_uninstall', None),
              'title': '④ 卸载', 'text': '按状态清单精确移除本工具装的技能，并还原被覆盖的同名技能。文件被外部改过时会先拦下确认。'},
-            {'target': None,
+            {'target': lambda: (getattr(home, '_quick_cards', None) or [None])[0],
              'title': '⑤ 快捷入口', 'text': '底部四张卡：模板库 / 技能库 / 运行日志 / 任务构建。任务构建能把一句话变成可执行的任务契约。'},
         ]
     if page_index == 1:
@@ -1491,8 +1491,8 @@ def tour_steps(page_index, win):
         return [
             {'target': lambda: getattr(logp, '_box', None),
              'title': '运行日志', 'text': '注入 / 自检 / 体检 / 卸载的实时输出。中文不会乱码，退出码每条都写。'},
-            {'target': lambda: getattr(logp, '_box', None),
-             'title': '操作记录', 'text': '右上「操作记录」打开 logs\\operations.log：一行一次操作，带技能数、模式、漂移与冲突计数。'},
+            {'target': lambda: getattr(logp, '_ops_btn', None),
+             'title': '操作记录', 'text': '这个按钮打开 logs\\operations.log：一行一次操作，带技能数、模式、漂移与冲突计数。'},
         ]
     if page_index == 4:
         return [
@@ -2068,6 +2068,10 @@ class HomePage(Page):
         for q in (q1, q2, q3, q4):
             quick.addWidget(q, 1)
         lay.addLayout(quick)
+        # 存到 self：教程「快捷入口」那一步要圈住这排卡
+        # （早先是局部变量 -> target=None -> 退化成居中卡片，指不到实物）
+        self._quick_cards = [q1, q2, q3, q4]
+        self._quick_row = quick
 
         # 教程入口
         foot = QHBoxLayout()
@@ -2921,12 +2925,15 @@ class LogPage(Page):
         b_clear.setFixedHeight(34)
         b_clear.clicked.connect(self.clear)
         hdr.addWidget(b_clear)
-        b_ops = QPushButton('操作记录')
-        b_ops.setStyleSheet(_btn_style('ghost'))
-        b_ops.setFixedHeight(34)
-        b_ops.setCursor(Qt.PointingHandCursor)
-        b_ops.clicked.connect(self._open_ops)
-        hdr.addWidget(b_ops)
+        # 存到 self：教程步骤要指向这个按钮（早先是局部变量，教程够不着，
+        # 只能把 target 写成日志正文 _box —— 文案说「右上「操作记录」」，
+        # 高亮框却圈在下面的日志区，指向与文字对不上）。
+        self._ops_btn = QPushButton('操作记录')
+        self._ops_btn.setStyleSheet(_btn_style('ghost'))
+        self._ops_btn.setFixedHeight(34)
+        self._ops_btn.setCursor(Qt.PointingHandCursor)
+        self._ops_btn.clicked.connect(self._open_ops)
+        hdr.addWidget(self._ops_btn)
         outer.addLayout(hdr)
 
         self._box = QTextBrowser()

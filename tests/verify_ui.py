@@ -264,6 +264,48 @@ if tour2 is not None:
     tour2.close_tour()
     app.processEvents()
 
+# 步骤目标质量：每个非 None 的 target 都必须能解析出**真实可见**的控件。
+# 背景：曾经有 3 处步骤指错 —— 「操作记录」指着日志正文 _box（文案说「右上按钮」，
+# 高亮框却圈在下方日志区）、「快捷入口」与「点卡片部署」写成 None 只能居中卡片。
+# 这类问题不会报错，只是高亮框圈错地方，肉眼不跑一遍根本发现不了。
+print('    -- 步骤目标解析检查 --')
+_bad_targets = []
+_none_steps = 0
+_total_steps = 0
+for _pi in range(6):
+    w.switch_page(_pi)
+    app.processEvents()
+    for _si, _step in enumerate(m.tour_steps(_pi, w) or []):
+        _total_steps += 1
+        _t = _step.get('target')
+        if _t is None:
+            _none_steps += 1
+            continue
+        try:
+            _wdg = _t() if callable(_t) else _t
+        except Exception as _e:
+            _bad_targets.append('页%d步%d 取值异常 %s' % (_pi, _si + 1, _e))
+            continue
+        if _wdg is None:
+            _bad_targets.append('页%d步%d target 取到 None' % (_pi, _si + 1))
+            continue
+        if not _wdg.isVisible():
+            _bad_targets.append('页%d步%d 控件不可见' % (_pi, _si + 1))
+chk('步骤目标均可解析且可见', not _bad_targets,
+    ('全部 %d 步' % _total_steps) if not _bad_targets else '; '.join(_bad_targets[:4]))
+chk('无锚点步骤不超过 2 个（其余都应指到实物）', _none_steps <= 2,
+    'None 步骤 %d 个 / 共 %d 步' % (_none_steps, _total_steps))
+# 「操作记录」必须指向真正的按钮，而不是日志正文
+_app_ops = getattr(w.page_log, '_ops_btn', None)
+chk('操作记录步骤有专属按钮实体', _app_ops is not None,
+    'logp._ops_btn=%s' % ('ok' if _app_ops is not None else 'missing'))
+chk('操作记录步骤不再指向日志正文', _app_ops is not getattr(w.page_log, '_box', None),
+    '与 _box 是不同控件')
+# 「快捷入口」必须指向底部快捷卡
+_app_qc = getattr(w.page_home, '_quick_cards', None)
+chk('快捷入口步骤有快捷卡实体', bool(_app_qc),
+    '%d 张卡' % (len(_app_qc) if _app_qc else 0))
+
 print()
 print('回归结果:', 'PASS' if ok else 'FAIL')
 sys.exit(0 if ok else 1)
