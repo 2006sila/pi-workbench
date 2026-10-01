@@ -104,8 +104,8 @@ $PATCH_END = $PATCH_KEY_END + ' ' + $MARK_VER
 # 匹配正则：关键串 + 任意载荷（含旧版本号）
 $MARK_RE_BEG  = [regex]::Escape($MARK_KEY_BEG) + '[^>]*-->'
 $MARK_RE_END  = [regex]::Escape($MARK_KEY_END) + '[^>]*-->'
-$PATCH_RE_BEG = '(?m)^[ \t]*' + [regex]::Escape($PATCH_KEY_BEG) + '[^\r\n]*$'
-$PATCH_RE_END = '(?m)^[ \t]*' + [regex]::Escape($PATCH_KEY_END) + '[^\r\n]*$'
+$PATCH_RE_BEG = '(?m)^[ \t]*' + [regex]::Escape($PATCH_KEY_BEG) + '[^\r\n]*'
+$PATCH_RE_END = '(?m)^[ \t]*' + [regex]::Escape($PATCH_KEY_END) + '[^\r\n]*'
 
 # ---------------------------------------------------------------- 路径与环境
 
@@ -837,7 +837,12 @@ function Get-MarkerBlock([string]$PromptPath) {
 }
 
 function Strip-PatchBlock([string]$Text) {
-    $pattern = '(?s)' + $PATCH_RE_BEG + '.*?' + $PATCH_RE_END + '[ \t]*\r?\n?'
+    # (?s) 不能包住整条模式：$PATCH_RE_BEG/END 用的是 (?m) 行锚点，
+    # 而 (?s) 下的 `$` 只匹配**整个字符串的末尾**（不是行尾），行锚点直接失效，
+    # 于是模式永远匹配不上 -> 旧标记块摘不掉 -> 每次部署往里追加一层
+    # （实测连部署 3 次得到 3 个 BEGIN/END）。
+    # 正确写法：行首/行尾部分保持 (?m)；只有夹在中间跨行的 `.*?` 用 (?s:...) 局部开启。
+    $pattern = $PATCH_RE_BEG + '\r?\n' + '(?s:.*?)' + $PATCH_RE_END + '[ \t]*\r?\n?'
     return [regex]::Replace($Text, $pattern, '')
 }
 
