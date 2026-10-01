@@ -8,9 +8,9 @@
 
 | 技能 | 许可文件 | sha256 | 首行 |
 |---|---|---|---|
-| `pentest-tools` | `skills-v4/pentest-tools/src-hunter/LICENSE` | `132f00040244` | MIT License |
-| `protocol-reverse-engineering` | `skills-v4/protocol-reverse-engineering/LICENSE` | `0f82096b2695` | MIT License |
-| `reverse-engineering-api` | `skills-v4/reverse-engineering-api/LICENSE` | `61765572b73e` | MIT License |
+| `pentest-tools` | `skills-v4/pentest-tools/src-hunter/LICENSE` | `5b02fedc65e6` | MIT License |
+| `protocol-reverse-engineering` | `skills-v4/protocol-reverse-engineering/LICENSE` | `8ceaab71b527` | MIT License |
+| `reverse-engineering-api` | `skills-v4/reverse-engineering-api/LICENSE` | `05b4c6033716` | MIT License |
 
 这些目录内的 `LICENSE` 保持原样，请一并遵守。
 
