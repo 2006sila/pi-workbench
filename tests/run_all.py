@@ -28,6 +28,7 @@ def run(cmd, label):
 def main():
     results = []
     for f, label in (('verify_inject.py', '注入核心（标记兼容 / 备份保留 / 占位符断言 / 漂移）'),
+                     ('verify_addons.py', '附加包生命周期（menuKeepAdvertised 同步 / 菜单重建 / 坏状态可检）'),
                      ('verify_import.py', '技能来源识别（集合 / 包装 / zip / 同名冲突 / 上限）'),
                      ('verify_readonly.py', '只读保护 + 客户端路径探测'),
                      ('verify_ui.py', '界面回归（页面 / 模式 / 只读 / 版本窗 / 任务构建）'),

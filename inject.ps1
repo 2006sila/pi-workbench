@@ -1263,6 +1263,22 @@ function Get-LoadLayerReport {
             $dn = Get-FrontField (Read-Utf8 $mp) 'name'
             if ($dn -and $dn -ne $mName) { $bad += ('菜单技能声明名与目录名不一致: ' + $dn + ' ≠ ' + $mName) }
         }
+        # menuKeepAdvertised = 「极简模式下也保持进提示词」的例外名单（纪律型技能）。
+        # 它此前**只被写入、没有任何消费方**：写成什么都不影响运行，所以一旦它
+        # 指向磁盘上不存在的技能（例如附加包被 -RemoveAddons 移除后），下次部署会
+        # 对不存在的路径调 Remove-DisableModelInvocation 并静默失败，「保持常驻」
+        # 这个承诺永远无法兑现，而没有任何地方会报出来。
+        # 这里把「名单里每一项都必须真实存在」变成可校验的断言。
+        if ($state.menuKeepAdvertised) {
+            foreach ($k in ($state.menuKeepAdvertised -split '[;]')) {
+                $k = $k.Trim()
+                if (-not $k) { continue }
+                $kp = Join-Path (Join-Path $SkillsTarget $k) 'SKILL.md'
+                if (-not (Test-Path -LiteralPath $kp)) {
+                    $bad += ('menuKeepAdvertised 指向不存在的技能（该例外无法生效）: ' + $k)
+                }
+            }
+        }
     }
     return @(($bad.Count -eq 0), $bad, $checked)
 }
@@ -2171,10 +2187,46 @@ if ($RemoveAddons) {
                 # 清单里名字恰好是附加包名子串的技能（如 gate）会被一并剔除。
                 $keep = @($st.installedSkills | Where-Object { $removeNames -notcontains $_ })
                 $st.installedSkills = $keep
-                Write-Utf8NoBom $StatePath (($st | ConvertTo-Json -Depth 5) + "`r`n")
-                Say 'INFO' '状态清单已同步更新'
             }
+            # menuKeepAdvertised 里可能引用刚被移除的包，必须同步剔除：
+            # 否则它会一直指着一个磁盘上已不存在的技能 —— 下次部署极简模式时
+            # 对它调 Remove-DisableModelInvocation 会静默失败（函数见路径不存在即返回），
+            # 「保持常驻」这个承诺永远无法兑现；-Check 此前也不读这个字段，发现不了。
+            if ($st.menuKeepAdvertised) {
+                $adv = @(($st.menuKeepAdvertised -split '[;]') |
+                         Where-Object { $_ -and ($removeNames -notcontains $_) })
+                $st.menuKeepAdvertised = if ($adv.Count -gt 0) { ($adv -join ';') } else { $null }
+            }
+            Write-Utf8NoBom $StatePath (($st | ConvertTo-Json -Depth 5) + "`r`n")
+            Say 'INFO' '状态清单已同步更新'
         } catch { Say 'WARN' '状态清单更新失败（不影响移除结果）' }
+    }
+    # 菜单技能正文要跟着重生成：它是部署时按当时的技能集生成的静态文本，
+    # 移除附加包后仍会列着已删的模块，agent 照着菜单去 read 会读不到
+    # （菜单 6 条硬规矩第 4 条「取不到就直说」本该在生成时就避免）。
+    # 只在极简模式且菜单技能确实存在时重建；失败不影响移除结果。
+    #
+    # 注意：这里不能用 $MenuSkillName —— 它要到脚本靠后的部署段才赋值
+    # （本块跑在前面），拿到的会是 $null，Join-Path 出来是空路径，
+    # Test-Path 恒为假，整块被静默跳过。用状态清单里记的名字更准确
+    # （用户可能部署的是别的名字），兜底才用默认名。
+    $menuNameRm = 'pi-workbench-menu'
+    if (Test-Path -LiteralPath $StatePath -ErrorAction SilentlyContinue) {
+        try {
+            $stPre = Read-Utf8 $StatePath | ConvertFrom-Json
+            if ($stPre.menuSkill) { $menuNameRm = [string]$stPre.menuSkill }
+        } catch { }
+    }
+    if (Test-Path -LiteralPath (Join-Path $SkillsTarget $menuNameRm)) {
+        try {
+            $stMenu = Read-Utf8 $StatePath | ConvertFrom-Json
+            if ($stMenu.skillMode -eq 'menu' -and $stMenu.installedSkills) {
+                $ids = @($stMenu.installedSkills | Where-Object { $_ -ne $menuNameRm })
+                $rebuilt = New-SkillMenu -Target $SkillsTarget -ModuleIds $ids `
+                    -CatFile (Join-Path $Base 'skill-categories.json') -MenuName $menuNameRm
+                Say 'INFO' ('菜单技能已按移除后的技能集重建（列 ' + $rebuilt + ' 个模块）')
+            }
+        } catch { Say 'WARN' '菜单技能重建失败（不影响移除结果）' }
     }
     if (Test-Path -LiteralPath $SkillsTarget) {
         $left = @(Get-ChildItem -LiteralPath $SkillsTarget -Force -ErrorAction SilentlyContinue)
