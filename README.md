@@ -401,6 +401,11 @@ powershell -ExecutionPolicy Bypass -File inject.ps1 -Target pideck -RemoveAddons
 # 多源技能库（分号分隔，相对路径按脚本所在目录解析）
 powershell -ExecutionPolicy Bypass -File inject.ps1 -Target dsh -SkillsSource 'skills-v4;D:\my-skills'
 
+# 多源里有同名技能时，显式指定取哪一份（不指定则取先出现的，并报出「取了谁/跳过谁」）
+powershell -ExecutionPolicy Bypass -File inject.ps1 -Target dsh `
+    -SkillsSource 'skills-v4;D:\my-skills' -SkillSourceMap 'l-reverse=my-skills'
+# 来源名 = 来源根的最后一段目录名（上例是 my-skills）；写了不存在的来源会停下不写入
+
 # 自检：L1 文件层 / L2 配置层 / L3 进程层（退出码 0=通过，1=有未通过项）
 powershell -ExecutionPolicy Bypass -File inject.ps1 -Target dsh -Check
 
@@ -569,7 +574,34 @@ pi-workbench/
 
 **V1.4 · 2026-09-30**
 
-从 [alicewe1/alice-assistant](https://github.com/alicewe1/alice-assistant)（GPL-3.0，clean-room，只借机制）学到的六件事，全部落地并带验收：
+本版是**工程加固版**。核心是修掉 6 处「静默失效」缺陷 —— 它们的共同特征是
+**不报错、不提示，但结果不是你以为的那个**；另附 alice-assistant 借鉴落地与发布合规。
+
+**一、修掉的静默缺陷**
+
+- **`Copy-Tree` 静默不覆盖**（影响面最大，6 处调用含**备份还原**）：
+  `robocopy` 的默认规则是「**大小相同 + 时间戳相同 = 已相同**」，**不看内容**。
+  技能包里的 `SKILL.md` 常是同一秒解压/生成的，于是「换个来源重装同名技能」
+  会静默保留旧内容。实测同一对文件（源/目标均 94B 且 mtime 相同、内容不同）：
+  `/IS`、`/IS /IT`、`/MIR` **全部 rc=0 且纹丝不动**，只有「先删目标再拷」才真正更新。
+  根因是 robocopy 在**目录层**就跳过，include 开关只管文件层。
+  现改为「先删目标再整份复制」，与本工具「整份接管」语义一致。
+- **DSH patch 层标记块每次部署累积一层**：`Strip-PatchBlock` 的定位正则末尾 `$`
+  被包在 `(?s)` 里 → .NET 多行模式下 `$` 匹配 `\n` 之前的位置，而 `[^\r\n]*`
+  之后还隔着 `\r`，**条件无解、模式永不匹配** → 旧块从没被摘掉。
+  实测连部署 3 次得到 3 个 `BEGIN/END`。修后老用户已有的累积块会被**一次清理干净**。
+- **移除附加包后状态不一致**：`-RemoveAddons` 只更新 `installedSkills`，
+  `menuKeepAdvertised` 仍指着已删的包 → 下次部署对它调 `Remove-DisableModelInvocation`
+  静默失败，「保持常驻」永远无法兑现，且 `-Check` 从不读该字段，发现不了。
+- **`-Probe` 归属误判**：原先用 `-match` 做**子串包含**，而技能名存在 **5 对包含关系**
+  （`reverse-engineering` ⊂ `reverse-engineering-api`、`l-reverse` ⊂ `seagull-reverse` 等），
+  会把「泄漏了 A」记成「泄漏了 B」。改为按行取词 + 精确比对。
+- **`-Probe` 隐藏泄漏被掩盖**：原先 `hit` 判定先于 `hid`，「答出了菜单技能
+  **+ 同时泄漏隐藏模块**」被判成 `pass` —— 隐藏标记失效被掩盖。改为隐藏泄漏优先。
+- **只读保护勾选报错**：`TemplatePage._on_readonly_toggle` 调了 `self._set_status`，
+  但该函数定义在 `MainWindow` 上 → 勾选抛 `AttributeError`，界面看着「没反应」。
+
+**二、从 [alicewe1/alice-assistant](https://github.com/alicewe1/alice-assistant)（GPL-3.0，clean-room，只借机制）学到的**
 
 - **标记块只认「关键串」**（修一个真实的升级兼容缺口）：
   - 定位改成 `<!-- BEGIN pi-workbench` + 任意载荷，版本号只是载荷
@@ -586,14 +618,34 @@ pi-workbench/
   **未声明来源的技能 59 个**（如实列出 —— 再分发前须自行确认权利人）
   - `skill_tool.py pack --exclude-bare`：打「再分发安全包」时排除这些未声明来源的技能
   - `contract` 会校验 NOTICE 三段式存在 + 第三方清单与磁盘一致（数量不符即报错）
+  - 本版同时修正了清单里**三个 LICENSE 的 sha256**（此前是陈旧值，与磁盘不符）
 - **Job Object 回收整棵进程树**（`bj_tool.py`）：子进程一 spawn 就挂进
   `KILL_ON_JOB_CLOSE` 作业，句柄关闭时由**内核**清掉整棵树（含孙进程），
   GUI 崩了也不留孤儿；宿主已在别的作业导致 assign 失败时优雅回退到 `taskkill /T`
 - **`deploy-self.ps1`**（自我部署）：停进程 → 备份 `.rollback-<时间戳>` → 覆盖 → 校验 SHA256 → 重启；
   `-WhatIfOnly` 只打印不动手，结束时**直接打印回滚命令**，回滚备份按 `-KeepRollbacks` 清理；
   路径按脚本位置推导（不写死盘符），构建产物==目标时拒绝
-- **测试进仓库**：`tests/` 两个套件 + `tests/run_all.py`（注入核心 13 项 / 工程件 13 项 / 仓库门禁），
+- **测试进仓库**：`tests/` + `tests/run_all.py`（一次跑完 12 个套件），
   以前放 `%TEMP%` 被系统清理过一次，现在跟代码走
+
+**三、新增能力**
+
+- **`-SkillSourceMap`（重名技能来源选择）**：`-SkillsSource` 支持多来源，
+  重名时此前只能靠调分号顺序表达偏好、**界面上没有入口**。现在可显式指定
+  `-SkillSourceMap "技能名=来源名"`；冲突文案报出「取了谁 / 跳过谁 / 怎么改」；
+  指定了**不存在的来源**则停下且不写入任何技能（绝不静默退回默认）
+- **进度「清单先行 + 逐项点亮」**：PowerShell 一启动就干活，而进度窗是点按钮才构造的 ——
+  只靠逐项事件会让窗口挂载前的那几步永远停在「待办」。现在先算好完整清单、
+  窗口构造时画全行，事件只按 key 点亮；**结束时未点亮的行标「跳过」**（不留在「待办」）
+- **子进程输出分级**：噪声前缀黑名单 + 关键行白名单（**白名单优先**，避免误丢含
+  `ERROR` 的噪声行）+ 关键行截断 160 字符 + **过滤计数上报**（丢了多少行必须可见）
+
+**四、其他修正**
+
+- `inject.ps1` 写入状态清单的 `toolVersion` 此前一直是 `1.0.0`（未跟着升版），本版修正为 `1.4.0`
+- 技能库：修 1 条失效相对链接；7 个技能的 `name` 对齐目录名
+  （`anti-cheat` / `dma-attack` / `game-engine` / `game-hacking` / `graphics-api` /
+  `research-rigor` / `windows-kernel` —— 状态清单 / 安装目录 / 类目表 / README 用的都是目录名）
 
 **V1.3 · 2026-09-26**
 

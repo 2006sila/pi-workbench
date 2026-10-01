@@ -96,7 +96,7 @@ $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 
 $TOOL_TAG  = 'pi-workbench'
-$TOOL_VER  = '1.0.0'
+$TOOL_VER  = '1.4.0'
 # 标记块分成「关键串 + 版本载荷」两段。定位只认关键串（$MARK_KEY_*），
 # 版本号只是载荷 —— 这样升级标记（v4 → v5）、或者历史上写过带别的东西的块
 #（旧版 install 脚本的 `BEGIN prompt=x.md` / `BEGIN pack=xxx`），
