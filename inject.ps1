@@ -14,6 +14,20 @@ param(
     [switch]$SkillsOnly,
     [string]$RemoveAddons,
 
+    # 重名技能的来源选择："技能名=来源标识;技能名=来源标识"。
+    # 来源标识 = 该技能所在来源根的最后一段目录名（如 skills-v4、my-skills）。
+    # 不传时保持历史行为：重名取先出现的那个（顺序 = -SkillsSource 分号顺序）。
+    # 为什么要它：-SkillsSource 支持多来源，两个包里有同名技能时总有一个被静默跳过；
+    # 用户此前只能靠调整分号顺序来表达偏好，界面上没有任何入口。
+    [string]$SkillSourceMap,
+
+    # 结构化进度：把「计划」与「逐项结果」按固定格式打到 stdout，
+    # 供 GUI 画进度清单（见 bj_tool.py 的 ProgressDialog）。
+    #   [PLAN] key|label      —— 全部待办项（在动手之前一次性发完）
+    #   [STEP] key|ok|detail  —— 某一项做完了
+    # 不传时输出与历史完全一致（纯文本日志），不影响命令行用法。
+    [switch]$EmitPlan,
+
     # 卸载时目标文件在部署后被外部改过（SHA-256 基线漂移）→ 默认停下不还原，
     # 加这个开关才继续（会先把改动存到备份区）。
     [switch]$Force,
@@ -248,6 +262,21 @@ function Say([string]$Level, [string]$Message) {
     [void]$Script:Report.Add($line)
 }
 
+function Emit-PlanItem([string]$Key, [string]$Label) {
+    # 计划行：动手之前把「待办清单」一次性发完。
+    # 为什么必须先行：GUI 是点了按钮才挂进度窗的，而 PowerShell 一启动就开始干活 ——
+    # 逐项事件会比窗口先到，窗口挂载时前面几项早发完了，用户看到的是「前面几步没结果」。
+    # 先发完整清单，窗口任何时候挂载都能把行画全，后续事件只负责点亮。
+    if ($EmitPlan) { Write-Host ('[PLAN] ' + $Key + '|' + $Label) }
+}
+
+function Emit-Step([string]$Key, [bool]$Ok, [string]$Detail) {
+    # 单项结果行。detail 里的换行会破坏「一行一项」的解析，压成空格。
+    if (-not $EmitPlan) { return }
+    $d = ([string]$Detail) -replace '[\r\n]+', ' '
+    $flag = if ($Ok) { 'ok' } else { 'fail' }
+    Write-Host ('[STEP] ' + $Key + '|' + $flag + '|' + $d)
+}
 function SayHost([string]$Level, [string]$Message) {
     # 与 Say 相同，但走 Write-Host：只上屏，不进管道。
     # 必须用在「有返回值的函数」内部 —— PowerShell 函数会把管道输出一并返回，
@@ -744,7 +773,27 @@ function Unlock-SkillTrees([string[]]$Names, [string]$Root) {
 }
 
 function Copy-Tree([string]$Src, [string]$Dest) {
-    robocopy $Src $Dest /E /MT:16 /R:1 /W:1 /NFL /NDL /NJH /NJS /NC /NS /NP | Out-Null
+    <#
+      整份接管：让 Dest 变成 Src 的样子，不做增量猜测。
+
+      为什么必须「先删再拷」而不是让 robocopy 自己判断增量 —— 实测（本机 robocopy）：
+        源 94B / 12:37:09.466，目标 94B / 12:37:09.466（同大小同时间戳，内容不同）
+          /E /IS        -> rc=0，目标纹丝不动   （不够）
+          /E /IS /IT    -> rc=0，目标纹丝不动   （也不够）
+          /MIR          -> rc=0，目标纹丝不动   （还不够）
+          先删目标再拷   -> rc=1，内容正确更新   （唯一可靠）
+
+      根因：robocopy 在**目录层**就把「判定为相同」的条目整体跳过，
+      而 include 开关（/IS /IT）只作用于文件层，管不到这个决策。
+      技能包里的 SKILL.md 常是同一秒解压/生成出来的，这个条件并不罕见 ——
+      后果是「换个来源重装同名技能」静默保留旧内容、备份还原也没真还原。
+    #>
+    if (Test-Path -LiteralPath $Dest) {
+        # 只读位会挡住删除（技能库可能被 -Readonly 保护过），先解锁
+        try { [void](Set-ReadonlyTree $Dest $false) } catch { }
+        Remove-Item -LiteralPath $Dest -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    robocopy $Src $Dest /E /R:1 /W:1 /NFL /NDL /NJH /NJS /NC /NS /NP | Out-Null
     if ($LASTEXITCODE -ge 8) { throw ("robocopy failed rc=" + $LASTEXITCODE + " for " + $Src) }
 }
 
@@ -1305,6 +1354,82 @@ function Get-TargetProbeCli {
     return $null
 }
 
+# ---------------------------------------------------------------- 子进程输出分级
+#
+# 目录清单类输出（npm/pnpm install、客户端启动横幅、依赖树）动辄上千行，
+# 直接把原始 stdout 灌进日志会让真正重要的 ERROR/WARN 被淹掉 ——
+# 用户的实际反馈是「滚了半天找不到哪行是错的」。
+# 处理口径：
+#   · 噪声前缀黑名单：确定性无信息量的横幅/进度行，直接丢
+#   · 关键行白名单：命中则整行保留（截断到 160 字符，防止单行撑爆界面）
+#   · 其余行：原样保留（这是「保守」取向 —— 只丢确定没用的，不猜）
+# 注意：白名单优先于黑名单，避免某行既是噪声前缀又含 ERROR 时被误丢。
+$Script:LogNoisePrefixes = @(
+    'Reading additional input',
+    'OpenAI Codex v',
+    'npm notice',
+    'npm warn deprecated',
+    'added ', 'removed ', 'changed ', 'audited ',
+    'Progress: resolved', 'Progress: downloaded',
+    'Downloading ', 'Resolving ', 'Fetching ',
+    'workdir:', 'model:', 'provider:', 'approval:', 'sandbox:', 'reasoning',
+    'session id:', 'tokens used',
+    '--------'
+)
+$Script:LogKeepPatterns = @(
+    'ERROR', 'FATAL', 'WARN', 'warning', 'failed', 'Failed',
+    'Rejected', 'refused', 'denied', 'timeout', 'Timed out',
+    '[ERROR]', '[WARN]', 'RESULT:', 'exit='
+)
+
+function Test-LogNoise([string]$Line) {
+    # 返回 $true 表示这行是确定性噪声（可丢）
+    if ([string]::IsNullOrWhiteSpace($Line)) { return $false }
+    $t = $Line.Trim()
+    if ($t.Length -eq 0) { return $false }
+    # 纯数字行（进度计数）、纯分隔线
+    if ($t -match '^\d+$') { return $true }
+    if ($t -match '^[-=*_]{3,}$') { return $true }
+    foreach ($p in $Script:LogNoisePrefixes) {
+        if ($t.StartsWith($p, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    return $false
+}
+
+function Select-LogKeep([string]$Line) {
+    # 关键行：命中白名单则保留（截断到 160 字符）
+    $t = $Line.Trim()
+    foreach ($p in $Script:LogKeepPatterns) {
+        if ($t.IndexOf($p, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            if ($t.Length -gt 160) { return $t.Substring(0, 160) + '…' }
+            return $t
+        }
+    }
+    return $null
+}
+
+function Write-FilteredChildOutput([string]$Text) {
+    <#
+      把子进程输出按上述口径过一遍再写日志。
+      返回 @{ kept = <保留行数>; dropped = <丢弃行数>; important = <关键行数> }
+      计数器会由调用方写进日志，让「过滤掉了多少」可见 —— 静默丢日志是不可接受的。
+    #>
+    $kept = 0; $dropped = 0; $important = 0
+    foreach ($raw in ($Text -split "[\r\n]+")) {
+        if ([string]::IsNullOrWhiteSpace($raw)) { continue }
+        $keep = Select-LogKeep $raw
+        if ($keep) {
+            Say 'WARN' ('  · ' + $keep)
+            $important++
+            $kept++
+            continue
+        }
+        if (Test-LogNoise $raw) { $dropped++; continue }
+        Say 'INFO' ('  ' + $raw.TrimEnd())
+        $kept++
+    }
+    return @{ kept = $kept; dropped = $dropped; important = $important }
+}
 function Invoke-ChannelProbe([string]$Cli, [string]$Question, [int]$TimeoutSec) {
     # 真跑一次客户端：只有技能描述真的进了系统提示词，模型才答得出。
     # 用 Start-Job 而不是直接调用 —— 原生调用没法设超时，模型卡住会把整个 GUI 挂死。
@@ -1803,19 +1928,36 @@ if ($Probe) {
             $record.detail = '客户端 CLI 退出码 ' + $code + '（可能是没登录 / 没配 provider）'
             $probeOk = $false
         } else {
+            # 匹配必须「按行精确」，不能用 -match 做子串包含 ——
+            # 技能名之间存在包含关系（reverse-engineering ⊂ reverse-engineering-api、
+            # l-reverse ⊂ seagull-reverse 等 5 对），子串匹配会把
+            # 「模型泄漏了 reverse-engineering-api」记成「泄漏了 reverse-engineering」，
+            # 归属报错，用户照着名字去查会发现那个技能根本没被列出来。
+            # 模型被要求「每行一个」，所以按行取词再精确比对是正确口径。
+            $replyTokens = @(
+                $diffLines -split "[\r\n]+" |
+                    ForEach-Object { $_.Trim().TrimStart('-', '*', ' ', '`t') } |
+                    Where-Object { $_ } |
+                    ForEach-Object { ($_ -split '[\s,，、]+')[0] } |   # 取每行第一个词
+                    ForEach-Object { $_.TrimEnd('.', ':', '：', '。') } |
+                    Where-Object { $_ }
+            )
             $hit = @()
-            foreach ($e in $expect) { if ($e -and $diffLines -match [regex]::Escape($e)) { $hit += $e } }
+            foreach ($e in $expect) { if ($e -and ($replyTokens -contains $e)) { $hit += $e } }
             $hid = @()
-            foreach ($h in $hidden) { if ($h -and $diffLines -match [regex]::Escape($h)) { $hid += $h } }
-            if ($hit.Count -gt 0) {
-                $record.status = 'pass'
-                $record.hit = @($hit)
-                $record.detail = '模型答出了已部署技能: ' + (($hit | Select-Object -First 3) -join ', ')
-            } elseif ($hid.Count -gt 0) {
+            foreach ($h in $hidden) { if ($h -and ($replyTokens -contains $h)) { $hid += $h } }
+            # 先判隐藏泄漏，再判命中：极简模式下「答出了菜单技能」是正常的，
+            # 但同时也列出模块名说明隐藏标记没生效 —— 那是真实缺陷，
+            # 不能被「至少命中了一个可见技能」掩盖成 pass。
+            if ($hid.Count -gt 0) {
                 $record.status = 'mismatch'
                 $record.hidden = @($hid | Select-Object -First 5)
                 $record.detail = '模型列出了本该被隐藏的模块（disable-model-invocation 未生效？）: ' + (($hid | Select-Object -First 3) -join ', ')
                 $probeOk = $false
+            } elseif ($hit.Count -gt 0) {
+                $record.status = 'pass'
+                $record.hit = @($hit)
+                $record.detail = '模型答出了已部署技能: ' + (($hit | Select-Object -First 3) -join ', ')
             } elseif ($diffLines -match '(?i)(^|\s)(none|无|没有)(\s|$)') {
                 $record.status = 'fail'
                 $record.detail = '模型表示看不到任何已部署技能'
@@ -2300,6 +2442,7 @@ if ($Uninstall) {
             $orig = Read-Utf8 $state.promptBackup
             Write-Utf8NoBom $PromptTarget $orig
             Say 'INFO' ($T.PromptName + ' 已还原为安装前内容')
+      Emit-Step 'prompt' $true '已还原'
             $restored = $true
         }
         if (-not $restored) {
@@ -2333,6 +2476,7 @@ if ($Uninstall) {
         if ($state -and $state.patchBackup -and (Test-Path -LiteralPath $state.patchBackup)) {
             Write-Utf8NoBom $PatchFile (Read-Utf8 $state.patchBackup)
             Say 'INFO' 'home 级 patch 已还原为安装前内容'
+      Emit-Step 'prompt' $true '已还原'
         } elseif ([string]::IsNullOrWhiteSpace($pstrip)) {
             Remove-Item -LiteralPath $PatchFile -Force -ErrorAction SilentlyContinue
             Say 'INFO' 'home 级 patch 由本工具创建，已删除'
@@ -2370,6 +2514,7 @@ if ($Uninstall) {
             }
         }
         Say 'INFO' ('已移除注入技能 ' + $removed + ' 个；' + $T.Label + ' 自带技能未被触碰')
+      Emit-Step 'skills' $true ('已移除 ' + $removed + ' 个')
         $Script:OpSkills = $removed
     } elseif ($state) {
         Say 'INFO' '状态清单存在，本次安装未部署技能库，无需移除技能'
@@ -2547,7 +2692,13 @@ if (Test-SameContent $promptFull $newBytes) {
     Write-Utf8NoBom $promptFull $newText
     $promptAfterHash = Get-Sha256 $newBytes
     Add-JournalFile $promptFull $promptBeforeB64 ($promptBeforeHash -ne '') ([Convert]::ToBase64String($newBytes)) $promptBeforeHash $promptAfterHash
+      # 结构化进度：动手之前先把完整待办清单发出去（理由见 Emit-PlanItem 注释）
+      if ($Target -eq 'dsh' -and -not $SkillsOnly) { Emit-PlanItem 'patch' 'home 级 patch 层（agent-instructions 预算）' }
+      Emit-PlanItem 'prompt' ('写入指令集 -> ' + $T.PromptName)
+      Emit-PlanItem 'skills' ('部署技能库 -> ' + $SkillsTarget)
+      Emit-PlanItem 'state' '写状态清单'
     Say 'INFO' ('已写入指令集: ' + $promptFull + '（' + $promptBody.Length + ' 字符，版本 ' + $VersionLabel + '，模式 ' + $SkillMode + '）')
+      Emit-Step 'prompt' $true '已写入'
 }
 }
 
@@ -2597,6 +2748,7 @@ if (($Target -eq 'dsh') -and (-not $SkillsOnly)) {
     $budgetVal    = $budget
     $budgetSrcVal = $budgetSource
     Say 'INFO' ('已写入 home 级 patch: ' + $PatchFile + '（agent-instructions maxBytes=' + $budget + '，来源 ' + $budgetSource + '）')
+      Emit-Step 'patch' $true '已写入'
 }
 
 # 2) 技能库
@@ -2644,21 +2796,71 @@ if ($NoSkills) {
     if ($dirs.Count -eq 0) {
         Say 'WARN' ('技能源目录为空: ' + $SkillsSource)
     } else {
-        # 同名冲突：以前是 silently 取第一个；现在把冲突名字与两边来源都报出来
-        $seen = @{}
-        $dups = @()
-        $unique = @()
+        # 同名技能的来源选择。
+        #
+        # 历史行为是 silently 取第一个，后来改成报 WARN 但仍取第一个 ——
+        # 用户可以靠调整 -SkillsSource 的分号顺序表达偏好，却在界面上没有任何入口，
+        # 而且调完顺序也看不出「到底生效了没有」。
+        #
+        # 现在：-SkillSourceMap "技能名=来源标识" 显式指定取哪一份；
+        # 没指定的重名项仍然取先出现的（默认回退）—— 绝不因为「用户没选」就卡住，
+        # 也绝不静默装错：没指定时会明确报出「取了谁、跳过了谁、怎么改」。
+        #
+        # 来源标识取来源根的最后一段目录名（skills-v4 / my-skills），
+        # 它同时是报错文案里能让用户直接抄进 -SkillSourceMap 的那个词。
+        $srcTag = @{}
+        foreach ($it in $dirs) {
+            $s = [string]$it.Source
+            $tag = Split-Path -Leaf $s
+            if (-not $tag) { $tag = $s }
+            $srcTag[$s] = $tag
+        }
+        $want = @{}
+        foreach ($kv in ($SkillSourceMap -split '[;]')) {
+            if ([string]::IsNullOrWhiteSpace($kv)) { continue }
+            $eq = $kv.IndexOf('=')
+            if ($eq -le 0) { continue }
+            $k = $kv.Substring(0, $eq).Trim()
+            $v = $kv.Substring($eq + 1).Trim()
+            if ($k -and $v) { $want[$k] = $v }
+        }
+
+        $byName = @{}          # 技能名 -> 候选列表（保序）
         foreach ($it in $dirs) {
             $nm = $it.Dir.Name
-            if ($seen.ContainsKey($nm)) {
-                $dups += ($nm + '（' + (Split-Path -Leaf ([string]$seen[$nm])) + ' vs ' + (Split-Path -Leaf ([string]$it.Source)) + '）')
-                continue
+            if (-not $byName.ContainsKey($nm)) { $byName[$nm] = @() }
+            $byName[$nm] = @($byName[$nm]) + @($it)
+        }
+
+        $unique = @()
+        $dups = @()
+        $badPick = @()
+        foreach ($nm in @($byName.Keys)) {
+            $cands = @($byName[$nm])
+            if ($cands.Count -le 1) { $unique += $cands; continue }
+            $tags = @($cands | ForEach-Object { $srcTag[[string]$_.Source] })
+            $picked = $cands[0]                       # 默认：先出现的
+            $why = '默认取先出现的'
+            if ($want.ContainsKey($nm)) {
+                $hit = @($cands | Where-Object { $srcTag[[string]$_.Source] -eq $want[$nm] })
+                if ($hit.Count -gt 0) {
+                    $picked = $hit[0]
+                    $why = '按 -SkillSourceMap 指定'
+                } else {
+                    # 指定了一个不存在的来源 —— 不能静默退回默认，那等于用户的选择被无视
+                    $badPick += ($nm + ' 指定的来源「' + $want[$nm] + '」不在候选里（可用：' + ($tags -join ' / ') + '）')
+                }
             }
-            $seen[$nm] = [string]$it.Source
-            $unique += $it
+            $unique += $picked
+            $skipped = @($cands | Where-Object { $_ -ne $picked } | ForEach-Object { $srcTag[[string]$_.Source] })
+            $dups += ($nm + ' → 取 ' + $srcTag[[string]$picked.Source] + '（' + $why + '），跳过 ' + ($skipped -join ' / '))
         }
         if ($dups.Count -gt 0) {
-            Say 'WARN' ('同名技能冲突（取先出现的那个，其余跳过）: ' + ($dups -join '；'))
+            Say 'WARN' ('同名技能冲突（' + $dups.Count + ' 个）: ' + ($dups -join '；'))
+            Say 'INFO' '要换来源：-SkillSourceMap "技能名=来源名"，多个用分号隔开'
+        }
+        if ($badPick.Count -gt 0) {
+            Fail ('-SkillSourceMap 指定了不存在的来源（已停止，未写入任何技能）: ' + ($badPick -join '；'))
         }
         $dirs = $unique
         # 上次部署设过只读 → 先解锁，否则 robocopy 覆盖 / 打标记会被挡住
@@ -2704,6 +2906,7 @@ if ($NoSkills) {
             $installedSkills += $d.Name
         }
         Say 'INFO' ('已部署技能 ' + $installedSkills.Count + ' 个 -> ' + $SkillsTarget)
+      Emit-Step 'skills' $true ('已部署 ' + $installedSkills.Count + ' 个')
     }
 }
 
@@ -2915,6 +3118,7 @@ if ($pr[0] -gt 0 -or $pr[1] -gt 0) {
 # 否则后续任何无关错误都会把已经记录在案的部署撤销掉。
 $Script:Rollback.Clear()
 Say 'INFO' ('状态清单: ' + $StatePath)
+      Emit-Step 'state' $true '已写入'
 
 $proc = Get-ClientProcess
 if ($proc.Count -gt 0) {

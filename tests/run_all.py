@@ -30,6 +30,7 @@ def main():
     for f, label in (('verify_inject.py', '注入核心（标记兼容 / 备份保留 / 占位符断言 / 漂移）'),
                      ('verify_addons.py', '附加包生命周期（menuKeepAdvertised 同步 / 菜单重建 / 坏状态可检）'),
                      ('verify_patch.py', 'DSH patch 层（幂等不累积 / 用户配置保留 / 历史块自愈）'),
+                     ('verify_borrowed.py', '借鉴机制（输出分级 / 进度清单先行 / 探针口径 / 重名来源选择）'),
                      ('verify_import.py', '技能来源识别（集合 / 包装 / zip / 同名冲突 / 上限）'),
                      ('verify_readonly.py', '只读保护 + 客户端路径探测'),
                      ('verify_ui.py', '界面回归（页面 / 模式 / 只读 / 版本窗 / 任务构建）'),

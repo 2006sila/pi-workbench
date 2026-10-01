@@ -165,7 +165,7 @@ tp._ro_chk.setChecked(True)
 app.processEvents()
 captured = []
 _old_launch = w._launch
-w._launch = lambda args, label, on_done, kind='操作', target_card='': captured.append(list(args))
+w._launch = lambda args, label, on_done, kind='操作', target_card='', plan=None: captured.append(list(args))
 tp.select_group(0)
 tp._deploy_template('v52c', 'V5.2c', False)
 app.processEvents()
@@ -223,7 +223,7 @@ chk('任务构建：档位5/通道7/格式3/预设3',
 
 enq = []
 _old_enq = w._enqueue
-w._enqueue = lambda args, label, on_done=None, kind='操作', target_card='': enq.append((list(args), label))
+w._enqueue = lambda args, label, on_done=None, kind='操作', target_card='', plan=None: enq.append((list(args), label))
 m.QMessageBox.question = staticmethod(lambda *a, **k: m.QMessageBox.Yes)
 w._probe_all()
 chk('体检两端：两次探针入队', len(enq) == 2 and all('-Probe' in a for a, _ in enq), str([a for a, _ in enq]))

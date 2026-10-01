@@ -916,6 +916,144 @@ class JobObject:
         self._k32 = None
 
 
+class ProgressDialog(QDialog):
+    """注入/卸载进度窗：**清单先行**，事件只负责点亮。
+
+    ══ 为什么清单要由前端先画好，而不是等后端报 ══════════════════════════
+    PowerShell 一启动就开始干活，而本窗口是点了按钮才构造的。如果只靠
+    后端逐项事件来「长出」列表，那么窗口挂载前发出的那几步事件统统收不到 ——
+    用户看到的是前面几项永远停在「待办」，像是卡住了。
+    （alice 那边踩过同一个坑：先试了「让后端先发 plan 事件」，仍然失败，
+      因为同步命令阻塞了主线程，窗口根本来不及挂载。最终定案是把清单算在
+      调用方手里、窗口用计划初始化状态。）
+
+    所以这里的契约是：
+      · 调用方传入 plan（[(key, label), ...]），窗口**构造时**就把行画全
+      · 后端 [STEP] 事件按 key 找到对应行并点亮
+      · 遇到未知 key → 追加一行（兜底，防止后端加了步骤而前端没同步）
+      · 结束时仍未点亮的行 → 标成「跳过」而不是留在「待办」
+        （后端有些步骤在特定条件下不发事件，兜这一层否则用户以为卡死）
+    """
+
+    def __init__(self, plan, title='执行进度', parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setModal(False)
+        self.setMinimumWidth(460)
+        self._rows = {}          # key -> QLabel(状态)
+        self._order = []         # 保持插入顺序，兜底追加时用
+        self._finished = False
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(20, 18, 20, 16)
+        lay.setSpacing(10)
+
+        head = _mk_label(title, 15, 'TEXT_PRIMARY', bold=True)
+        lay.addWidget(head)
+        self._sub = _mk_label('', 11, 'TEXT_MUTED', bold=False)
+        lay.addWidget(self._sub)
+
+        self._grid = QVBoxLayout()
+        self._grid.setSpacing(6)
+        lay.addLayout(self._grid)
+
+        for k, lb in (plan or []):
+            self._add_row(k, lb)
+
+        foot = QHBoxLayout()
+        foot.addStretch(1)
+        self._b_close = QPushButton('后台运行')
+        self._b_close.setStyleSheet(_btn_style('ghost'))
+        self._b_close.setFixedHeight(30)
+        self._b_close.clicked.connect(self.hide)
+        foot.addWidget(self._b_close)
+        lay.addLayout(foot)
+
+    def _add_row(self, key, label):
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        icon = _mk_label('○', 12, 'TEXT_MUTED', bold=True)
+        icon.setFixedWidth(16)
+        row.addWidget(icon)
+        txt = _mk_label(label, 12, 'TEXT_SECONDARY', bold=False)
+        txt.setWordWrap(True)
+        row.addWidget(txt, 1)
+        det = _mk_label('待办', 11, 'TEXT_MUTED', bold=False)
+        det.setFixedWidth(96)
+        det.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        row.addWidget(det)
+        self._grid.addLayout(row)
+        self._rows[key] = (icon, txt, det)
+        self._order.append(key)
+
+    def mark(self, key, ok, detail=''):
+        """按 key 点亮一行；未知 key 追加（兜底）。"""
+        if key not in self._rows:
+            self._add_row(key, detail or key)
+        icon, txt, det = self._rows[key]
+        if ok:
+            icon.setText('✓')
+            icon.setStyleSheet('color: ' + C['SUCCESS'] + ';')
+            det.setText(detail or '完成')
+        else:
+            icon.setText('✗')
+            icon.setStyleSheet('color: ' + C['DANGER'] + ';')
+            det.setText(detail or '失败')
+        det.setToolTip(detail or '')
+
+    def feed(self, line):
+        """吃一行子进程输出；命中 [PLAN] / [STEP] 就更新，否则原样返回 False。"""
+        s = (line or '').strip()
+        if s.startswith('[PLAN] '):
+            body = s[7:]
+            if '|' in body:
+                k, lb = body.split('|', 1)
+                k = k.strip()
+                if k and k not in self._rows:
+                    self._add_row(k, lb.strip())
+            return True
+        if s.startswith('[STEP] '):
+            body = s[7:]
+            parts = body.split('|')
+            if len(parts) >= 2:
+                k = parts[0].strip()
+                ok = parts[1].strip() == 'ok'
+                detail = parts[2].strip() if len(parts) > 2 else ''
+                self.mark(k, ok, detail)
+            return True
+        return False
+
+    def finish_all(self, code):
+        """收尾：仍未点亮的行统一标「跳过」。
+
+        不能留在「待办」—— 后端有些步骤在特定条件下不发事件
+        （例如技能目录已被前一步清空），用户会以为卡住了。
+        """
+        if self._finished:
+            return
+        self._finished = True
+        pending = 0
+        for k in self._order:
+            icon, txt, det = self._rows[k]
+            if det.text() == '待办':
+                icon.setText('–')
+                icon.setStyleSheet('color: ' + C['TEXT_MUTED'] + ';')
+                det.setText('跳过')
+                pending += 1
+        if code == 0:
+            self._sub.setText('完成' + ('（%d 项未执行）' % pending if pending else ''))
+        else:
+            self._sub.setText('结束，退出码 %d（详见运行日志）' % code)
+        self._b_close.setText('关闭')
+
+    def keyPressEvent(self, ev):
+        # Esc = 收起来继续跑后台，不是取消任务
+        if ev.key() == Qt.Key_Escape:
+            self.hide()
+            return
+        super().keyPressEvent(ev)
+
+
 class Runner(QThread):
     """在后台线程里跑 PowerShell。
 
@@ -929,6 +1067,9 @@ class Runner(QThread):
 
     line = Signal(str)
     done = Signal(int)
+    # 过滤统计：@任务结束发一次，让「丢了多少行」可见。
+    # 静默丢日志是不可接受的——用户会以为工具没输出，实际是被过滤器吃了。
+    filtered = Signal(int, int)      # (dropped, important)
 
     MAX_TAIL = 400
     # 单任务输出行数上限：超了就只记不显示（子进程的 stdout 还得继续读，
@@ -936,7 +1077,29 @@ class Runner(QThread):
     STORM_LIMIT = 20000
     _job_warned = False      # 「作业分配失败，回退 taskkill」只提醒一次，不刷屏
 
-    def __init__(self, argv, parent=None):
+    # ---- 输出分级（照 alice 的 stderr 三分法）----------------------------
+    # 为什么需要：robocopy / pi.cmd / 客户端 CLI 的横幅与进度行动辄上千行，
+    # 直接把原始 stdout 灌进日志会让真正的 ERROR 被淹掉——用户的实际反馈是
+    # 「滚了半天找不到哪行是错的」。
+    # 口径（保守取向：只丢确定没用的，不猜）：
+    #   · 关键行白名单优先——命中就整行保留（截断到 160 字符防撑爆界面）
+    #   · 噪声前缀黑名单——确定性无信息量的横幅/进度行，丢
+    #   · 其余行原样保留
+    IMPORTANT_MARKS = ('ERROR', 'FATAL', 'WARN', 'warning', 'failed', 'Failed',
+                       'Rejected', 'refused', 'denied', 'timeout', 'Timed out',
+                       '[ERROR]', '[WARN]', 'RESULT:', 'exit=')
+    NOISE_PREFIXES = (
+        'Reading additional input', 'OpenAI Codex v',
+        'npm notice', 'npm warn deprecated',
+        'added ', 'removed ', 'changed ', 'audited ',
+        'Progress: resolved', 'Progress: downloaded',
+        'Downloading ', 'Resolving ', 'Fetching ',
+        'workdir:', 'model:', 'provider:', 'approval:', 'sandbox:', 'reasoning:',
+        'session id:', 'tokens used',
+    )
+    IMPORTANT_MAX = 160      # 关键行截断长度
+
+    def __init__(self, argv, parent=None, filter_output=True):
         super().__init__(parent)
         self._argv = argv
         self._proc = None
@@ -944,6 +1107,34 @@ class Runner(QThread):
         self._tail = []
         self._lines = 0
         self._stormed = False
+        # 过滤开关：默认开。GUI 日志要可读；测试或排障时可关掉看原始输出。
+        self._filter = bool(filter_output)
+        self._dropped = 0
+        self._important = 0
+
+    def classify(self, text):
+        """返回 ('keep'|'noise', 可能被截断的文本)。
+
+        白名单优先于黑名单：某行既是噪声前缀又含 ERROR 时不能丢。
+        """
+        t = text.strip()
+        if not t:
+            return 'keep', text
+        for m in self.IMPORTANT_MARKS:
+            if m in t:
+                self._important += 1
+                if len(t) > self.IMPORTANT_MAX:
+                    t = t[:self.IMPORTANT_MAX] + '…'
+                return 'keep', t
+        if t.isdigit():
+            return 'noise', text
+        stripped = t.strip('-=*_ ')
+        if not stripped:                      # 纯分隔线
+            return 'noise', text
+        for p in self.NOISE_PREFIXES:
+            if t.startswith(p):
+                return 'noise', text
+        return 'keep', text
 
     def run(self):
         dec = codecs.getincrementaldecoder('utf-8')('replace')
@@ -985,6 +1176,9 @@ class Runner(QThread):
             code = self._proc.wait()
         except Exception:
             code = -1
+        # 过滤统计在结束时发一次：让「丢了多少行」可见，而不是静默吃掉
+        if self._dropped or self._important:
+            self.filtered.emit(self._dropped, self._important)
         self.done.emit(code)
 
     def _emit(self, raw):
@@ -1000,6 +1194,12 @@ class Runner(QThread):
                     self.line.emit('[WARN] 输出行数超过 ' + str(self.STORM_LIMIT)
                                    + '，后续只读不显示（防界面被刷死）；文件日志不受影响')
                 return
+            if self._filter:
+                kind, out = self.classify(text)
+                if kind == 'noise':
+                    self._dropped += 1
+                    return
+                text = out
             self.line.emit(text)
 
     def tail(self):
@@ -2308,8 +2508,10 @@ class TemplatePage(Page):
     def _on_readonly_toggle(self, on):
         # 只读保护：部署后把技能库设为只读（本工具自己的写入会先自动解锁）
         write_app_config('readonlySkills', bool(on))
-        self._set_status('只读保护：' + ('已开启（下次部署生效）' if on else '已关闭（下次部署会解除只读）'),
-                         'warn' if on else 'ok')
+        # _set_status 定义在 MainWindow 上，不在本页 —— 直接 self._set_status
+        # 会 AttributeError（勾选框回调里抛出，Qt 打印堆栈但界面看着「没反应」）。
+        self.main._set_status('只读保护：' + ('已开启（下次部署生效）' if on else '已关闭（下次部署会解除只读）'),
+                              'warn' if on else 'ok')
 
     def _set_mode(self, key):
         self._sel_mode = key
@@ -4160,17 +4362,23 @@ class MainWindow(FramelessWindow):
 
     # ---------------------------------------------------------- 执行队列
 
-    def _enqueue(self, args, label, on_done=None, kind='操作', target_card=''):
-        self._queue.append((args, label, on_done, kind, target_card))
+    def _enqueue(self, args, label, on_done=None, kind='操作', target_card='', plan=None):
+        # plan: [(key, label), ...] —— 进度窗要画的待办清单。
+        # 传了才开进度窗；传 None 的任务（自检/体检等）仍只走文本日志。
+        # key 必须与 inject.ps1 的 Emit-PlanItem 用的一致。
+        if plan is not None:
+            # 清单先行：构造时就把行画全（理由见 ProgressDialog 文档字符串）
+            args = list(args) + ['-EmitPlan']
+        self._queue.append((args, label, on_done, kind, target_card, plan))
         self._pump()
 
     def _pump(self):
         if self._busy or not self._queue:
             return
-        args, label, on_done, kind, target_card = self._queue.pop(0)
-        self._launch(args, label, on_done, kind, target_card)
+        args, label, on_done, kind, target_card, plan = self._queue.pop(0)
+        self._launch(args, label, on_done, kind, target_card, plan)
 
-    def _launch(self, args, label, on_done, kind='操作', target_card=''):
+    def _launch(self, args, label, on_done, kind='操作', target_card='', plan=None):
         if not IS_WINDOWS:
             self._set_status('当前仅支持 Windows', 'error')
             self._pump()          # 早退也要继续队列，否则后面的任务全卡住
@@ -4203,6 +4411,21 @@ class MainWindow(FramelessWindow):
             self._watchdog.setSingleShot(True)
             self._watchdog.timeout.connect(self._on_task_timeout)
         self._watchdog.start(int(TASK_TIMEOUT_SEC * 1000))
+
+        # 进度窗（有 plan 才开）。注意顺序：**先构造窗口再起线程** ——
+        # 反过来的话子进程的头几行 [STEP] 会在窗口存在之前到达并被丢掉。
+        if plan:
+            try:
+                if getattr(self, '_progress', None) is not None:
+                    self._progress.deleteLater()
+                    self._progress = None
+            except Exception:
+                self._progress = None
+            try:
+                self._progress = ProgressDialog(plan, label, self)
+                self._progress.show()
+            except Exception:
+                self._progress = None
 
         runner = Runner(argv, self)
         runner.line.connect(self._log_line)
@@ -4245,6 +4468,15 @@ class MainWindow(FramelessWindow):
         if ms:
             self._log_line('· ' + ms)
         self._busy = False
+        # 进度窗收尾：仍未点亮的行标「跳过」，绝不留在「待办」——
+        # 后端有些步骤在特定条件下不发事件，留着用户会以为卡死
+        dlg = getattr(self, '_progress', None)
+        if dlg is not None:
+            try:
+                dlg.finish_all(code)
+            except Exception:
+                pass
+            self._progress = None
         self._refresh_status()
         history_add(self._cur_kind, self._cur_target, label, code == 0)
         if on_done:
@@ -4252,10 +4484,39 @@ class MainWindow(FramelessWindow):
         QTimer.singleShot(0, self._pump)
 
     def _log_line(self, text):
+        # [PLAN]/[STEP] 是给进度窗的结构化事件，不进文本日志
+        # （进了会跟人读的日志混在一起，两边都变难读）
+        dlg = getattr(self, '_progress', None)
+        if dlg is not None:
+            try:
+                if dlg.feed(text):
+                    return
+            except Exception:
+                pass
         self.page_log.append(text)
 
     # ---------------------------------------------------------- 动作
 
+    def _plan_for(self, kind, target, with_skills=True):
+        """构造进度窗的待办清单。
+
+        key 必须与 inject.ps1 的 Emit-PlanItem 完全一致，否则事件点不亮行、
+        会退化成「所有行都标跳过」——用户在界面上看到的是「一个都没做」，
+        而实际已经装完了。两边是**字符串契约**，改动必须同步。
+        """
+        p = []
+        if kind == 'install':
+            if target.get('key') == 'dsh':
+                p.append(('patch', 'home 级 patch 层（agent-instructions 预算）'))
+            p.append(('prompt', '写入指令集 -> ' + str(target.get('prompt_name') or 'AGENTS.md')))
+            if with_skills:
+                p.append(('skills', '部署技能库'))
+            p.append(('state', '写状态清单'))
+        elif kind == 'uninstall':
+            p.append(('prompt', '摘除注入的指令内容'))
+            if with_skills:
+                p.append(('skills', '移除注入的技能'))
+        return p
     def _run_install(self, target, version_key, version_label, no_skills, label=None, addon_keys=None,
                      skill_mode='full'):
         prompt = ensure_prompt(version_key)
@@ -4285,7 +4546,8 @@ class MainWindow(FramelessWindow):
                 self.switch_page(3)
 
         self._enqueue(args, label or ('注入 ' + target['card'] + ' · ' + version_label + mode_note), done,
-                      kind='注入', target_card=target['card'])
+                      kind='注入', target_card=target['card'],
+                      plan=self._plan_for('install', target, with_skills=(not no_skills)))
 
     def _remove_addons(self, target, skill_dirs, names):
         """从目标端移除附加技能包（不动指令集与其它技能）。"""
