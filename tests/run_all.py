@@ -34,6 +34,7 @@ def main():
                      ('verify_import.py', '技能来源识别（集合 / 包装 / zip / 同名冲突 / 上限）'),
                      ('verify_readonly.py', '只读保护 + 客户端路径探测'),
                      ('verify_ui.py', '界面回归（页面 / 模式 / 只读 / 版本窗 / 任务构建）'),
+                     ('verify_menu.py', '技能菜单生成器（评分列 / 分片 / 陈旧分片清理 / -Check 覆盖）'),
                      ('verify_job_and_deploy.py', '工程件（Job Object 进程树 / 自我部署脚本）')):
         ok = run([PY, '-X', 'utf8', os.path.join(HERE, f)], label)
         results.append((label, ok))

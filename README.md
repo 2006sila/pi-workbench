@@ -91,14 +91,30 @@ Pi 会在启动时把每个技能的**名字 + 描述 + 路径**写进系统提�
 
 ```text
 skills/
-├── pi-workbench-menu/SKILL.md   ← 唯一进提示词的技能：类目 + 65 个模块「何时用」+ 取用纪律
+├── pi-workbench-menu/SKILL.md      ← 唯一进提示词的技能：类目 + 模块「何时用 + 评分」+ 取用纪律
+├── pi-workbench-menu/sections/     ← 类目内模块数超过阈值时，该类的模块表拆到这里（按需读）
 ├── pwn-chain/SKILL.md           ⎫
 ├── ida-reverse/SKILL.md         ⎬ frontmatter 里多一行 disable-model-invocation: true
 └── …（其余 63 个）                ⎭ → Pi 的 formatSkillsForSystemPrompt 会把它们整个滤除
 ```
 
 模块文件位置不变，AI 按菜单里的模块 id 直接 `read` 对应 `SKILL.md`（`/skill:<名字>` 也仍可手动强制加载，作为兜底）。
-类目由仓库根的 [skill-categories.json](skill-categories.json) 决定；未登记的模块归入「其他」。
+类目由仓库根的 [skill-categories.json](skill-categories.json) 决定；未登记的模块归入「其他」；
+模块**评分与分片阈值**由 [skill-ratings.json](skill-ratings.json) 决定（`skill_tool.py rate` 维护）。
+
+**菜单是两层结构**（为技能库长大后不失控）：
+
+- 类目内模块数 **≤ 分片阈值**（默认 12）→ 直接列在菜单里。
+- 超过阈值 → 该类的模块表拆到 `sections/<NN>-<模块id>.md`，菜单里只留一行指针。
+  每次重新部署会**整体对齐** sections：缺的写、旧的改、类目缩小后多余的删掉。
+
+注意「常驻」与「按需」的区别：进系统提示词的只有菜单技能的**名字 + 描述 + 路径**（609 字符），
+菜单正文与分片都是模型真正来查时才会被读。所以分片省的不是每轮开销，而是**模型每次读菜单的体积**——
+技能库涨到几百个模块时，读「菜单 + 一个分片」远小于读一张几万字符的大表，也不会撞上单文件读取上限。
+
+评分只用于**同一类目内多个模块都命中**时的排序（匹配度 → 评分 → 索引序），
+它由可测量信号算出来（`skill_tool.py rate --seed`：references/ scripts/ 描述长度 正文长度 代码块），
+不是质量论断；人工用 `rate --set <技能> <分>` 覆盖，覆盖过的条目记进 `manual`，重跑 --seed 不会盖掉它。
 
 **两种模式对比**（用 Pi 自己的加载器实测）：
 
@@ -108,7 +124,8 @@ skills/
 | 进提示词 | 65 条 | **1 条**（+ 纪律型技能，见下） |
 | 提示词块 | 28,922 字符 | **609 字符（2.1%）**；带两个附属模板时 1,341 字符 |
 | 每轮固定开销 | ≈7,000 tokens | ≈90 tokens（带附属模板量级仍远低于完整模式） |
-| 代价 | — | AI 多一跳（先读菜单再读正文）；依赖它遵守取用纪律 |
+| 菜单正文（按需读） | — | 实测 6,615 字符（65 模块 / 1 个分片）；分片后每次只读「菜单 + 相关分片」 |
+| 代价 | — | AI 多一跳（先读菜单或分片，再读模块正文）；依赖它遵守取用纪律 |
 
 **切换**：两种模式互相切换是幂等的 —— 切回 `完整模式` 会自动删掉菜单技能、并用源文件覆盖掉模块上那行标记。
 UI 上直接点模式按钮重新部署一次即可；命令行传 `-SkillMode`（不传则沿用目标端上次记录的模式）。
@@ -140,14 +157,15 @@ UI 上直接点模式按钮重新部署一次即可；命令行传 `-SkillMode`�
    （约 150 tokens，含菜单绝对路径与取用上限）。APPEND_SYSTEM.md 是系统级、每轮都在、
    优先级高于技能描述，所以路由比只靠菜单描述稳；切回完整模式或卸载时自动消失。
 
-**极简模式的菜单技能自带 6 条硬规矩**（写进生成的菜单，不靠模型自觉）：
+**极简模式的菜单技能自带 7 条硬规矩**（写进生成的菜单，不靠模型自觉）：
 
-1. 先选类目再选模块（每个类目下带「何时进这类」）
-2. 一个阶段最多 4 个模块正文
-3. **报名（硬性）**：选定/换用模块的**当下**报一行 `参考模块: <模块id>（<用途>）`，禁止只执行不报名、禁止事后补报
-4. **取不到就直说**：读不到模块正文时如实报告，**不得声称已按该模块执行**
-5. 已读模块直接复用，不重复读
-6. 三不要：不为了解全部能力读完所有模块 / 不为比较而读无关类目 / 不凑数
+1. 先选类目；`sections/xx.md` 指针 → 先读分片拿清单，再选模块
+2. 排序：任务匹配度 → 评分（`x/10`）→ 索引顺序
+3. 一个阶段最多 4 个模块正文
+4. **报名（硬性）**：选定/换用模块的**当下**报一行 `参考模块: <模块id>（<用途>）`，禁止只执行不报名、禁止事后补报
+5. **取不到就直说**：读不到模块正文时如实报告，**不得声称已按该模块执行**
+6. 已读模块直接复用，不重复读
+7. 三不要：不为了解全部能力读完所有模块（含分片）/ 不为比较而读无关类目 / 不凑数
 
 ---
 
@@ -303,6 +321,13 @@ py -X utf8 skill_tool.py remove my-old-skill --yes
 py -X utf8 skill_tool.py gen --check     # 只读校验三方一致（frontmatter × 类目表 × 磁盘），不一致退出码 1
 py -X utf8 skill_tool.py gen             # 缺声明的从类目表回填，再按声明重排（已有顺序保留，新技能追加末尾）
 
+# 评分表（菜单排序列 + 分片阈值）：按可测量信号生成 / 人工覆盖 / 查看 / 校验覆盖
+py -X utf8 skill_tool.py rate --seed               # 只补缺的，保留人工评分（--force 全重算）
+py -X utf8 skill_tool.py rate --set pwn-chain 9    # 人工评分（记入 manual，--seed 不覆盖）
+py -X utf8 skill_tool.py rate --list
+py -X utf8 skill_tool.py rate --check              # 缺评分/多余条目退出码 1（可进 CI）
+py -X utf8 skill_tool.py rate --threshold 16       # 改分片阈值（类目内超过就拆文件）
+
 # 部署契约：随包资源 ↔ bj_tool.spec ↔ 标记块 ↔ 退出码 ↔ 溯源（README）三方对齐
 py -X utf8 skill_tool.py contract
 
@@ -354,7 +379,7 @@ py -X utf8 skill_tool.py pack --verify build\skill-library.zip
 
 ### 方式一：用打包好的发布包
 
-从 [Releases](https://github.com/2006sila/pi-workbench/releases/latest) 下载 `pi-workbench-v1.4.1-windows-x64.zip`，
+从 [Releases](https://github.com/2006sila/pi-workbench/releases/latest) 下载 `pi-workbench-v1.4.2-windows-x64.zip`，
 解压到任意目录（例  `D:pi-workbench`），双击其中的 `pi用学习工作台pi用学习工作台.exe` 即用（无需 Python 环境）。
 
 自 v1.4.1 起改为 **onedir** 发布形态：不再是单文件自解压，启动过程不碰 `%TEMP%`
@@ -574,6 +599,50 @@ pi-workbench/
 ---
 
 ## 更新记录
+
+**V1.4.2 · 2026-10-08**
+
+本版给**技能菜单**加了两样东西：评分列与类目分片 —— 都是为了让技能库能长大；另修一处既有的教程指向失效。
+
+**一、为什么加（背景）**
+
+极简模式把 65 个模块压成「一张菜单 + 按需读模块」。原来菜单只有「模块 | 何时用」两列：
+类目内多个模块同时命中时没有第二判据；模块多了那张表也越来越长，模型每次读菜单要整张读完。
+
+- **评分列**：每行带 `x/10`，排序变成 **匹配度 → 评分 → 索引序**。
+- **分片**：类目内模块数超过阈值（默认 12）→ 该类拆到 `sections/<NN>-<模块id>.md`，菜单只留一行指针；
+  每次部署整体对齐 sections（缺的写、旧的改、多余的删）。
+
+评分口径写进 `skill-ratings.json`（可复算）：base 5 + references/+1 + scripts/+1 + description≥80 字符/+1 +
+正文≥2500 字符/+1 + 含代码块/+1，夹在 1..10 —— 它是**自足度**，不是质量论断；
+人工用 `rate --set` 覆盖并记入 `manual`，`--seed` 不会盖掉。
+
+**二、一个必要的口径澄清**
+
+进系统提示词的只有菜单技能的 **name + description + path**（实测 609 字符 ≈ 90 tokens/轮）；
+菜单正文与分片都是模型**按需读**的。所以分片省的不是每轮开销，而是**每次读菜单的体积**
+（技能库到几百个模块时，读「菜单 + 一个分片」远小于读一张几万字符的大表，也不会撞上单文件读取上限）。
+
+**三、其他改动**
+
+- `skill_tool.py rate`：`--seed` / `--set` / `--list` / `--check` / `--threshold`
+- `skill_tool.py contract`：多一行「评分 已评 N/N ｜ 类目内超过 X 个模块就分片」
+- 修：技能库页教程第 4 步指向已不存在的 `_table`（技能库页早已改成卡片流）→ 改指卡片流容器。
+  这是**既有缺陷**（改动前 `bj_tool.py` 在工作区无改动），由 `tests/verify_ui.py` 报出后修复。
+- `tests/verify_menu.py`（新）：25 项，含陈旧分片清理与 `-Check` 覆盖分片。
+
+**四、验证**
+
+- `tests/run_all.py` → 13/13 全过（含新菜单套件 25/25）
+- `skill_tool.py contract` → 契约与仓库一致（随包资源 19 项、评分 65/65）
+- `PJ_BUNDLE_CHECK=1` → `ok=true`、技能 65；`PJ_UI_SELFTEST=1` → 退出码 0
+- 用**打包内**的 injector 在沙箱跑极简模式 → `RESULT: OK`，菜单列 65 模块、拆出 1 个分片
+
+**五、已知边界**
+
+- 分片阈值默认 12（`skill-ratings.json` 的 `shardThreshold`，或 `-ShardThreshold` 覆盖）
+- 完整模式下 65 个模块 ≈ 7k tokens/轮；模块规模上去后建议用极简模式
+- `disable-model-invocation` 只在 Pi 上实测过，其他客户端不确定时先用 `full`
 
 **V1.4.1 · 2026-10-08**
 

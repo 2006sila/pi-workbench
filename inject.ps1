@@ -6,6 +6,12 @@ param(
 
     [string]$SourcePrompt,
     [string]$SkillsSource,
+    # 评分表（菜单的「评分」列 + 分片阈值）：默认随包 skill-ratings.json。
+    [string]$RatingFile,
+    # 类目表（菜单的类目结构）：默认随包 skill-categories.json；显式指定便于生成器测试。
+    [string]$CatFile,
+    # 覆盖分片阈值（0 = 用评分表里的 shardThreshold）：类目内超过就拆到 sections/。
+    [int]$ShardThreshold = 0,
     [string]$AgentDir,
 
     [switch]$Uninstall,
@@ -96,7 +102,7 @@ $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 
 $TOOL_TAG  = 'pi-workbench'
-$TOOL_VER  = '1.4.1'
+$TOOL_VER  = '1.4.2'
 # 标记块分成「关键串 + 版本载荷」两段。定位只认关键串（$MARK_KEY_*），
 # 版本号只是载荷 —— 这样升级标记（v4 → v5）、或者历史上写过带别的东西的块
 #（旧版 install 脚本的 `BEGIN prompt=x.md` / `BEGIN pack=xxx`），
@@ -1132,16 +1138,87 @@ function Shorten-Desc([string]$Desc) {
     return $d
 }
 
+function Get-RatingMap([string]$RatingFile) {
+    # 评分表（菜单的「评分」列）+ 分片阈值。文件缺失/坏掉 → 空表 + 默认阈值：
+    # 菜单少一列评分但照样生成 —— 评分只用于同类目内的排序，不是硬依赖。
+    $res = @{ ratings = @{}; threshold = 12 }
+    if (-not $RatingFile -or -not (Test-Path -LiteralPath $RatingFile)) { return $res }
+    try {
+        $j = Read-Utf8 $RatingFile | ConvertFrom-Json
+        if ($j.shardThreshold) { $res.threshold = [int]$j.shardThreshold }
+        if ($j.ratings) {
+            foreach ($p in $j.ratings.PSObject.Properties) { $res.ratings[[string]$p.Name] = [int]$p.Value }
+        }
+    } catch { }
+    return $res
+}
+
+function Get-SectionFileName([int]$Index, [string[]]$Ids) {
+    # 分片文件名 = 序号 + 首个模块 id（模块 id 规定为 ASCII；类目名是中文，不能直接做文件名）。
+    $slug = 'cat'
+    foreach ($i in $Ids) {
+        if ($i -match '^[A-Za-z0-9]') {
+            $slug = ($i -replace '[^A-Za-z0-9]+', '-').Trim('-').ToLower()
+            break
+        }
+    }
+    if ($slug.Length -gt 24) { $slug = $slug.Substring(0, 24).TrimEnd('-') }
+    $fmtArgs = @(($Index + 1), $slug)
+    return ('{0:d2}-{1}.md' -f $fmtArgs)
+}
+
+function Format-ModuleRow([string]$Id, [string]$Why, [hashtable]$Declared, [hashtable]$Ratings) {
+    # 一行 = 模块（+ frontmatter 真名）+ 评分 + 何时用。评分缺失写 '-'，不编数。
+    $tick = [string][char]96
+    $cell = $tick + $Id + $tick
+    if ($Declared.ContainsKey($Id)) { $cell += '（/skill:' + $Declared[$Id] + '）' }
+    $score = if ($Ratings.ContainsKey($Id)) { [string]([int]$Ratings[$Id]) + '/10' } else { '-' }
+    return '| ' + $cell + ' | ' + $score + ' | ' + $Why + ' |'
+}
+
+function Sort-ModulesByRating([string[]]$Ids, [hashtable]$Ratings) {
+    # 表内顺序 = 评分降序、同分保持类目声明顺序 —— 给模型一个确定的「先看谁」。
+    $rows = @()
+    for ($k = 0; $k -lt $Ids.Count; $k++) {
+        $sc = if ($Ratings.ContainsKey($Ids[$k])) { [int]$Ratings[$Ids[$k]] } else { 0 }
+        $rows += [pscustomobject]@{ Id = $Ids[$k]; Score = $sc; Order = $k }
+    }
+    return @($rows | Sort-Object -Property @{ Expression = { $_.Score }; Descending = $true },
+                                            @{ Expression = { $_.Order }; Descending = $false } |
+                                            ForEach-Object { [string]$_.Id })
+}
+
+function New-SectionText([string]$Title, [string]$When, [string[]]$Ids, [hashtable]$Why,
+                         [hashtable]$Declared, [hashtable]$Ratings) {
+    # 一个类目的分片清单（模块多到不该塞进常驻菜单时用）
+    $nl = [string][char]13 + [string][char]10
+    $tick = [string][char]96
+    $sec = New-Object System.Collections.ArrayList
+    [void]$sec.Add('# ' + $Title + ' · ' + $Ids.Count + ' 个模块')
+    if ($When) { [void]$sec.Add(''); [void]$sec.Add('> 何时进这类：' + $When) }
+    [void]$sec.Add('')
+    [void]$sec.Add('父级菜单：' + $tick + '../SKILL.md' + $tick + '（类目总表）。本文件只列这一类的模块；模块正文仍要读它自己的 ' + $tick + 'SKILL.md' + $tick + '。')
+    [void]$sec.Add('')
+    [void]$sec.Add('| 模块 | 评分 | 何时用 |')
+    [void]$sec.Add('|---|---|---|')
+    foreach ($h in $Ids) { [void]$sec.Add((Format-ModuleRow $h $Why[$h] $Declared $Ratings)) }
+    return (($sec -join $nl) + $nl)
+}
+
 function Get-SkillMenuText {
     # 生成菜单技能的**文本**（不落盘）—— 落盘在 New-SkillMenu。
-    # 拆成两半步是为了让 -Check 能只读比对「已部署的菜单是不是与当前技能库/类目表一致」。
-    # 只列「有哪些模块 + 何时用」+ 取用纪律，正文按需读。
-    # 以类目表（skill-categories.json）分类；未登记的模块归入「其他」。
-    param([string]$Target, [string[]]$ModuleIds, [string]$CatFile, [string]$MenuName)
+    # 拆成两半步是为了让 -Check 能只读比对「已部署的菜单是不是与当前技能库/类目表/评分表一致」。
+    # 两层结构：类目内模块数 <= 分片阈值 → 直接列表；超过 → 拆到 sections/<NN>-<模块id>.md，
+    # 菜单只留一行指针。技能库涨到几百个模块时，每轮常驻的菜单不会跟着一起涨。
+    param([string]$Target, [string[]]$ModuleIds, [string]$CatFile, [string]$MenuName,
+          [string]$RatingFile, [int]$ShardThreshold)
     $cats = @()
     if (Test-Path -LiteralPath $CatFile) {
         try { $cats = @((Read-Utf8 $CatFile | ConvertFrom-Json).categories) } catch { $cats = @() }
     }
+    $rm = Get-RatingMap $RatingFile
+    $ratings = $rm.ratings
+    $threshold = if ($ShardThreshold -gt 0) { $ShardThreshold } else { [int]$rm.threshold }
     $one = @{}
     $declared = @{}          # 模块 id -> frontmatter 里的真名（用于 /skill: 强制加载）
     foreach ($id in $ModuleIds) {
@@ -1154,35 +1231,45 @@ function Get-SkillMenuText {
     }
     $placed = @{}
     $lines = New-Object System.Collections.ArrayList
+    $sections = [ordered]@{}
+    $catIndex = 0
     foreach ($c in $cats) {
         $hit = @()
         foreach ($m in $c.modules) { if ($one.ContainsKey([string]$m)) { $hit += [string]$m } }
+        $catIndex++
         if ($hit.Count -eq 0) { continue }
         foreach ($h in $hit) { $placed[$h] = $true }
+        $sorted = Sort-ModulesByRating $hit $ratings
         [void]$lines.Add('')
         [void]$lines.Add('### ' + [string]$c.name)
         if ($c.when) { [void]$lines.Add('> 何时进这类：' + [string]$c.when) }
         [void]$lines.Add('')
-        [void]$lines.Add('| 模块 | 何时用 |')
-        [void]$lines.Add('|---|---|')
-        foreach ($h in $hit) {
-            $cell = '`' + $h + '`'
-            if ($declared.ContainsKey($h)) { $cell += '（/skill:' + $declared[$h] + '）' }
-            [void]$lines.Add('| ' + $cell + ' | ' + $one[$h] + ' |')
+        if ($sorted.Count -gt $threshold) {
+            # 大表拆出去：菜单里只留一行指针，清单按需读
+            $secName = Get-SectionFileName ($catIndex - 1) $sorted
+            [void]$lines.Add('> 本类 ' + $sorted.Count + ' 个模块（超过分片阈值 ' + $threshold + '）→ 先读 `sections/' + $secName + '` 拿清单，再挑模块读它的 SKILL.md 全文。')
+            $sections[$secName] = (New-SectionText ([string]$c.name) ([string]$c.when) $sorted $one $declared $ratings)
+        } else {
+            [void]$lines.Add('| 模块 | 评分 | 何时用 |')
+            [void]$lines.Add('|---|---|---|')
+            foreach ($h in $sorted) { [void]$lines.Add((Format-ModuleRow $h $one[$h] $declared $ratings)) }
         }
     }
     $rest = @($ModuleIds | Where-Object { -not $placed.ContainsKey($_) })
     if ($rest.Count -gt 0) {
+        $sortedRest = Sort-ModulesByRating $rest $ratings
         [void]$lines.Add('')
         [void]$lines.Add('### 其他')
         [void]$lines.Add('> 何时进这类：不在上述类目里，但名字对得上任务')
         [void]$lines.Add('')
-        [void]$lines.Add('| 模块 | 何时用 |')
-        [void]$lines.Add('|---|---|')
-        foreach ($h in $rest) {
-            $cell = '`' + $h + '`'
-            if ($declared.ContainsKey($h)) { $cell += '（/skill:' + $declared[$h] + '）' }
-            [void]$lines.Add('| ' + $cell + ' | ' + $one[$h] + ' |')
+        if ($sortedRest.Count -gt $threshold) {
+            $secName = Get-SectionFileName 98 $sortedRest
+            [void]$lines.Add('> ' + $sortedRest.Count + ' 个模块（超过分片阈值 ' + $threshold + '）→ 先读 `sections/' + $secName + '` 拿清单。')
+            $sections[$secName] = (New-SectionText '其他' '不在上述类目里，但名字对得上任务' $sortedRest $one $declared $ratings)
+        } else {
+            [void]$lines.Add('| 模块 | 评分 | 何时用 |')
+            [void]$lines.Add('|---|---|---|')
+            foreach ($h in $sortedRest) { [void]$lines.Add((Format-ModuleRow $h $one[$h] $declared $ratings)) }
         }
     }
     $domains = @()
@@ -1202,30 +1289,45 @@ function Get-SkillMenuText {
     [void]$sb.Append("括号里是 frontmatter 里的真名（与目录名不同时才有）；用 ``/skill:<真名>`` 可强制加载。`r`n")
     [void]$sb.Append("本文件只给「有哪些模块 + 何时用」，正文按需读。`r`n`r`n")
     [void]$sb.Append("## 取用纪律（硬性）`r`n`r`n")
-    [void]$sb.Append("1. **先选类目再选模块**：按任务选 1 个类目，类目内按「何时用」取 **1 个**最匹配的模块，读完 ``SKILL.md`` 再动手。`r`n")
-    [void]$sb.Append("2. **上限**：一个阶段最多加载 4 个模块正文；确需跳类目时才取第二个类目。`r`n")
-    [void]$sb.Append("3. **报名（硬性）**：选定 / 换用 / 补充任何模块的当下，先向用户说一行 ``参考模块: <模块id>（<用途>）``。`r`n")
+    [void]$sb.Append("1. **先选类目；有分片先读分片**：类目里直接有表 → 表内取 1 个；只给了 `sections/xx.md` 指针 → 先读那个分片拿清单，再取 1 个模块，读完它的 SKILL.md 全文再动手。`r`n")
+    [void]$sb.Append("2. **排序**：任务匹配度 → **评分**（表里 `x/10`，越高越先看）→ 索引顺序；评分只用于同类目内的取舍。`r`n")
+    [void]$sb.Append("3. **上限**：一个阶段最多加载 4 个模块正文；确需跳类目时才取第二个类目。`r`n")
+    [void]$sb.Append("4. **报名（硬性）**：选定 / 换用 / 补充任何模块的当下，先向用户说一行 ``参考模块: <模块id>（<用途>）``。`r`n")
     [void]$sb.Append("   禁止只执行不报名，禁止事后补报。`r`n")
-    [void]$sb.Append("4. **取不到就直说**：读不到模块正文时如实报告，**不得声称已按该模块执行**。`r`n")
-    [void]$sb.Append("5. **已读复用**：同一任务已读过的模块直接复用，不重复读。`r`n")
-    [void]$sb.Append("6. **三不要**：不要为了解全部能力而读完所有模块；不要只为比较而读无关类目；`r`n")
+    [void]$sb.Append("5. **取不到就直说**：读不到模块正文时如实报告，**不得声称已按该模块执行**。`r`n")
+    [void]$sb.Append("6. **已读复用**：同一任务已读过的模块直接复用，不重复读。`r`n")
+    [void]$sb.Append("7. **三不要**：不要为了解全部能力而读完所有模块（含分片）；不要只为比较而读无关类目；`r`n")
     [void]$sb.Append("   找不到匹配模块就用自己的知识继续，不要凑数。`r`n`r`n")
     [void]$sb.Append("## 模块清单`r`n")
     [void]$sb.Append(($lines -join "`r`n"))
     [void]$sb.Append("`r`n")
     # 生成物断言：残留占位符就别写进用户配置（渲染没完成 / 拼接写错）
     [void](Assert-NoUnrendered $sb.ToString() ('菜单技能 ' + $MenuName))
-    return @($sb.ToString(), $one.Count)
+    return [pscustomobject]@{ Text = $sb.ToString(); Count = $one.Count; Sections = $sections; Threshold = $threshold }
 }
 
 function New-SkillMenu {
     # 生成 + 落盘（生成逻辑在 Get-SkillMenuText，它自己不写文件，-Check 才能只读比对）。
-    param([string]$Target, [string[]]$ModuleIds, [string]$CatFile, [string]$MenuName)
-    $gen = Get-SkillMenuText -Target $Target -ModuleIds $ModuleIds -CatFile $CatFile -MenuName $MenuName
+    # sections/ 每次整体对齐：缺的写、旧的改、多出来的删 —— 否则旧分片会一直指着已删模块。
+    param([string]$Target, [string[]]$ModuleIds, [string]$CatFile, [string]$MenuName,
+          [string]$RatingFile, [int]$ShardThreshold)
+    $gen = Get-SkillMenuText -Target $Target -ModuleIds $ModuleIds -CatFile $CatFile -MenuName $MenuName -RatingFile $RatingFile -ShardThreshold $ShardThreshold
     $menuDir = Assert-Writable $Target $MenuName
     New-Item -ItemType Directory -Force -Path $menuDir | Out-Null
-    Write-AtomicText (Join-Path $menuDir 'SKILL.md') ([string]$gen[0]) $Utf8NoBom
-    return [int]$gen[1]
+    Write-AtomicText (Join-Path $menuDir 'SKILL.md') ([string]$gen.Text) $Utf8NoBom
+    $secDir = Join-Path $menuDir 'sections'
+    foreach ($k in @($gen.Sections.Keys)) {
+        New-Item -ItemType Directory -Force -Path $secDir | Out-Null
+        Write-AtomicText (Join-Path $secDir $k) ([string]$gen.Sections[$k]) $Utf8NoBom
+    }
+    if (Test-Path -LiteralPath $secDir) {
+        foreach ($f in @(Get-ChildItem -LiteralPath $secDir -File -ErrorAction SilentlyContinue)) {
+            if (-not $gen.Sections.Contains($f.Name)) {
+                Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+    return [int]$gen.Count
 }
 
 function Get-ClientProcess {
@@ -1593,6 +1695,12 @@ if ($VersionMap.ContainsKey($PromptLeaf)) {
     $VersionKey   = $PromptLeaf
     $VersionLabel = $PromptLeaf
 }
+if ([string]::IsNullOrWhiteSpace($RatingFile)) {
+    $RatingFile = Join-Path $Base 'skill-ratings.json'
+}
+if ([string]::IsNullOrWhiteSpace($CatFile)) {
+    $CatFile = Join-Path $Base 'skill-categories.json'
+}
 if ([string]::IsNullOrWhiteSpace($SkillsSource)) {
     $SkillsSource = Join-Path $Base 'skills-v4'
 } else {
@@ -1785,22 +1893,37 @@ if ($Check) {
         }
     }
 
-    # L1c 生成物一致性：菜单技能是从技能库 + 类目表现场生成的，
+    # L1c 生成物一致性：菜单技能 + 分片清单都是从技能库 + 类目表 + 评分表现场生成的，
     # 库改了没重注入 → 模型看到的模块清单就是旧的（只读比对，不写文件）。
     $genOk = $true
     if ($state -and $state.skillMode -eq 'menu' -and $state.installedSkills) {
         $mName = if ($state.menuSkill) { [string]$state.menuSkill } else { 'pi-workbench-menu' }
-        $mPath = Join-Path (Join-Path $SkillsTarget $mName) 'SKILL.md'
+        $mDir = Join-Path $SkillsTarget $mName
+        $mPath = Join-Path $mDir 'SKILL.md'
         if (Test-Path -LiteralPath $mPath) {
             $ids = @($state.installedSkills | Where-Object { $_ -ne $mName })
-            $gen = Get-SkillMenuText -Target $SkillsTarget -ModuleIds $ids -CatFile (Join-Path $Base 'skill-categories.json') -MenuName $mName
-            $cur = Read-Utf8 $mPath
+            $gen = Get-SkillMenuText -Target $SkillsTarget -ModuleIds $ids -CatFile $CatFile -MenuName $mName -RatingFile $RatingFile -ShardThreshold $ShardThreshold
             # 只比内容不比行尾：手改过行尾不该被当成「过期」
-            $same = (($cur -replace "`r`n", "`n").TrimStart([char]0xFEFF) -eq (([string]$gen[0]) -replace "`r`n", "`n"))
-            if ($same) {
-                Say 'L1' ('生成物一致：菜单技能与当前技能库/类目表一致（列 ' + $gen[1] + ' 个模块）')
+            $same = (((Read-Utf8 $mPath) -replace "`r`n", "`n").TrimStart([char]0xFEFF) -eq (([string]$gen.Text) -replace "`r`n", "`n"))
+            $secBad = @()
+            $secDir = Join-Path $mDir 'sections'
+            foreach ($k in @($gen.Sections.Keys)) {
+                $fp = Join-Path $secDir $k
+                if (-not (Test-Path -LiteralPath $fp)) { $secBad += ($k + '(缺)'); continue }
+                if (((Read-Utf8 $fp) -replace "`r`n", "`n") -ne (([string]$gen.Sections[$k]) -replace "`r`n", "`n")) {
+                    $secBad += ($k + '(内容旧)')
+                }
+            }
+            if (Test-Path -LiteralPath $secDir) {
+                foreach ($f in @(Get-ChildItem -LiteralPath $secDir -File -ErrorAction SilentlyContinue)) {
+                    if (-not $gen.Sections.Contains($f.Name)) { $secBad += ($f.Name + '(多余)') }
+                }
+            }
+            if ($same -and $secBad.Count -eq 0) {
+                Say 'L1' ('生成物一致：菜单技能与当前技能库/类目表/评分表一致（列 ' + $gen.Count + ' 个模块，分片 ' + $gen.Sections.Count + ' 个）')
             } else {
-                Say 'WARN' '菜单技能已过期：技能库或类目表变过但未重注入（重跑一次部署即可刷新）'
+                if (-not $same) { Say 'WARN' '菜单技能已过期：技能库/类目表/评分表变过但未重注入（重跑一次部署即可刷新）' }
+                if ($secBad.Count -gt 0) { Say 'WARN' ('菜单分片不一致：' + ($secBad -join '、')) }
                 $genOk = $false
             }
         }
@@ -2426,8 +2549,7 @@ if ($RemoveAddons) {
             $stMenu = Read-Utf8 $StatePath | ConvertFrom-Json
             if ($stMenu.skillMode -eq 'menu' -and $stMenu.installedSkills) {
                 $ids = @($stMenu.installedSkills | Where-Object { $_ -ne $menuNameRm })
-                $rebuilt = New-SkillMenu -Target $SkillsTarget -ModuleIds $ids `
-                    -CatFile (Join-Path $Base 'skill-categories.json') -MenuName $menuNameRm
+                $rebuilt = New-SkillMenu -Target $SkillsTarget -ModuleIds $ids -CatFile $CatFile -MenuName $menuNameRm -RatingFile $RatingFile -ShardThreshold $ShardThreshold
                 Say 'INFO' ('菜单技能已按移除后的技能集重建（列 ' + $rebuilt + ' 个模块）')
             }
         } catch { Say 'WARN' '菜单技能重建失败（不影响移除结果）' }
@@ -3041,7 +3163,7 @@ if (-not $NoSkills) {
         } else {
             Register-Rollback $menuDest 'delete' '' $false
         }
-        $MenuModules = New-SkillMenu -Target $SkillsTarget -ModuleIds $menuable -CatFile (Join-Path $Base 'skill-categories.json') -MenuName $MenuSkillName
+        $MenuModules = New-SkillMenu -Target $SkillsTarget -ModuleIds $menuable -CatFile $CatFile -MenuName $MenuSkillName -RatingFile $RatingFile -ShardThreshold $ShardThreshold
         if ($MenuModules -gt 0) {
             if ($installedSkills -notcontains $MenuSkillName) { $installedSkills += $MenuSkillName }
             $keepNote = if ($keep.Count -gt 0) { '，' + $keep.Count + ' 个保持进提示词' } else { '' }

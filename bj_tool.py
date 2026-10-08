@@ -28,8 +28,8 @@ from PySide6.QtWidgets import (
 
 APP_NAME = 'pi用学习工作台'
 APP_SUBTITLE = 'PiDeck / DeepSeek Harness 一键部署 · 注入即用 · 卸载即还原'
-APP_VERSION = 'V1.4.1'
-APP_BUILD = '2026-10-08 · v1.4.1 目录/编辑按钮修复（系统外壳委派 + 应用内编辑器）+ onedir 便携发布'
+APP_VERSION = 'V1.4.2'
+APP_BUILD = '2026-10-08 · v1.4.2 技能菜单：评分列 + 类目分片（为技能库规模化做准备）'
 
 _ACTIVE_WINDOW = None
 _THEME_FILTER = None      # 系统主题监听器：必须持引用，否则可能被 GC 后悬垂
@@ -1819,8 +1819,8 @@ def tour_steps(page_index, win):
              'title': '② 搜索与筛选', 'text': '搜技能名；筛选可看「启用 / 已禁用 / 本工具部署」。'},
             {'target': lambda: getattr(sk, '_import_btn', None),
              'title': '③ 导入技能', 'text': '从文件夹或 zip 导入：支持技能集合（一包多技能）与带一层包装的压缩包，同名会报出来并先备份。'},
-            {'target': lambda: getattr(sk, '_table', None),
-             'title': '④ 列表', 'text': '「禁用」是把技能移出扫描路径（skills-disabled），随时可移回，不删文件。'},
+            {'target': lambda: getattr(sk, '_scroll', None),
+             'title': '④ 卡片列表', 'text': '一技能一张卡：卡上的开关就是「禁用/启用」（移出 / 移回 skills-disabled，不删文件），卡上还有目录、编辑、删除。'},
         ]
     if page_index == 3:
         return [

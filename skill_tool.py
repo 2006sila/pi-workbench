@@ -19,6 +19,10 @@
   py -X utf8 skill_tool.py register <技能名> --category <类目>    # 只改登记，不动文件
   py -X utf8 skill_tool.py remove <技能名> [--yes]               # 移到 skills-v4/_removed/
   py -X utf8 skill_tool.py new-category <类目名> --when "<何时进这类>"
+  py -X utf8 skill_tool.py rate --seed               # 按可测量信号生成评分表（菜单排序列）
+  py -X utf8 skill_tool.py rate --list               # 看评分与分片阈值
+  py -X utf8 skill_tool.py rate --set <技能> <1-10>  # 人工评分（--seed 不覆盖它）
+  py -X utf8 skill_tool.py rate --check              # 校验评分覆盖（可进 CI）
 
 退出码：0 正常；1 体检发现问题；2 参数或校验不通过。
 """
@@ -48,6 +52,8 @@ INJECT_PATH = os.path.join(ROOT, 'inject.ps1')
 BJTOOL_PATH = os.path.join(ROOT, 'bj_tool.py')
 README_PATH = os.path.join(ROOT, 'README.md')
 REMOVED_DIR = os.path.join(SKILLS_DIR, '_removed')
+RATINGS_PATH = os.path.join(ROOT, 'skill-ratings.json')
+DEFAULT_SHARD_THRESHOLD = 12      # 类目内超过这么多个模块，菜单就把它拆到 sections/<类目>.md
 
 # Agent Skills 规范 / Pi 文档里的硬规则
 NAME_MAX = 64
@@ -911,6 +917,14 @@ def cmd_contract(args):
     if 'GPL-3.0' in json.dumps(c, ensure_ascii=False) and not (c.get('cleanroom')):
         errors.append('契约里提到了第三方许可证，但没写 cleanroom 溯源段')
 
+    # ③ 评分表：随包（菜单排序列 + 分片阈值），缺覆盖只提示不拦 —— 缺了菜单就少一列
+    ratings, shard_threshold, _manual = load_ratings()
+    rated = [n for n in disk if n in ratings]
+    if not os.path.isfile(RATINGS_PATH):
+        warnings.append('缺 skill-ratings.json：菜单少一列评分（跑 skill_tool.py rate --seed 生成）')
+    elif len(rated) < len(disk):
+        warnings.append('评分表未覆盖 %d 个技能：菜单里它们不带【x/10】' % (len(disk) - len(rated)))
+
     print('契约：%s（schema %s / 版本 %s）' % (os.path.relpath(CONTRACT_PATH, ROOT), c.get('schema'), c.get('version')))
     print('  随包资源      %d 项（磁盘齐全 %d / 已进 DATAS %d）'
           % (len(resources), len(resources) - len(missing), len(resources) - len(uncovered)))
@@ -918,6 +932,8 @@ def cmd_contract(args):
           % (len(disk), lib.get('minSkills'), ncat))
     print('  模板          %d 个引用件 ｜ 合成版本 %d ｜ 独立版本 %d ｜ 锚定串 %d 个模板'
           % (len(referenced), len(composed), len(standalone), len(anchors)))
+    print('  评分          已评 %d/%d ｜ 类目内超过 %d 个模块就分片'
+          % (len(rated), len(disk), shard_threshold))
     print('  目标端        %s' % '、'.join(t.get('label') or t.get('key') or '?' for t in c.get('targets') or []))
     print('  退出码        %s' % '、'.join(sorted((c.get('exitCodes') or {}).keys())))
     print('  溯源          %s' % '、'.join('%s %s (%s/%s)' % (k, str(v.get('commit', ''))[:7], v.get('license'), v.get('mode'))
@@ -930,6 +946,158 @@ def cmd_contract(args):
     print()
     print('结论：%s' % ('契约与仓库一致' if not errors else '不一致（%d 个错误）' % len(errors)))
     return 1 if errors else 0
+
+
+# ---------------------------------------------------------------- 评分（菜单排序用）
+
+def rating_signals(d):
+    """按**可测量信号**给一个技能打分（自足度，不是质量论断）。
+
+    公式（同步写进 skill-ratings.json 的 formula 字段，可复算）：
+      base 5
+      +1 有 references/ 目录      —— 自带分片资料，不必全靠模型知识
+      +1 带可执行脚本             —— 能直接跑，不只是说明文字
+      +1 description >= 80 字符   —— 路由信息足够长
+      +1 正文 >= 2500 字符        —— 有实质内容
+      +1 正文含围栏代码块         —— 有可复用命令
+    结果夹在 1..10。它只解决「同一类目里多个模块都命中时先看谁」，
+    不代替人（或 AI）对模块强弱的判断 —— 后者用 rate --set 覆盖。
+    """
+    sk = os.path.join(d, 'SKILL.md')
+    text = read(sk) if os.path.isfile(sk) else ''
+    fm, body = parse_frontmatter(text)
+    desc = fm_value(fm, 'description')
+    score, sig = 5, []
+    if os.path.isdir(os.path.join(d, 'references')):
+        score += 1
+        sig.append('references')
+    if any(fn.lower().endswith(('.py', '.ps1', '.sh', '.js', '.mjs', '.cmd', '.bat'))
+           for _dp, _dn, fns in os.walk(d) for fn in fns):
+        score += 1
+        sig.append('scripts')
+    if len(desc) >= 80:
+        score += 1
+        sig.append('desc>=80')
+    if len(body) >= 2500:
+        score += 1
+        sig.append('body>=2500')
+    if (chr(96) * 3) in body:      # 围栏代码块：避免在源码里写三个反引号
+        score += 1
+        sig.append('code')
+    return max(1, min(10, score)), sig
+
+
+def load_ratings():
+    """返回 (ratings, threshold, manual)。文件缺失/损坏时给空表与默认阈值（菜单照样生成）。"""
+    if not os.path.isfile(RATINGS_PATH):
+        return {}, DEFAULT_SHARD_THRESHOLD, []
+    try:
+        j = json.loads(read(RATINGS_PATH))
+    except Exception:
+        return {}, DEFAULT_SHARD_THRESHOLD, []
+    return (dict(j.get('ratings') or {}),
+            int(j.get('shardThreshold') or DEFAULT_SHARD_THRESHOLD),
+            list(j.get('manual') or []))
+
+
+def write_ratings(ratings, threshold, manual):
+    data = {
+        'schema': 1,
+        'note': '模块评分与菜单分片阈值。评分只用于「同一类目里多个模块都命中」时的排序：'
+                '匹配度 → 评分 → 索引序。它是**可测量的自足度**（见 formula），不是质量论断；'
+                '人工/AI 改过的条目记在 manual 里，重跑 rate --seed 不会覆盖它们。',
+        'formula': 'base 5 + references/+1 + scripts/+1 + desc>=80字符/+1 + 正文>=2500字符/+1 + 含代码块/+1（夹在 1..10）',
+        'shardThreshold': threshold,
+        'manual': sorted(manual),
+        'ratings': {k: ratings[k] for k in sorted(ratings)},
+    }
+    tmp = RATINGS_PATH + '.tmp'
+    with open(tmp, 'w', encoding='utf-8', newline='\n') as fh:
+        fh.write(json.dumps(data, ensure_ascii=False, indent=2) + '\n')
+    os.replace(tmp, RATINGS_PATH)
+
+
+def _library_modules():
+    return [x for x in sorted(os.listdir(SKILLS_DIR)) if not x.startswith('_')
+            and os.path.isfile(os.path.join(SKILLS_DIR, x, 'SKILL.md'))] if os.path.isdir(SKILLS_DIR) else []
+
+
+def cmd_rate(args):
+    """评分表维护：--seed 生成 / --set 人工覆盖 / --list 查看 / --check 校验覆盖。"""
+    ratings, threshold, manual = load_ratings()
+    disk = _library_modules()
+
+    if args.threshold is not None:
+        if args.threshold < 1:
+            print('✗ 分片阈值要 >= 1')
+            return 2
+        threshold = args.threshold
+
+    if args.set:
+        name, value = args.set
+        if name not in disk:
+            print('✗ 技能库里没有 %s' % name)
+            return 2
+        try:
+            v = int(value)
+        except ValueError:
+            v = 0
+        if not 1 <= v <= 10:
+            print('✗ 评分要 1..10 的整数')
+            return 2
+        ratings[name] = v
+        if name not in manual:
+            manual.append(name)
+        write_ratings(ratings, threshold, manual)
+        print('已记 %s = %d/10（manual，--seed 不会覆盖）' % (name, v))
+        return 0
+
+    if args.seed:
+        if args.force:
+            ratings, manual = {}, []
+        computed = []
+        for n in disk:
+            if n in manual and n in ratings:
+                continue
+            v, sig = rating_signals(os.path.join(SKILLS_DIR, n))
+            ratings[n] = v
+            computed.append((v, n, sig))
+        for n in list(ratings):
+            if n not in disk:
+                del ratings[n]                  # 技能已移除 → 评分表跟着瘦身
+        write_ratings(ratings, threshold, manual)
+        computed.sort(key=lambda r: (-r[0], r[1]))
+        for v, n, sig in computed[:args.limit]:
+            print('  %2d/10  %-34s %s' % (v, n, ','.join(sig) or '-'))
+        if len(computed) > args.limit:
+            print('  … 其余 %d 条略（--limit 调大即可看全）' % (len(computed) - args.limit))
+        hist = {}
+        for v in ratings.values():
+            hist[v] = hist.get(v, 0) + 1
+        print('评分表：%s（%d 条：%s）' % (os.path.relpath(RATINGS_PATH, ROOT), len(ratings),
+                                      ' '.join('%d分%d个' % (k, hist[k]) for k in sorted(hist))))
+        if manual:
+            print('保留人工评分 %d 条（--force 可一并重算）' % len(manual))
+        print('分片阈值：类目内超过 %d 个模块 → 拆到 sections/<类目>.md，菜单只留一行指针' % threshold)
+        return 0
+
+    if args.check:
+        missing = [n for n in disk if n not in ratings]
+        extra = [n for n in ratings if n not in disk]
+        print('评分覆盖 %d/%d ｜ 分片阈值 >%d' % (len(disk) - len(missing), len(disk), threshold))
+        if missing:
+            print('  缺评分：%s%s' % ('、'.join(missing[:10]), ' …' if len(missing) > 10 else ''))
+        if extra:
+            print('  表里有多余条目（技能已不在库）：%s' % '、'.join(extra[:10]))
+        return 1 if (missing or extra) else 0
+
+    rows = sorted(((ratings.get(n, 0), n) for n in disk), key=lambda r: (-r[0], r[1]))
+    for v, n in rows[:args.limit]:
+        print('  %s  %s' % (('%2d/10' % v) if v else '  --  ', n))
+    if len(rows) > args.limit:
+        print('  … 其余 %d 条略' % (len(rows) - args.limit))
+    print('共 %d 个技能 ｜ 分片阈值 >%d' % (len(disk), threshold))
+    return 0
 
 
 def cmd_pack(args):
@@ -1516,6 +1684,16 @@ def main():
     p.add_argument('skill', nargs='+')
     p.add_argument('--yes', action='store_true')
     p.set_defaults(func=cmd_remove)
+
+    p = sub.add_parser('rate', help='模块评分表（菜单排序列 + 分片阈值）：--seed / --set / --list / --check')
+    p.add_argument('--seed', action='store_true', help='按可测量信号生成（保留人工评分）')
+    p.add_argument('--force', action='store_true', help='--seed 时连人工评分一起重算')
+    p.add_argument('--set', nargs=2, metavar=('技能名', '分'), help='人工指定 1..10（记入 manual，--seed 不覆盖）')
+    p.add_argument('--list', action='store_true', help='列出评分')
+    p.add_argument('--check', action='store_true', help='校验覆盖（缺失/多余退出码 1）')
+    p.add_argument('--threshold', type=int, help='菜单分片阈值（类目内超过就拆文件）')
+    p.add_argument('--limit', type=int, default=25, help='最多显示多少行（默认 25）')
+    p.set_defaults(func=cmd_rate)
 
     p = sub.add_parser('new-category', help='新增一个类目')
     p.add_argument('name')

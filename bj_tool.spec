@@ -19,6 +19,7 @@ DATAS = [
     ('inject-dsh.ps1', '.'),
     ('app.ico', '.'),
     ('skill-categories.json', '.'),
+    ('skill-ratings.json', '.'),
     ('prompts', 'prompts'),
     ('skills-v4', 'skills-v4'),
 ]
