@@ -96,7 +96,7 @@ $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 
 $TOOL_TAG  = 'pi-workbench'
-$TOOL_VER  = '1.4.0'
+$TOOL_VER  = '1.4.1'
 # 标记块分成「关键串 + 版本载荷」两段。定位只认关键串（$MARK_KEY_*），
 # 版本号只是载荷 —— 这样升级标记（v4 → v5）、或者历史上写过带别的东西的块
 #（旧版 install 脚本的 `BEGIN prompt=x.md` / `BEGIN pack=xxx`），
@@ -177,7 +177,7 @@ $TARGETS = @{
         )
         # 安装路径探测用的匹配式（注册表 DisplayName / 快捷方式名）。
         # 只靠写死的 ExeHints 不够：用户完全可以把 PiDeck 装到 D:\Agent\PiDeck（实测就是）。
-        RegPattern      = '*PiDeck*'
+        RegPattern      = 'PiDeck'
         ShortcutPattern = '*PiDeck*'
         # 通道体检用的 CLI：PiDeck 桌面端不能跑无头，但 pi CLI 读的是同一个配置根。
         ProbeCli    = @('pi.cmd', 'pi')
@@ -190,7 +190,9 @@ $TARGETS = @{
         AgentDir    = $DshHomeDir[0]
         AgentDirSource = $DshHomeDir[1]
         PromptName  = 'AGENTS.md'
-        ProcNames   = @('DeepSeek Harness', 'DeepSeekHarness', 'deepseek-harness', 'dsh')
+        # 实机（NSIS 装 'DSH NEXT'）：进程名是可执行文件名本身，不是产品名 ——
+        # 只按产品名找会漏掉正在跑的客户端，部署时误报「未运行，下次启动即生效」。
+        ProcNames   = @('DSH NEXT', 'DeepSeek Harness', 'DeepSeekHarness', 'deepseek-harness', 'dsh')
         ProbeFiles  = @(
             (Join-Path $DshHomeDir[0] 'settings.yaml'),
             (Join-Path $DshHomeDir[0] 'cordis.patch.yml')
@@ -200,7 +202,9 @@ $TARGETS = @{
             (Join-Path $env:ProgramFiles 'DeepSeek Harness\DeepSeek Harness.exe'),
             (Join-Path $env:LOCALAPPDATA 'Programs\dsh\dsh.exe')
         )
-        RegPattern      = '*DeepSeek Harness*'
+        # DSH NEXT 的注册表 DisplayName / 安装目录 / 进程名都不含 "DeepSeek Harness"（实测），
+        # 注册表匹配式必须带上 DSH 才能抓到 NSIS 写的 DisplayIcon。
+        RegPattern      = 'DeepSeek Harness|DSH'
         ShortcutPattern = '*DeepSeek*'
         ProbeCli    = @('dsh.cmd', 'dsh')
     }
@@ -228,7 +232,20 @@ if (-not [string]::IsNullOrWhiteSpace($AgentDir)) {
 }
 
 $Base       = $PSScriptRoot
-$WorkRoot   = Join-Path $env:LOCALAPPDATA $TOOL_TAG
+# 数据根与 GUI（bj_tool.py）同一契约：
+#   1. $env:PJ_WORK_ROOT 显式指定（GUI 便携模式传入）—— 优先；
+#   2. 否则 %LOCALAPPDATA%\pi-workbench（历史行为）。
+# 不在这里重做「exe 目录可写」探测：GUI 已探过并把结果写进 PJ_WORK_ROOT；
+# 单独跑 CLI 时没有 GUI，沿用 LOCALAPPDATA 是安全默认。
+$Script:PortableRootNote = ''
+if (-not [string]::IsNullOrWhiteSpace($env:PJ_WORK_ROOT)) {
+    $WorkRoot   = $env:PJ_WORK_ROOT
+    # Say 在 273 行才定义（PS 自上而下执行），此刻调用会报「not recognized」。
+    # 先记下，函数定义后立刻补发。
+    $Script:PortableRootNote = '便携数据根（PJ_WORK_ROOT）: ' + $WorkRoot
+} else {
+    $WorkRoot   = Join-Path $env:LOCALAPPDATA $TOOL_TAG
+}
 $StateDir   = Join-Path $WorkRoot 'state'
 $BackupRoot = Join-Path $WorkRoot 'backup'
 $LogDir     = Join-Path $WorkRoot 'logs'
@@ -261,6 +278,8 @@ function Say([string]$Level, [string]$Message) {
     Write-Output $line
     [void]$Script:Report.Add($line)
 }
+
+if ($Script:PortableRootNote) { Say 'INFO' $Script:PortableRootNote }
 
 function Emit-PlanItem([string]$Key, [string]$Label) {
     # 计划行：动手之前把「待办清单」一次性发完。
@@ -670,26 +689,49 @@ function Write-AtomicText([string]$Path, [string]$Text, $Enc) {
     # 原子写：先写同目录的临时文件，再替换目标。
     # 直接 WriteAllText 覆写时，进程写到一半被杀会留下半截文件 ——
     # 这条路径真实可达：GUI 退出时会 taskkill 整棵进程树。
+    #
+    # 实测（2026-10-08，.dsh 部署报「未能找到文件 ...tmp」）：带点前缀的 .tmp
+    # 在写入与 Replace 之间的窗口里会被外部清掉（DSH 客户端对配置目录有
+    # watcher，会清理陌生的带点临时文件），Replace 拿不到 tmp 直接抛
+    # FileNotFoundException。对策：
+    #   1. tmp 不带点前缀（watcher 的清理目标主要是隐藏形态的临时文件）；
+    #   2. Replace/Move 失败且 tmp 消失时，换新 tmp 重试一次；
+    #   3. 仍失败则直接 WriteAllText 覆写目标 —— 牺牲原子性保住部署
+    #      （半截文件风险只剩「写到一半被 taskkill」这一种，可接受）。
     $dir = Split-Path -Parent $Path
     if ([string]::IsNullOrEmpty($dir)) { $dir = '.' }
     if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
-    $tmp = Join-Path $dir ('.' + (Split-Path -Leaf $Path) + '.' + [guid]::NewGuid().ToString('N') + '.tmp')
-    try {
-        [System.IO.File]::WriteAllText($tmp, $Text, $Enc)
-        if (Test-Path -LiteralPath $Path) {
-            [System.IO.File]::Replace($tmp, $Path, $null)
-        } else {
-            [System.IO.File]::Move($tmp, $Path)
-        }
-    } catch {
-        # Replace 在部分卷（网络盘、某些虚拟盘）上会不可用，回退成覆盖拷贝
+    $leaf = Split-Path -Leaf $Path
+    $lastErr = $null
+    for ($attempt = 0; $attempt -lt 2; $attempt++) {
+        $tmp = Join-Path $dir ($leaf + '.' + [guid]::NewGuid().ToString('N') + '.tmp')
         try {
-            [System.IO.File]::Copy($tmp, $Path, $true)
-        } catch {
+            [System.IO.File]::WriteAllText($tmp, $Text, $Enc)
+            if (Test-Path -LiteralPath $Path) {
+                try {
+                    [System.IO.File]::Replace($tmp, $Path, $null)
+                } catch {
+                    # 部分卷不支持 Replace，或 tmp 被外部清掉 —— 回退覆盖拷贝
+                    [System.IO.File]::Copy($tmp, $Path, $true)
+                }
+            } else {
+                [System.IO.File]::Move($tmp, $Path)
+            }
             if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
-            throw
+            return
+        } catch {
+            $lastErr = $_.Exception
+            if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+            # tmp 还在 → 是 Replace/Copy 本身的问题，重试也没用，直接跳出
+            if (Test-Path -LiteralPath $tmp) { break }
+            # tmp 消失（被外部清理）→ 换新 tmp 重试一次
         }
-        if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+    }
+    # 最终兜底：直接覆写目标（非原子）。连这都失败就把原始异常抛出去。
+    try {
+        [System.IO.File]::WriteAllText($Path, $Text, $Enc)
+    } catch {
+        throw $lastErr
     }
 }
 
@@ -1192,6 +1234,16 @@ function Get-ClientProcess {
         $p = @(Get-Process -Name $n -ErrorAction SilentlyContinue)
         if ($p.Count -gt 0) { $found += $p }
     }
+    if ($found.Count -eq 0 -and $T.RegPattern) {
+        # 兜底：按进程名找不中时，改按可执行文件路径匹配产品词（RegPattern，正则）。
+        # 客户端改产品名（如 'DeepSeek Harness' -> 'DSH NEXT'）就不用再改 ProcNames ——
+        # 这次的事故正是这种形态。只读探测，不写不杀，误报代价为零。
+        foreach ($p in (Get-Process -ErrorAction SilentlyContinue)) {
+            try {
+                if ($p.Path -and ($p.Path -match $T.RegPattern)) { $found += $p }
+            } catch { }
+        }
+    }
     return $found
 }
 
@@ -1216,14 +1268,16 @@ function Get-ExeFromRegistry([string]$Pattern) {
         $items = @()
         try { $items = @(Get-ItemProperty -Path $root -ErrorAction SilentlyContinue) } catch { }
         foreach ($it in $items) {
-            if (-not $it.DisplayName -or ([string]$it.DisplayName -notlike $Pattern)) { continue }
+            # -match + 正则：一个匹配式要同时容纳多个产品名（如 'DSH NEXT' 与 'DeepSeek Harness'），
+            # -like 不支持 | 交替，写 '*A*|*B*' 会静默匹配不到任何项。
+            if (-not $it.DisplayName -or ([string]$it.DisplayName -notmatch $Pattern)) { continue }
             $cands = @()
             if ($it.DisplayIcon) {
                 $cands += (([string]$it.DisplayIcon) -replace ',\s*\d+\s*$', '').Trim().Trim('"')
             }
             if ($it.InstallLocation) {
                 $loc = ([string]$it.InstallLocation).Trim().Trim('"')
-                foreach ($nm in @('PiDeck.exe', 'DeepSeek Harness.exe', 'dsh.exe')) { $cands += (Join-Path $loc $nm) }
+                foreach ($nm in @('PiDeck.exe', 'DeepSeek Harness.exe', 'DSH NEXT.exe', 'dsh.exe')) { $cands += (Join-Path $loc $nm) }
             }
             foreach ($c in $cands) {
                 if ($c -and (Test-Path -LiteralPath $c -PathType Leaf)) { return $c }
@@ -1904,11 +1958,13 @@ if ($Probe) {
         Say 'WARN' ('通道预检没过，已跳过模型调用：' + ($pre -join '；'))
         $probeOk = $false
     } elseif (-not $cli) {
+        # 找不到 CLI ≠ 部署失效：桌面端安装本来就带不出 CLI（无头模式没有命令行入口），
+        # 这时加载层已经通过，只差模型侧人工确认。记 unrun 但不再拉低体检结论 ——
+        # 旧写法把 PARTIAL/exit 1 当默认结局，用户每次都以为出了故障。
         $easy = if ($T.ProbeCli) { [string]$T.ProbeCli[0] } else { 'pi' }
         $record.status = 'unrun'
-        $record.detail = '未执行：找不到客户端 CLI。手动体检命令：' + $easy + ' --print "' + $question + '"'
-        Say 'WARN' $record.detail
-        $probeOk = $false
+        $record.detail = '未执行：找不到客户端 CLI（桌面端无命令行入口属预期）。手动体检命令：' + $easy + ' --print "' + $question + '"'
+        Say 'INFO' $record.detail
     } else {
         $record.cli = [string]$cli
         Say 'INFO' ('通道体检：真跑 ' + $cli + '（一次模型调用，超时 ' + $ProbeTimeout + 's）…')
@@ -1984,6 +2040,7 @@ if ($Probe) {
     Finish 'PARTIAL'
     exit 1
 }
+
 
 # ---------------------------------------------------------------- 客户端路径探测（-FindExe）
 

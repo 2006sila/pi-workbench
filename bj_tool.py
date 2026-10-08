@@ -28,8 +28,8 @@ from PySide6.QtWidgets import (
 
 APP_NAME = 'pi用学习工作台'
 APP_SUBTITLE = 'PiDeck / DeepSeek Harness 一键部署 · 注入即用 · 卸载即还原'
-APP_VERSION = 'V1.4'
-APP_BUILD = '2026-09-30 · v1.4 标记升级兼容 + 备份保留 + 进程树回收 + 自我部署'
+APP_VERSION = 'V1.4.1'
+APP_BUILD = '2026-10-08 · v1.4.1 目录/编辑按钮修复（系统外壳委派 + 应用内编辑器）+ onedir 便携发布'
 
 _ACTIVE_WINDOW = None
 _THEME_FILTER = None      # 系统主题监听器：必须持引用，否则可能被 GC 后悬垂
@@ -132,6 +132,19 @@ def write_json(path, obj):
     tmp = path + '.tmp'
     with open(tmp, 'w', encoding='utf-8') as fh:
         json.dump(obj, fh, ensure_ascii=False, indent=2)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+
+
+def write_text_atomic(path, text):
+    """原子写文本：先写同目录临时文件再 os.replace，保存中途不会留下半截技能文件。"""
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    tmp = path + '.tmp'
+    with open(tmp, 'w', encoding='utf-8', newline='') as fh:
+        fh.write(text)
         fh.flush()
         os.fsync(fh.fileno())
     os.replace(tmp, path)
@@ -311,11 +324,15 @@ TARGETS = [
                  '作为持久 user 消息（<system-reminder>）注入提示词；技能走 $DSH_HOME/skills。'
                  '另写一层 home 级 cordis.patch.yml，把 agent-instructions 的 maxBytes '
                  '预算抬到能装下完整指令集（预算不足时 dsh 会整份丢弃 AGENTS.md）。'),
-        'procs': ['DeepSeek Harness', 'DeepSeekHarness', 'deepseek-harness', 'dsh'],
+        # 实机（NSIS 装 'DSH NEXT'）：进程名是可执行文件名本身，不是产品名。
+        'procs': ['DSH NEXT', 'DeepSeek Harness', 'DeepSeekHarness', 'deepseek-harness', 'dsh'],
         'exe_hints': [
             os.path.join(os.environ.get('LOCALAPPDATA', ''), 'Programs', 'DeepSeek Harness', 'DeepSeek Harness.exe'),
             os.path.join(os.environ.get('ProgramFiles', ''), 'DeepSeek Harness', 'DeepSeek Harness.exe'),
             os.path.join(os.environ.get('LOCALAPPDATA', ''), 'Programs', 'dsh', 'dsh.exe'),
+            # 实机 NSIS 安装目录名就是 'DSH NEXT'（可在任意盘，注册表探测兜底）。
+            os.path.join(os.environ.get('ProgramFiles', ''), 'DSH NEXT', 'DSH NEXT.exe'),
+            os.path.join('D:\\Agent', 'DSH NEXT', 'DSH NEXT.exe'),
         ],
     },
 ]
@@ -481,7 +498,43 @@ def home_dir():
     return os.environ.get('USERPROFILE') or os.path.expanduser('~')
 
 
+def _portable_root():
+    """全便携模式的数据根：exe 同级的 data\ 目录。
+
+    判定（按顺序，命中即用）：
+      1. 环境变量 PJ_WORK_ROOT（GUI 与注入子进程的显式通道）；
+      2. frozen 且 exe 所在目录可写 → 在 exe 同级建/用 data\；
+      3. exe 目录不可写（如装进 Program Files）→ 返回 None，回落 LOCALAPPDATA。
+    以「exe 目录可写」为准的原因：拷到 U 盘 / 别的机器 / 用户目录，天然可写，
+    自动就是便携；装进受保护目录，自动回落，两种形态都不需要用户做任何选择。
+    """
+    env = os.environ.get('PJ_WORK_ROOT')
+    if env:
+        return env
+    if getattr(sys, 'frozen', False):
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        cand = os.path.join(exe_dir, 'data')
+        try:
+            os.makedirs(cand, exist_ok=True)
+            probe = os.path.join(cand, '.write_probe')
+            with open(probe, 'w') as fh:
+                fh.write('x')
+            os.remove(probe)
+            return cand
+        except OSError:
+            return None
+    return None
+
+
+def repr_escaped(path):
+    """PS 单引号字符串字面量：内部单引号翻倍。"""
+    return "'" + str(path).replace("'", "''") + "'"
+
+
 def work_root():
+    portable = _portable_root()
+    if portable:
+        return portable
     base = os.environ.get('LOCALAPPDATA') or os.path.expanduser('~')
     return os.path.join(base, 'pi-workbench')
 
@@ -777,14 +830,90 @@ def kill_procs(names):
     return killed
 
 
-def open_in_explorer(path):
+def _external_process_env():
+    """Start system GUI programs without PyInstaller, Python, or Qt runtime paths."""
+    env = os.environ.copy()
+    for key in list(env):
+        upper = key.upper()
+        if upper.startswith(('PYTHON', 'PYI_', 'QT_', 'QML', 'SHIBOKEN')):
+            env.pop(key, None)
+    windir = env.get('WINDIR', r'C:\Windows')
+    env['PATH'] = os.pathsep.join((
+        os.path.join(windir, 'System32'), windir,
+        os.path.join(windir, 'System32', 'Wbem'),
+        os.path.join(windir, 'System32', 'WindowsPowerShell', 'v1.0')))
+    return env
+
+
+def _shell_start(path):
+    """交给已在运行的系统外壳打开（ShellExecute），不新建 explorer.exe 进程。
+
+    实测：直接 CreateProcess 启动 explorer.exe 在本机必然以 0xC0000142
+    （STATUS_DLL_INIT_FAILED）崩溃并弹「应用程序错误」对话框；改走系统外壳则正常。
+    """
     try:
-        if IS_WINDOWS and os.path.exists(path):
-            os.startfile(path)  # noqa: S606
-        else:
-            QDesktopServices.openUrl(QUrl.fromLocalFile(path))
-    except Exception:
-        pass
+        os.startfile(path)      # noqa: S606
+        return True, ''
+    except OSError as e:
+        return False, str(e)
+
+
+def _shell_reveal(path):
+    """请已在运行的资源管理器窗口打开目录（SHOpenFolderAndSelectItems，进程内调用）。"""
+    if not IS_WINDOWS:
+        return False, ''
+    try:
+        import ctypes
+        from ctypes import wintypes
+        ole32 = ctypes.WinDLL('ole32')
+        shell32 = ctypes.WinDLL('shell32')
+        hr = ole32.CoInitializeEx(None, 2)          # COINIT_APARTMENTTHREADED
+        owns_com = hr in (0, 1)                     # S_OK / S_FALSE
+        try:
+            pidl = ctypes.c_void_p()
+            attrs = wintypes.DWORD()
+            shell32.SHParseDisplayName.argtypes = (
+                ctypes.c_wchar_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p),
+                ctypes.c_ulong, ctypes.POINTER(wintypes.DWORD))
+            shell32.SHParseDisplayName.restype = ctypes.c_long
+            r = shell32.SHParseDisplayName(os.path.abspath(path), None,
+                                           ctypes.byref(pidl), 0, ctypes.byref(attrs))
+            if r != 0 or not pidl.value:
+                return False, '无法解析目录路径（0x%08X）' % (r & 0xFFFFFFFF)
+            shell32.SHOpenFolderAndSelectItems.argtypes = (
+                ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_ulong)
+            shell32.SHOpenFolderAndSelectItems.restype = ctypes.c_long
+            r2 = shell32.SHOpenFolderAndSelectItems(pidl, 0, None, 0)
+            ole32.CoTaskMemFree(pidl)
+            if r2 == 0:
+                return True, ''
+            return False, '资源管理器未接受请求（0x%08X）' % (r2 & 0xFFFFFFFF)
+        finally:
+            if owns_com:
+                ole32.CoUninitialize()
+    except Exception as e:
+        return False, str(e)
+
+
+def open_in_explorer(path):
+    """打开目录：只请系统外壳/已运行的资源管理器处理，绝不直接启动 explorer.exe。"""
+    try:
+        if not os.path.exists(path):
+            return False, '目录不存在：' + path
+        path = os.path.abspath(path)
+        if IS_WINDOWS:
+            tried = []
+            for label, fn in (('系统外壳', _shell_start), ('资源管理器窗口', _shell_reveal)):
+                ok, detail = fn(path)
+                if ok:
+                    return True, ''
+                tried.append(label + '：' + (detail or '失败'))
+            return False, '；'.join(tried)
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(path)):
+            return False, '系统未能打开目录：' + path
+        return True, ''
+    except Exception as e:
+        return False, str(e)
 
 
 # ------------------------------------------------------------------ 免责声明
@@ -1138,11 +1267,17 @@ class Runner(QThread):
 
     def run(self):
         dec = codecs.getincrementaldecoder('utf-8')('replace')
+        # 全便携模式：把数据根传给注入子进程，两边（GUI/PS）落同一份 state/backup/logs。
+        env = None
+        pr = _portable_root()
+        if pr:
+            env = dict(os.environ)
+            env['PJ_WORK_ROOT'] = pr
         try:
             self._proc = subprocess.Popen(
                 self._argv,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                creationflags=CREATE_NO_WINDOW, bufsize=0,
+                creationflags=CREATE_NO_WINDOW, bufsize=0, env=env,
             )
         except Exception as e:
             self.line.emit('[!] 无法启动 PowerShell: ' + str(e))
@@ -2785,6 +2920,41 @@ class TemplatePage(Page):
 
 # ------------------------------------------------------------------ 技能页
 
+class SkillCard(QFrame):
+    # 技能卡片容器：点空白处选中技能；按钮/开关等子控件自己收事件。
+    # 之前用 card.mousePressEvent = lambda 的实例级覆写 + 定宽按钮，实测按钮
+    # 显示裁字且点击无响应 —— 统一改成类级覆写：只在命中点不是子控件时才选中，
+    # 并给按钮专用紧凑样式（ghost 的 0 14px 内边距会把 44px 定宽的文字区压到
+    # 16px，两个汉字叠成墨块）。
+
+    clicked = Signal(str)
+
+    def __init__(self, name, parent=None):
+        super().__init__(parent)
+        self._name = name
+        self.setObjectName('skillCard')
+        self.setCursor(Qt.PointingHandCursor)
+
+    def name(self):
+        return self._name
+
+    def mousePressEvent(self, ev):
+        # 命中点落在交互子控件（开关/按钮）上时不抢事件；QLabel 等非交互控件按空白处理。
+        from PySide6.QtWidgets import QAbstractButton
+        pos = ev.position().toPoint() if hasattr(ev, 'position') else ev.pos()
+        child = self.childAt(pos)
+        interactive = False
+        while child is not None:
+            if isinstance(child, QAbstractButton):
+                interactive = True
+                break
+            parent = child.parentWidget()
+            child = parent if parent is not self else None
+        if not interactive:
+            self.clicked.emit(self._name)
+        super().mousePressEvent(ev)
+
+
 class SkillFilterChip(QPushButton):
     def __init__(self, text, parent=None):
         super().__init__(text, parent)
@@ -2798,6 +2968,321 @@ class SkillFilterChip(QPushButton):
             'QPushButton:hover { color: ' + C['TEXT_PRIMARY'] + '; border-color: ' + C['ACCENT'] + '; }'
             'QPushButton:checked { background: ' + C['ACCENT_LIGHT'] + '; color: ' + C['ACCENT_GLOW']
             + '; border-color: ' + C['ACCENT'] + '; }')
+
+
+def _read_frontmatter(path):
+    """读 SKILL.md 的 frontmatter 与正文。返回 (fields dict, body str, total_lines int)。
+
+    宽松解析：只认第一对 --- 包裹的 YAML 简单 key: value 行（够用——技能
+    frontmatter 按规范就只有 name/description 等平铺字段）；结构坏/无 frontmatter
+    返回 ({}, '', 0)，由调用方显示为「不合格」。
+    """
+    try:
+        with open(path, encoding='utf-8-sig') as fh:
+            text = fh.read()
+    except OSError:
+        return {}, '', 0
+    lines = text.splitlines()
+    total = len(lines)
+    if not lines or lines[0].strip() != '---':
+        return {}, text, total
+    end = None
+    for i in range(1, len(lines)):
+        if lines[i].strip() == '---':
+            end = i
+            break
+    if end is None:
+        return {}, text, total
+    fields = {}
+    for ln in lines[1:end]:
+        if ':' in ln and not ln.startswith((' ', '\t', '-', '#')):
+            k, _, v = ln.partition(':')
+            k = k.strip()
+            v = v.strip().strip('"').strip("'")
+            if k:
+                fields[k] = v
+    body = '\n'.join(lines[end + 1:])
+    return fields, body, total
+
+
+class SkillPreviewDialog(QDialog):
+    """技能详情：frontmatter 摘要 + 合规判定 + SKILL.md 全文预览（只读）。"""
+
+    def __init__(self, skill_dir, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('技能详情')
+        self.resize(860, 640)
+        name = os.path.basename(skill_dir.rstrip('/\\'))
+        fields, body, total = _read_frontmatter(os.path.join(skill_dir, 'SKILL.md'))
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(18, 16, 18, 14)
+        outer.setSpacing(10)
+
+        head = QHBoxLayout()
+        t = _mk_label(name, 17, 'TEXT_PRIMARY', bold=True)
+        head.addWidget(t)
+        head.addStretch(1)
+        ok = bool(fields.get('name')) and bool(fields.get('description'))
+        tag = QLabel('frontmatter 合规' if ok else 'frontmatter 不合规（缺 name/description，客户端不会加载）')
+        tag.setStyleSheet('color: ' + (C['SUCCESS'] if ok else C['ERROR']) + '; font-size: 12px;')
+        head.addWidget(tag)
+        outer.addLayout(head)
+
+        desc = (fields.get('description') or '（缺）')
+        if len(desc) > 120:
+            desc = desc[:120] + '…'
+        meta = _mk_label(
+            'name: ' + (fields.get('name') or '（缺）') + '    description: ' + desc
+            + '    ' + str(total) + ' 行 · ' + _human(self._dir_size(skill_dir)),
+            11, 'TEXT_SECONDARY', wrap=True)
+        outer.addWidget(meta)
+
+        view = QPlainTextEdit(body if body.strip() else '（正文为空）')
+        view.setReadOnly(True)
+        view.setStyleSheet(
+            'QPlainTextEdit { background: ' + C['SURFACE'] + '; color: ' + C['TEXT_PRIMARY'] + ';'
+            ' border: 1px solid ' + C['BORDER'] + '; border-radius: 10px; font-size: 12px; }')
+        outer.addWidget(view, 1)
+
+        row = QHBoxLayout()
+        b_open = QPushButton('打开技能目录')
+        b_open.setStyleSheet(_btn_style('ghost'))
+        b_open.setFixedHeight(32)
+        b_open.clicked.connect(lambda: open_path_ui(skill_dir, self))
+        row.addWidget(b_open)
+        row.addStretch(1)
+        b_close = QPushButton('关闭')
+        b_close.setStyleSheet(_btn_style('primary'))
+        b_close.setFixedHeight(32)
+        b_close.clicked.connect(self.accept)
+        row.addWidget(b_close)
+        outer.addLayout(row)
+
+    @staticmethod
+    def _dir_size(p):
+        n = 0
+        for root, _d, files in os.walk(p):
+            for f in files:
+                try:
+                    n += os.path.getsize(os.path.join(root, f))
+                except OSError:
+                    pass
+        return n
+
+
+class SkillEditorDialog(QDialog):
+    """应用内编辑 SKILL.md —— 不启动任何外部进程，保存走原子写。
+
+    为什么不用记事本/VS Code：外部 GUI 进程一旦由本程序直接 CreateProcess 启动，
+    在本机会以 0xC0000142 崩溃（explorer.exe 已实测），用户只看到「点了没反应」。
+    应用内编辑器与进程启动无关，任何权限下都能用。
+    """
+
+    def __init__(self, skill_dir, parent=None, on_elevate=None):
+        super().__init__(parent)
+        self.skill_dir = skill_dir
+        self.path = os.path.join(skill_dir, 'SKILL.md')
+        self.on_elevate = on_elevate
+        self._dirty = False
+        self._name = os.path.basename(skill_dir.rstrip('/\\'))
+        self.setWindowTitle('编辑技能 · ' + self._name)
+        self.resize(900, 660)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(18, 16, 18, 14)
+        outer.setSpacing(10)
+
+        head = QHBoxLayout()
+        head.addWidget(_mk_label(self._name, 17, 'TEXT_PRIMARY', bold=True))
+        head.addStretch(1)
+        self._status = _mk_label('', 11, 'TEXT_MUTED')
+        head.addWidget(self._status)
+        outer.addLayout(head)
+        outer.addWidget(_mk_label(self.path, 11, 'TEXT_SECONDARY', wrap=True))
+
+        self.view = QPlainTextEdit()
+        self.view.setStyleSheet(
+            'QPlainTextEdit { background: ' + C['SURFACE'] + '; color: ' + C['TEXT_PRIMARY'] + ';'
+            ' border: 1px solid ' + C['BORDER'] + '; border-radius: 10px; padding: 8px; }')
+        mono = QFont('Consolas')
+        mono.setStyleHint(QFont.Monospace)
+        mono.setPointSize(10)
+        self.view.setFont(mono)
+        self.view.setPlainText(self._load())
+        self.view.textChanged.connect(self._mark_dirty)
+        outer.addWidget(self.view, 1)
+
+        row = QHBoxLayout()
+        b_sys = QPushButton('用系统程序打开')
+        b_sys.setStyleSheet(_btn_style('ghost'))
+        b_sys.setFixedHeight(32)
+        b_sys.clicked.connect(self._open_system)
+        row.addWidget(b_sys)
+        row.addStretch(1)
+        b_save = QPushButton('保存（Ctrl+S）')
+        b_save.setStyleSheet(_btn_style('primary'))
+        b_save.setFixedHeight(32)
+        b_save.clicked.connect(self._save)
+        row.addWidget(b_save)
+        b_close = QPushButton('关闭')
+        b_close.setStyleSheet(_btn_style('ghost'))
+        b_close.setFixedHeight(32)
+        b_close.clicked.connect(self.close)
+        row.addWidget(b_close)
+        outer.addLayout(row)
+
+    def _load(self):
+        try:
+            with open(self.path, 'r', encoding='utf-8-sig') as fh:
+                return fh.read()
+        except OSError as e:
+            QMessageBox.warning(self, APP_NAME, '读取技能文件失败：' + str(e))
+            return ''
+
+    def _mark_dirty(self):
+        self._dirty = True
+        self._status.setText('未保存')
+
+    def _save(self):
+        try:
+            write_text_atomic(self.path, self.view.toPlainText())
+        except OSError as e:
+            QMessageBox.warning(self, APP_NAME,
+                                '保存失败：' + str(e) + '\n\n' + self.path)
+            if self.on_elevate:
+                self.on_elevate('保存技能文件「' + self._name + '/SKILL.md」')
+            return False
+        self._dirty = False
+        self._status.setText('已保存 ' + time.strftime('%H:%M:%S'))
+        return True
+
+    def _open_system(self):
+        try:
+            os.startfile(self.path)     # noqa: S606
+            self._status.setText('已交给系统关联程序')
+        except OSError as e:
+            QMessageBox.warning(self, APP_NAME, '系统关联程序打不开这个文件：' + str(e))
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_S and (event.modifiers() & Qt.ControlModifier):
+            self._save()
+            return
+        super().keyPressEvent(event)
+
+    def closeEvent(self, event):
+        if self._dirty:
+            ans = QMessageBox.question(
+                self, APP_NAME, '有未保存的修改，保存后关闭？',
+                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel, QMessageBox.Yes)
+            if ans == QMessageBox.Cancel:
+                event.ignore()
+                return
+            if ans == QMessageBox.Yes and not self._save():
+                event.ignore()
+                return
+        return super().closeEvent(event)
+
+
+class FolderBrowserDialog(QDialog):
+    """系统资源管理器打不开目录时的兜底：应用内直接列出目录内容。"""
+
+    def __init__(self, folder, parent=None, reason='', on_elevate=None):
+        super().__init__(parent)
+        self.folder = folder
+        self.on_elevate = on_elevate
+        self.setWindowTitle('目录内容 · ' + os.path.basename(folder.rstrip('/\\')))
+        self.resize(760, 560)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(18, 16, 18, 14)
+        outer.setSpacing(10)
+        outer.addWidget(_mk_label(os.path.basename(folder.rstrip('/\\')), 17,
+                                  'TEXT_PRIMARY', bold=True))
+        outer.addWidget(_mk_label(folder, 11, 'TEXT_SECONDARY', wrap=True))
+        if reason:
+            outer.addWidget(_mk_label(
+                '系统资源管理器没有打开：' + reason
+                + '（下面是应用内列表，双击文件即可查看/编辑）', 11, 'TEXT_MUTED', wrap=True))
+
+        self.list = QListWidget()
+        self.list.setStyleSheet(
+            'QListWidget { background: ' + C['SURFACE'] + '; color: ' + C['TEXT_PRIMARY'] + ';'
+            ' border: 1px solid ' + C['BORDER'] + '; border-radius: 10px; padding: 4px; }'
+            'QListWidget::item { padding: 6px 8px; }')
+        try:
+            entries = sorted(os.listdir(folder))
+        except OSError as e:
+            entries = []
+            outer.addWidget(_mk_label('读取目录失败：' + str(e), 11, 'TEXT_MUTED', wrap=True))
+        for nm in entries:
+            full = os.path.join(folder, nm)
+            if os.path.isdir(full):
+                size_txt = '<目录>'
+            else:
+                try:
+                    size_txt = _human(os.path.getsize(full))
+                except OSError:
+                    size_txt = '-'
+            it = QListWidgetItem(nm + '    ' + size_txt)
+            it.setData(Qt.UserRole, full)
+            self.list.addItem(it)
+        self.list.itemDoubleClicked.connect(self._open_item)
+        outer.addWidget(self.list, 1)
+
+        row = QHBoxLayout()
+        b_copy = QPushButton('复制路径')
+        b_copy.setStyleSheet(_btn_style('ghost'))
+        b_copy.setFixedHeight(32)
+        b_copy.clicked.connect(self._copy_path)
+        row.addWidget(b_copy)
+        b_retry = QPushButton('再试系统资源管理器')
+        b_retry.setStyleSheet(_btn_style('ghost'))
+        b_retry.setFixedHeight(32)
+        b_retry.clicked.connect(self._retry_system)
+        row.addWidget(b_retry)
+        row.addStretch(1)
+        b_close = QPushButton('关闭')
+        b_close.setStyleSheet(_btn_style('primary'))
+        b_close.setFixedHeight(32)
+        b_close.clicked.connect(self.accept)
+        row.addWidget(b_close)
+        outer.addLayout(row)
+
+    def _copy_path(self):
+        QApplication.clipboard().setText(self.folder)
+
+    def _retry_system(self):
+        ok, error = open_in_explorer(self.folder)
+        if ok:
+            self.accept()
+            return
+        QMessageBox.warning(self, APP_NAME, '系统资源管理器仍未打开：' + error)
+
+    def _open_item(self, item):
+        full = item.data(Qt.UserRole)
+        if not full:
+            return
+        if os.path.isdir(full):
+            FolderBrowserDialog(full, parent=self, on_elevate=self.on_elevate).exec()
+            return
+        if os.path.basename(full).lower() == 'skill.md':
+            SkillEditorDialog(os.path.dirname(full), parent=self,
+                              on_elevate=self.on_elevate).exec()
+            return
+        try:
+            os.startfile(full)      # noqa: S606
+        except OSError as e:
+            QMessageBox.warning(self, APP_NAME, '系统关联程序打不开这个文件：' + str(e))
+
+
+def open_path_ui(path, parent=None, on_elevate=None):
+    """打开目录：先请系统外壳处理，失败则退到应用内目录浏览器（一定能看内容）。"""
+    ok, error = open_in_explorer(path)
+    if ok:
+        return True
+    FolderBrowserDialog(path, parent=parent, reason=error, on_elevate=on_elevate).exec()
+    return False
 
 
 class SkillsPage(Page):
@@ -2887,38 +3372,58 @@ class SkillsPage(Page):
         chips.addStretch(1)
         outer.addLayout(chips)
 
-        # 表格
-        self._table = QTableWidget(0, 4)
-        self._table.setHorizontalHeaderLabels(['技能', '来源', '状态', '大小'])
-        self._table.verticalHeader().setVisible(False)
-        self._table.setSelectionBehavior(QTableWidget.SelectRows)
-        self._table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self._table.setShowGrid(False)
-        self._table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self._table.horizontalHeader().setFixedHeight(34)
-        self._table.setStyleSheet(
-            'QTableWidget { background: ' + C['CARD_BG'] + '; border: 1px solid ' + C['BORDER'] + ';'
-            ' border-radius: 12px; font-size: 12px; color: ' + C['TEXT_PRIMARY'] + '; }'
-            'QTableWidget::item { padding: 6px 8px; border-bottom: 1px solid ' + C['BORDER_LIGHT'] + '; }'
-            'QTableWidget::item:selected { background: ' + C['ACCENT_LIGHT'] + '; color: ' + C['TEXT_PRIMARY'] + '; }'
-            'QHeaderView::section { background: ' + C['SURFACE'] + '; border: none;'
-            ' border-bottom: 1px solid ' + C['BORDER'] + '; padding: 6px 8px; font-size: 12px;'
-            ' color: ' + C['TEXT_SECONDARY'] + '; }')
-        outer.addWidget(self._table, 1)
+        # 主从布局 · 左列技能卡片流（对照 Alice-skills：开关 + 名称徽标 + 描述 + 行内操作钮），
+        # 右列详情面板。选中卡片即刷详情。
+        from PySide6.QtWidgets import QSplitter
 
-        # 批量操作条
+        self._split = QSplitter(Qt.Horizontal)
+        self._split.setChildrenCollapsible(False)
+
+        # ---- 左列：滚动区 + 卡片流 ------------------------------------
+        self._list_host = QWidget()
+        self._list_v = QVBoxLayout(self._list_host)
+        self._list_v.setContentsMargins(0, 0, 6, 0)
+        self._list_v.setSpacing(8)
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setWidget(self._list_host)
+        self._scroll.setFrameShape(QFrame.NoFrame)
+        self._scroll.setStyleSheet('QScrollArea { background: transparent; }')
+        self._scroll.setMinimumWidth(520)
+        self._split.addWidget(self._scroll)
+
+        self._rows = []          # [(name, enabled, dir, card), ...]
+        self._sel_name = ''      # 当前选中的技能名（卡片高亮 + 详情联动）
+
+        # ---- 右列：详情面板 -------------------------------------------
+        detail = QWidget()
+        dv = QVBoxLayout(detail)
+        dv.setContentsMargins(4, 0, 0, 0)
+        dv.setSpacing(6)
+        self._detail_title = _mk_label('选择一个技能', 16, 'TEXT_PRIMARY', bold=True)
+        dv.addWidget(self._detail_title)
+        self._detail_meta = _mk_label('左侧选中后，这里显示 frontmatter 摘要与 SKILL.md 全文。', 11, 'TEXT_SECONDARY', wrap=True)
+        dv.addWidget(self._detail_meta)
+        self._detail_view = QPlainTextEdit('')
+        self._detail_view.setReadOnly(True)
+        self._detail_view.setStyleSheet(
+            'QPlainTextEdit { background: ' + C['SURFACE'] + '; color: ' + C['TEXT_PRIMARY'] + ';'
+            ' border: 1px solid ' + C['BORDER'] + '; border-radius: 10px; font-size: 12px; }')
+        dv.addWidget(self._detail_view, 1)
+        self._detail_compliance = QLabel('')
+        self._detail_compliance.setStyleSheet('font-size: 11px;')
+        dv.addWidget(self._detail_compliance)
+        self._split.addWidget(detail)
+        self._split.setStretchFactor(0, 11)
+        self._split.setStretchFactor(1, 9)
+        self._split.setSizes([520, 300])
+        detail.setMinimumWidth(300)
+        outer.addWidget(self._split, 1)
+
+
+        # 操作条：行内已各自带 目录/编辑/删除 + 开关，批量按钮不再需要
         foot = QHBoxLayout()
         foot.setSpacing(10)
-        b_dis = QPushButton('禁用选中')
-        b_dis.setStyleSheet(_btn_style('ghost'))
-        b_dis.setFixedHeight(34)
-        b_dis.clicked.connect(self._disable_selected)
-        foot.addWidget(b_dis)
-        b_en = QPushButton('启用选中')
-        b_en.setStyleSheet(_btn_style('ghost'))
-        b_en.setFixedHeight(34)
-        b_en.clicked.connect(self._enable_selected)
-        foot.addWidget(b_en)
         foot.addStretch(1)
         b_open = QPushButton('打开目录')
         b_open.setStyleSheet(_btn_style('secondary'))
@@ -3016,86 +3521,265 @@ class SkillsPage(Page):
         mode_txt = ''
         if st and st.get('skillMode') in ('full', 'menu'):
             mode_txt = ' · ' + ('极简模式' if st['skillMode'] == 'menu' else '完整模式')
-        rows = []
-        for prefix, state in ((act, '启用'), (dis, '已禁用')):
-            if not os.path.isdir(prefix):
+
+        # 收集 (name, src, enabled, dir)
+        items = []
+        for src_label, base_dir, enabled in (('启用', act, True), ('已禁用', dis, False)):
+            if not os.path.isdir(base_dir):
                 continue
-            for name in sorted(os.listdir(prefix)):
-                p = os.path.join(prefix, name)
+            for name in sorted(os.listdir(base_dir)):
+                p = os.path.join(base_dir, name)
                 if not os.path.isdir(p) or not os.path.exists(os.path.join(p, 'SKILL.md')):
                     continue
-                size = self._dir_size(p)
-                rows.append((name, '本工具' if name in ours else '客户端自带', state, _human(size)))
+                items.append((name, src_label, enabled, p))
 
         # 过滤
         if self._filter == 'on':
-            rows = [r for r in rows if r[2] == '启用']
+            items = [x for x in items if x[2]]
         elif self._filter == 'off':
-            rows = [r for r in rows if r[2] == '已禁用']
+            items = [x for x in items if not x[2]]
         elif self._filter == 'ours':
-            rows = [r for r in rows if r[1] == '本工具']
+            items = [x for x in items if x[0] in ours]
         if self._search:
-            rows = [r for r in rows if self._search in r[0].lower()]
+            items = [x for x in items if self._search in x[0].lower()]
 
-        self._table.setRowCount(len(rows))
-        for r, (name, src, state, size) in enumerate(rows):
-            self._table.setItem(r, 0, QTableWidgetItem(name))
-            self._table.setItem(r, 1, QTableWidgetItem(src))
-            item = QTableWidgetItem(state)
-            item.setForeground(QColor(C['SUCCESS'] if state == '启用' else C['WARN']))
-            self._table.setItem(r, 2, item)
-            self._table.setItem(r, 3, QTableWidgetItem(size))
-        self._stat.setText(TARGETS[self._target_index]['card'] + ' · 共 ' + str(len(rows)) + ' 个技能'
+        prev_sel = self._sel_name
+
+        # 重建卡片流
+        while self._list_v.count():
+            it = self._list_v.takeAt(0)
+            w = it.widget()
+            if w:
+                w.deleteLater()
+        self._rows = []
+
+        for name, src_label, enabled, p in items:
+            card = self._build_skill_card(name, src_label, enabled, p)
+            self._list_v.addWidget(card)
+            self._rows.append((name, enabled, p, card))
+        self._list_v.addStretch(1)
+
+        self._stat.setText(TARGETS[self._target_index]['card'] + ' · 共 ' + str(len(items)) + ' 个技能'
                            + mode_txt)
+
+        # 恢复选中（按名字）；没有就清详情
+        self._sel_name = prev_sel if any(x[0] == prev_sel for x in items) else (items[0][0] if items else '')
+        self._apply_card_selection()
+        self._sync_detail()
+
+    def _build_skill_card(self, name, src_label, enabled, skill_dir):
+        """Alice 风格技能卡片：开关 + 名称徽标 + 描述换行 + 行内三钮（目录/编辑/删除）。"""
+        card = SkillCard(name)
+        card.setStyleSheet(
+            'QFrame#skillCard { background: ' + C['CARD_BG'] + '; border: 1px solid ' + C['BORDER']
+            + '; border-radius: 12px; }'
+            'QFrame#skillCard:hover { border-color: ' + C['ACCENT'] + '; }')
+
+        v = QVBoxLayout(card)
+        v.setContentsMargins(14, 10, 10, 10)
+        v.setSpacing(4)
+
+        top = QHBoxLayout()
+        top.setSpacing(10)
+        tg = ToggleSwitch()
+        tg.setChecked(enabled)
+        tg.toggled.connect(lambda on, n=name: self._toggle_skill(n, on))
+        top.addWidget(tg)
+        tname = _mk_label(name, 13, 'TEXT_PRIMARY', bold=True)
+        # 关键：QLabel 的最小宽度默认 = 整串文本宽度。技能名一长就把整行撑破，
+        # 三个按钮被推出卡片右缘、部分落进滚动区视口外 —— 看得见却点不到。
+        # 清零最小宽让名字就地截断，按钮永远留在卡内。
+        from PySide6.QtWidgets import QSizePolicy
+        tname.setMinimumWidth(140)
+        tname.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        tname.setToolTip(name)
+        # 省略号截断：Ignored 策略会把名字压没（上一版教训），Expanding+最小宽保证可见，
+        # 超长部分显示为 …，完整名在 tooltip。按行宽静态截断（名字截断显示不影响功能）。
+        from PySide6.QtGui import QFontMetrics
+        fm = QFontMetrics(tname.font())
+        tname.setText(fm.elidedText(name, Qt.ElideRight, 240))
+        top.addWidget(tname)
+        badge = QLabel(src_label if src_label != '启用' else ('本工具' if name in (read_json(state_path(TARGETS[self._target_index]['key'])) or {}).get('installedSkills', []) else ''))
+        badge.setStyleSheet(
+            'QLabel { background: ' + C['ACCENT_LIGHT'] + '; color: ' + C['ACCENT_GLOW']
+            + '; border-radius: 6px; padding: 1px 8px; font-size: 10px; }')
+        if not badge.text():
+            badge.hide()
+        top.addWidget(badge)
+        nfiles = sum(len(files) for _r, _d, files in os.walk(skill_dir))
+        nf = QLabel(str(nfiles) + '文件')
+        nf.setStyleSheet('color: ' + C['TEXT_SECONDARY'] + '; font-size: 11px;')
+        top.addWidget(nf)
+        top.addStretch(1)
+
+        # 行内三钮：目录 / 编辑 / 删除。专用紧凑样式：ghost 的 0 14px 内边距配
+        # 44px 定宽会把文字区压到 16px，两个汉字叠成墨块 —— 宽度给足 58px。
+        btn_qss = ('QPushButton { background: transparent; color: ' + C['TEXT_SECONDARY'] + ';'
+                   ' border: 1px solid ' + C['BORDER'] + '; border-radius: 8px;'
+                   ' padding: 0 6px; font-size: 12px; }'
+                   'QPushButton:hover { color: ' + C['TEXT_PRIMARY'] + '; border-color: ' + C['ACCENT'] + ';'
+                   ' background: ' + C['CARD_BG_HOVER'] + '; }')
+        for txt, cb in (('目录', lambda _checked=False, p=skill_dir: self._open_skill_dir(p)),
+                        ('编辑', lambda _checked=False, p=skill_dir: self._edit_skill(p)),
+                        ('删除', lambda _checked=False, n=name: self._delete_one(n))):
+            b = QPushButton(txt)
+            b.setStyleSheet(btn_qss)
+            b.setFixedSize(58, 26)
+            b.setCursor(Qt.PointingHandCursor)
+            b.clicked.connect(cb)
+            top.addWidget(b)
+        v.addLayout(top)
+
+        fields, _body, _total = _read_frontmatter(os.path.join(skill_dir, 'SKILL.md'))
+        desc = (fields.get('description') or '')
+        if desc:
+            dl = _mk_label(desc, 11, 'TEXT_SECONDARY', wrap=True)
+            dl.setMinimumHeight(38)
+            dl.setMaximumHeight(40)
+            v.addWidget(dl)
+
+        card.clicked.connect(self._select_card)
+
+        return card
+
+    def _select_card(self, name):
+        self._sel_name = name
+        self._apply_card_selection()
+        self._sync_detail()
+
+    def _apply_card_selection(self):
+        """按 _sel_name 给卡片上高亮边框。"""
+        for n, _en, _p, card in self._rows:
+            if n == self._sel_name:
+                card.setStyleSheet(
+                    'QFrame#skillCard { background: ' + C['ACCENT_LIGHT'] + '; border: 1px solid ' + C['ACCENT']
+                    + '; border-radius: 12px; }'
+                    'QFrame#skillCard:hover { border-color: ' + C['ACCENT'] + '; }')
+            else:
+                card.setStyleSheet(
+                    'QFrame#skillCard { background: ' + C['CARD_BG'] + '; border: 1px solid ' + C['BORDER']
+                    + '; border-radius: 12px; }'
+                    'QFrame#skillCard:hover { border-color: ' + C['ACCENT'] + '; }')
+
+    def _offer_elevated_restart(self, action_desc):
+        """目标端写入被拦截时提供『以管理员身份重启工作台』——重启后所有行内操作
+        （开关/编辑/删除）都在管理员令牌下执行，不再撞权限层。"""
+        ans = QMessageBox.question(
+            self, APP_NAME,
+            action_desc + ' 被系统拦截（普通权限无法写客户端配置目录）。\n\n'
+            '以管理员身份重启工作台？重启后所有操作都在管理员令牌下执行。\n'
+            '（当前窗口会先退出，重新打开后请重试刚才的操作。）',
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+        if ans != QMessageBox.Yes:
+            return
+        exe = sys.executable if getattr(sys, 'frozen', False) else sys.argv[0]
+        try:
+            import subprocess as _sp
+            _sp.Popen(['powershell.exe', '-NoProfile', '-Command',
+                       'Start-Process -FilePath ' + repr_escaped(exe) + ' -Verb RunAs'],
+                      creationflags=CREATE_NO_WINDOW)
+        except Exception as e:
+            QMessageBox.warning(self, APP_NAME, '拉起管理员实例失败：' + str(e))
+            return
+        self.window().close()
+
+    def _toggle_skill(self, name, on):
+        """行内开关 = 移入/移出 skills-disabled。完成后保持选中与详情。"""
+        _b, act, dis = self._dirs()
+        src_dir, dst_dir = (dis, act) if on else (act, dis)
+        s = os.path.join(src_dir, name)
+        d = os.path.join(dst_dir, name)
+        if not os.path.isdir(s):
+            return
+        try:
+            os.makedirs(dst_dir, exist_ok=True)
+            os.rename(s, d)
+        except OSError as e:
+            self._offer_elevated_restart('切换「' + name + '」的启用状态')
+            self._reload()
+            return
+        self._reload()
+
+    def _open_skill_dir(self, skill_dir):
+        """打开目录：系统外壳优先，失败退到应用内目录浏览器（不再直接启动 explorer.exe）。"""
+        ok, error = open_in_explorer(skill_dir)
+        if ok:
+            return
+        FolderBrowserDialog(skill_dir, parent=self, reason=error,
+                            on_elevate=self._offer_elevated_restart).exec()
+
+    def _edit_skill(self, skill_dir):
+        """编辑 SKILL.md：直接用应用内编辑器，不启动任何外部进程。"""
+        sk = os.path.join(skill_dir, 'SKILL.md')
+        if not os.path.isfile(sk):
+            QMessageBox.warning(self, APP_NAME, '技能文件不存在：' + sk)
+            return
+        SkillEditorDialog(skill_dir, parent=self,
+                          on_elevate=self._offer_elevated_restart).exec()
+        self._reload()
+
+    def _delete_one(self, name):
+        _b, act, dis = self._dirs()
+        ans = QMessageBox.question(
+            self, APP_NAME,
+            '确定删除技能「' + name + '」？\n此操作不可恢复（关闭开关才是可逆的）。',
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if ans != QMessageBox.Yes:
+            return
+        for root_d in (act, dis):
+            p = os.path.join(root_d, name)
+            if os.path.isdir(p) and os.path.abspath(p).startswith(os.path.abspath(_b)):
+                import shutil
+                try:
+                    shutil.rmtree(p)
+                except OSError as e:
+                    self._offer_elevated_restart('删除「' + name + '」')
+                break
+        if self._sel_name == name:
+            self._sel_name = ''
+        self._reload()
 
     def on_enter(self):
         self._reload()
 
     # ---- 操作
 
-    def _selected_names(self):
-        out = []
-        for idx in self._table.selectionModel().selectedRows():
-            out.append(self._table.item(idx.row(), 0).text())
-        return out
+    def _skill_dir_of(self, name):
+        # name -> 当前所在实际目录（启用 / 已禁用两处找）。找不到返回 None。
+        _b, act, dis = self._dirs()
+        for d in (act, dis):
+            p = os.path.join(d, name)
+            if os.path.isdir(p) and os.path.exists(os.path.join(p, 'SKILL.md')):
+                return p
+        return None
 
-    def _move(self, names, src_dir, dst_dir):
-        if not names:
-            QMessageBox.information(self, APP_NAME, '请先选中要操作的技能。')
+    def _sync_detail(self):
+        # 选中卡片 -> 右侧详情实时刷新。空选择显示占位。
+        if not self._sel_name:
+            self._detail_title.setText('选择一个技能')
+            self._detail_meta.setText('左侧选中后，这里显示 frontmatter 摘要与 SKILL.md 全文。')
+            self._detail_view.setPlainText('')
+            self._detail_compliance.setText('')
             return
-        os.makedirs(dst_dir, exist_ok=True)
-        ok, fail = 0, []
-        for n in names:
-            s = os.path.join(src_dir, n)
-            d = os.path.join(dst_dir, n)
-            if not os.path.isdir(s):
-                continue
-            try:
-                if os.path.isdir(d):
-                    fail.append(n)
-                    continue
-                os.rename(s, d)
-                ok += 1
-            except Exception:
-                fail.append(n)
-        self._reload()
-        msg = '已处理 ' + str(ok) + ' 个'
-        if fail:
-            msg += '；失败 ' + str(len(fail)) + ' 个：' + '、'.join(fail)
-        QMessageBox.information(self, APP_NAME, msg)
-
-    def _disable_selected(self):
-        _b, act, dis = self._dirs()
-        self._move(self._selected_names(), act, dis)
-
-    def _enable_selected(self):
-        _b, act, dis = self._dirs()
-        self._move(self._selected_names(), dis, act)
+        d = self._skill_dir_of(self._sel_name)
+        if not d:
+            return
+        fields, body, total = _read_frontmatter(os.path.join(d, 'SKILL.md'))
+        self._detail_title.setText(self._sel_name)
+        desc = (fields.get('description') or '（缺 description）')
+        self._detail_meta.setText(desc)
+        ok = bool(fields.get('name')) and bool(fields.get('description'))
+        self._detail_compliance.setText(
+            ('frontmatter 合规' if ok else 'frontmatter 不合规（缺 name/description，客户端不会加载）')
+            + '    ' + str(total) + ' 行 · ' + _human(self._dir_size(d)))
+        self._detail_compliance.setStyleSheet(
+            'font-size: 11px; color: ' + (C['SUCCESS'] if ok else C['ERROR']) + ';')
+        self._detail_view.setPlainText(body if body.strip() else '（正文为空）')
 
     def _open_dir(self):
         base, _a, _d = self._dirs()
         os.makedirs(base, exist_ok=True)
-        open_in_explorer(base)
+        open_path_ui(base, self, self._offer_elevated_restart)
 
 
 # ------------------------------------------------------------------ 日志页
@@ -3868,7 +4552,7 @@ class SettingsPage(Page):
         b_open = QPushButton('打开')
         b_open.setStyleSheet(_btn_style('ghost'))
         b_open.setFixedHeight(34)
-        b_open.clicked.connect(lambda: open_in_explorer(work_root()))
+        b_open.clicked.connect(lambda: open_path_ui(work_root(), self))
         c2.addWidget(b_open)
         outer.addWidget(card2)
 
@@ -4335,10 +5019,9 @@ class MainWindow(FramelessWindow):
     def _refresh_status(self):
         any_installed = False
         for target in TARGETS:
-            st = read_json(state_path(target['key']))
+            installed, st = self._target_install_state(target)
             ver = st.get('versionLabel') if st else None
             mode = st.get('skillMode') if st else None
-            installed = bool(st)
             any_installed = any_installed or installed
             self.page_home.cards[target['key']].update_state(installed, ver, mode)
         if self._busy:
@@ -4349,7 +5032,29 @@ class MainWindow(FramelessWindow):
             self.page_home._chip_all.set_state('未部署', C['TEXT_MUTED'])
 
     def _any_installed(self):
-        return any(read_json(state_path(t['key'])) for t in TARGETS)
+        return any(self._target_install_state(t)[0] for t in TARGETS)
+
+    @staticmethod
+    def _target_install_state(target):
+        """Prefer the state manifest; recover display state from managed files if it is missing."""
+        st = read_json(state_path(target['key']))
+        if st and st.get('status') == 'OK':
+            return True, st
+
+        base = resolve_agent_dir(target)
+        marker = '<!-- BEGIN pi-workbench v4 -->'
+        try:
+            with open(os.path.join(base, prompt_name(target)), 'r', encoding='utf-8-sig') as fh:
+                managed = marker in fh.read()
+        except (OSError, UnicodeError):
+            managed = False
+        if managed:
+            recovered = dict(st or {})
+            recovered.setdefault('versionLabel', '已检测到工作台指令集')
+            recovered.setdefault('skillMode', None)
+            recovered['status'] = 'OK'
+            return True, recovered
+        return False, st
 
     def _set_status(self, text, level=None):
         color = {'ok': C['SUCCESS'], 'error': C['DANGER'], 'warn': C['WARN']}.get(level, C['TEXT_SECONDARY'])
@@ -4541,13 +5246,89 @@ class MainWindow(FramelessWindow):
             if code == 0:
                 self._set_status(target['card'] + ' 注入完成 · ' + version_label, 'ok')
                 self.switch_page(3)
-            else:
-                self._set_status(target['card'] + ' 注入失败，见日志', 'error')
-                self.switch_page(3)
+                return
+            # 访问被拒（安全软件/权限层拦截目标端写入）→ 提供一键管理员重试。
+            # tail 是最近日志行；拒绝特征可能以「访问被拒绝」「拒绝访问」出现。
+            joined = ' '.join(str(x) for x in (tail or []))
+            if ('访问被拒绝' in joined) or ('拒绝访问' in joined) or ('Access denied' in joined):
+                ans = QMessageBox.question(
+                    self, APP_NAME,
+                    '写入 ' + target['card'] + ' 配置目录被系统拦截（普通权限被拒）。\n\n'
+                    '用管理员权限重跑本次注入？会弹 UAC 确认框，注入过程显示在新的 PowerShell 窗口里，\n'
+                    '完成后回到本界面点一次「体检」即可刷新状态。',
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+                if ans == QMessageBox.Yes:
+                    self._elevated_reinject(args, target)
+                    return
+            self._set_status(target['card'] + ' 注入失败，见日志', 'error')
+            self.switch_page(3)
 
         self._enqueue(args, label or ('注入 ' + target['card'] + ' · ' + version_label + mode_note), done,
                       kind='注入', target_card=target['card'],
                       plan=self._plan_for('install', target, with_skills=(not no_skills)))
+
+    def _elevated_reinject(self, args, target):
+        """以管理员重跑注入：弹 UAC，独立 PowerShell 窗口跑（输出无法回收，靠结果文件回读结论）。
+
+        完成判定：管理员进程退出后轮询状态清单的 installedAt 是否更新（最多等 120s）。
+        """
+        script = _res('inject.ps1')
+        # 管理员进程不带本进程环境 → 显式把便携数据根塞进命令行，保证 state/backup 落同一处
+        pr = _portable_root()
+        env_prefix = '$env:PJ_WORK_ROOT = ' + repr_escaped(pr) + '; ' if pr else ''
+        argv = ['/NoProfile', '-ExecutionPolicy', 'Bypass', '-Command',
+                env_prefix + ' & powershell.exe ' + ' '.join(['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script] + list(args))]
+        cmdline = 'powershell.exe ' + ' '.join(argv)
+        done_flag = os.path.join(work_root(), 'elevated-deploy.done')
+        try:
+            if os.path.exists(done_flag):
+                os.remove(done_flag)
+        except OSError:
+            pass
+        # 让管理员侧跑完后摸一下 done 标志。参数传递走 cmd 包装文件：
+        # Start-Process -ArgumentList 的字符串会按空格重切，-Command 的长参数
+        # 必碎（实测：env 前缀丢了，state 落错目录）。cmd 文件的转义规则只有
+        # 一条（% 与引号），可控性完全不同。
+        import subprocess as _sp
+        tmp_cmd = os.path.join(work_root(), 'elevated-deploy.cmd')
+        pr = _portable_root()
+        env_line = ('set PJ_WORK_ROOT=' + pr) if pr else 'rem no portable root'
+        NL = chr(13) + chr(10)
+        DQ = chr(34)   # double quote
+        SQ = chr(39)   # single quote
+        touch_line = ('powershell.exe -NoProfile -Command ' + DQ
+                      + 'Set-Content -LiteralPath ' + SQ + done_flag + SQ
+                      + ' -Value (Get-Date -Format o)' + DQ)
+        body = ('@echo off' + NL + env_line + NL + cmdline + NL
+                + 'set EC=%ERRORLEVEL%' + NL
+                + touch_line + NL
+                + 'exit /b %EC%' + NL)
+        with open(tmp_cmd, 'w', encoding='ascii', errors='replace') as fh:
+            fh.write(body)
+        try:
+            _sp.Popen(['powershell.exe', '-NoProfile', '-Command',
+                       'Start-Process cmd.exe -ArgumentList "/c "' + tmp_cmd + '"" -Verb RunAs -Wait'],
+                      creationflags=CREATE_NO_WINDOW)
+        except Exception as e:
+            QMessageBox.warning(self, APP_NAME, '拉起管理员进程失败：' + str(e))
+            return
+        self._set_status('等待管理员注入完成（UAC 确认 + 新窗口执行）…', 'warn')
+
+        def poll():
+            if os.path.exists(done_flag):
+                self._poll_timer.stop()
+                self._set_status(target['card'] + ' 管理员注入已执行，刷新状态中…', 'warn')
+                st = read_json(state_path(target['key']))
+                if st and st.get('status') == 'OK':
+                    self._set_status(target['card'] + ' 注入完成（管理员）· 状态已刷新', 'ok')
+                else:
+                    self._set_status(target['card'] + ' 管理员进程已退出，但状态清单未更新 —— 看管理员窗口日志', 'error')
+        self._poll_timer = QTimer(self)
+        self._poll_timer.setInterval(1500)
+        self._poll_timer.timeout.connect(poll)
+        self._poll_timer.start()
+        # 120s 后停止轮询
+        QTimer.singleShot(120000, lambda: self._poll_timer.stop())
 
     def _remove_addons(self, target, skill_dirs, names):
         """从目标端移除附加技能包（不动指令集与其它技能）。"""
@@ -4964,7 +5745,7 @@ def version_check():
         'name': APP_NAME,
         'version': APP_VERSION,
         'build': APP_BUILD,
-        'frozen': bool(getattr(sys, '_MEIPASS', None)),
+        'frozen': bool(getattr(sys, 'frozen', False)),
         'python': sys.version.split()[0],
         'executable': sys.executable,
         'workRoot': work_root(),
@@ -4987,7 +5768,8 @@ def bundle_check():
     原因：资源清单写两处就会漏（旧写法是这里一份、实际随包一份，
     增模板时只改一处不会有人报错）。
     """
-    res = {'frozen': bool(getattr(sys, '_MEIPASS', None)), 'base': _res(), 'items': {}, 'ok': True}
+    # onedir 下没有 _MEIPASS，但 sys.frozen 仍为 True —— 两种打包形态都要报对。
+    res = {'frozen': bool(getattr(sys, 'frozen', False)), 'base': _res(), 'items': {}, 'ok': True}
     cpath = _res('deploy-contract.json')
     contract = None
     try:
@@ -5038,12 +5820,81 @@ def bundle_check():
     return 0 if res['ok'] else 1
 
 
+def _migrate_to_portable():
+    """首次便携运行：把 LOCALAPPDATA 里的旧数据搬进 exe 同级 data\。
+
+    只搬一次：搬完在旧目录留 MIGRATED.marker，第二次启动就跳过。
+    搬是复制不是移动 —— 旧数据保留原处，万一便携目录被整个删了还能再迁回来。
+    """
+    pr = _portable_root()
+    if not pr:
+        return
+    old = os.path.join(os.environ.get('LOCALAPPDATA') or os.path.expanduser('~'), 'pi-workbench')
+    if not os.path.isdir(old) or os.path.isfile(os.path.join(old, 'MIGRATED.marker')):
+        return
+    # 目标已有 state（用户已在便携侧用过）就不动，避免新盖旧
+    if os.path.isdir(os.path.join(pr, 'state')):
+        return
+    import shutil
+    try:
+        shutil.copytree(old, pr, dirs_exist_ok=True)
+        with open(os.path.join(old, 'MIGRATED.marker'), 'w', encoding='utf-8') as fh:
+            fh.write('已迁移到 ' + pr + '（' + __import__('datetime').datetime.now().isoformat() + '）\n'
+                     '旧数据保留在此仅作迁移来源；确认便携侧正常后可整体删除本目录。\n')
+    except OSError:
+        pass  # 迁移失败不拦启动 —— 回落行为与旧版一致
+
+
+def ui_selftest():
+    """PJ_UI_SELFTEST=1：不开界面，直接验证打包后的关键交互路径。
+
+    覆盖：应用内技能编辑器读取/修改/原子保存，目录兜底浏览器列目录。
+    返回码：0 通过，2 读取不符，3 保存失败，4 落盘内容不符，5 目录列表异常，6 环境异常。
+    """
+    import shutil
+    import tempfile
+    base = None
+    for candidate in (tempfile.gettempdir(), work_root()):
+        try:
+            base = tempfile.mkdtemp(prefix='pj-ui-selftest-', dir=candidate)
+            break
+        except OSError:
+            continue
+    if base is None:
+        return 6
+    try:
+        sk = os.path.join(base, 'SKILL.md')
+        with open(sk, 'w', encoding='utf-8') as fh:
+            fh.write('# selftest\n')
+        dlg = SkillEditorDialog(base)
+        if dlg.view.toPlainText() != '# selftest\n':
+            return 2
+        dlg.view.setPlainText('# selftest ok\n')
+        if not dlg._save():
+            return 3
+        with open(sk, 'r', encoding='utf-8') as fh:
+            if fh.read() != '# selftest ok\n':
+                return 4
+        dlg.close()
+        fb = FolderBrowserDialog(base, reason='selftest')
+        if fb.list.count() != 1:
+            return 5
+        fb.close()
+        return 0
+    except Exception:
+        return 6
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
 def main():
     global _ACTIVE_WINDOW
     if os.environ.get('PJ_BUNDLE_CHECK') == '1':
         return bundle_check()
     if os.environ.get('PJ_VERSION_CHECK') == '1':
         return version_check()
+
+    _migrate_to_portable()
 
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
@@ -5054,6 +5905,9 @@ def main():
     _apply_ui_font(app)
     _apply_ui_font_px(app, 13)
     _apply_global_qss(app)
+
+    if os.environ.get('PJ_UI_SELFTEST') == '1':
+        return ui_selftest()
 
     # 主题：配置优先（auto = 跟随系统）
     cfg = read_json(tool_config_path()) or {}

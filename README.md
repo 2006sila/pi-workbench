@@ -52,7 +52,7 @@ Pi 系客户端读两类东西：**系统提示词**（每轮都在上下文里�
   - `极简模式` = 只留一个菜单技能进提示词（约 90 tokens/轮），模块加 `disable-model-invocation` 不进提示词，AI 按菜单里的模块 id 按需 `read`
 - **附加技能包**：两个独立技能包可与模板一起部署，也可单独部署 / 单独移除（同样跟随上面选的客户端与模式）
 - 启动时自动重注入开关（按上次记录的模板与模式幂等覆盖）
-- 打包自检：验证单文件 exe 内的脚本、模板、技能库、图标都可寻址
+- 打包自检：验证发布产物（onedir 目录）内的脚本、模板、技能库、图标都可寻址
 
 **执行**
 
@@ -352,11 +352,14 @@ py -X utf8 skill_tool.py pack --verify build\skill-library.zip
 
 ## 安装
 
-### 方式一：用打包好的单文件 exe
+### 方式一：用打包好的发布包
 
-从 [Releases](https://github.com/2006sila/pi-workbench/releases/latest) 下载 `pi-workbench-v1.4.exe`（单文件，约 48MB），双击即用（无需 Python 环境）。
-本地自己构建的产物名是 `pi用学习工作台.exe`，功能相同。
-首次启动会解压内置资源到临时目录，约 2~4 秒。
+从 [Releases](https://github.com/2006sila/pi-workbench/releases/latest) 下载 `pi-workbench-v1.4.1-windows-x64.zip`，
+解压到任意目录（例  `D:pi-workbench`），双击其中的 `pi用学习工作台pi用学习工作台.exe` 即用（无需 Python 环境）。
+
+自 v1.4.1 起改为 **onedir** 发布形态：不再是单文件自解压，启动过程不碰 `%TEMP%`
+（旧单文件版在 `%TEMP%` 被安全软件拦截的机器上会直接弹 "Could not create temporary directory"）。
+整体拷贝目录即「安装」，删除目录即「卸载」；数据默认就近放在 exe 同级 `data\`（便携）。
 
 ### 方式二：从源码构建
 
@@ -366,14 +369,14 @@ cd pi-workbench
 python -m venv .venv
 .venv\Scripts\python -m pip install -r requirements.txt
 
-# 一键构建（清理 build/dist 后打包单文件）
+# 一键构建（清理 build/dist 后打包 onedir）
 build.cmd
 
 # 或直接跑开发模式
 .venv\Scripts\python bj_tool.py
 ```
 
-产物：`dist\pi用学习工作台.exe`
+产物：`dist\pi用学习工作台\`（onedir：exe 在目录里，整体拷贝即安装）
 
 **环境**：Windows 10/11 + PowerShell 5.1+（注入器依赖 `robocopy` / `tasklist` / 注册表）。
 开发验证于 Win11 26100 / Python 3.13 / PySide6 6.11.2 / PyInstaller 6.22.3。
@@ -449,11 +452,11 @@ powershell -ExecutionPolicy Bypass -File inject.ps1 -Target pideck -AgentDir D:\
 
 ```powershell
 # 打包自检：验证随包资源可寻址（清单来自 deploy-contract.json，不再写死在这里）
-$env:PJ_BUNDLE_CHECK='1'; .\dist\pi-workbench-v1.4.exe
+$env:PJ_BUNDLE_CHECK='1'; .\dist\pi用学习工作台\pi用学习工作台.exe
 # 结果：%LOCALAPPDATA%\pi-workbench\bundle-check.json
 
 # 构建身份自检：确认你跑的是不是这个构建（升级排查第一步）
-$env:PJ_VERSION_CHECK='1'; .\dist\pi-workbench-v1.4.exe
+$env:PJ_VERSION_CHECK='1'; .\dist\pi用学习工作台\pi用学习工作台.exe
 # 结果：%LOCALAPPDATA%\pi-workbench\version-check.json（版本号 / APP_BUILD / frozen）
 ```
 
@@ -571,6 +574,34 @@ pi-workbench/
 ---
 
 ## 更新记录
+
+**V1.4.1 · 2026-10-08**
+
+本版修技能库页两个「点了没反应 / 弹系统错误框」的按钮，并把发布形态从单文件改成 onedir 目录。
+
+**一、技能页「目录」按钮：不再直接启动 explorer.exe**
+
+根因（实测）：从程序里直接 `CreateProcess` 启动 `explorer.exe`，不管参数、creationflags、
+cwd，甚至清空 PyInstaller / Qt 环境变量，都会以 `0xC0000142`（`STATUS_DLL_INIT_FAILED`）崩溃并弹出
+「explorer.exe - 应用程序错误」；而交给系统外壳（`ShellExecute` / 已运行的资源管理器）则正常。
+旧实现走的正是前者，且把「卡在崩溃提示框上的进程」误判成启动成功，所以既不打开也不提示。
+
+现在改为：`os.startfile`（ShellExecute 委派）→ 失败则 `SHOpenFolderAndSelectItems`
+（进程内调用，交给已运行的资源管理器）→ 都失败则弹**应用内目录浏览器**（列文件、双击查看/编辑、
+复制路径、再试系统）。全程不新建 explorer.exe 进程。
+
+**二、技能页「编辑」按钮：改为应用内编辑器**
+
+打开的是内置编辑器（`QPlainTextEdit` + 原子写保存 + Ctrl+S + 未保存提醒），不再依赖
+记事本 / VS Code / 文件关联 —— 零外部进程，任何权限下都能用。需要外部工具时，对话框里保留
+「用系统程序打开」。
+
+**三、发布形态：单文件 → onedir**（见「安装」一节：启动不再自解压到 `%TEMP%`）
+
+**四、验证**
+
+- `PJ_BUNDLE_CHECK=1` → `ok=true`，随包技能 65
+- `PJ_UI_SELFTEST=1`（应用内编辑器读 → 改 → 原子落盘 + 目录兜底）→ 退出码 0
 
 **V1.4 · 2026-09-30**
 

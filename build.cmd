@@ -9,7 +9,7 @@ echo [1/2] 清理旧产物
 if exist build rmdir /s /q build
 if exist dist rmdir /s /q dist
 
-echo [2/2] 使用 PyInstaller 构建单文件
+echo [2/2] 使用 PyInstaller 构建 onedir
 "%PY%" -m PyInstaller --noconfirm bj_tool.spec
 if errorlevel 1 (
     echo 构建失败
@@ -17,6 +17,6 @@ if errorlevel 1 (
 )
 
 echo.
-echo 产物: %~dp0dist\pi用学习工作台.exe
+echo 产物目录: %~dp0dist\pi用学习工作台\（onedir：整体拷贝即安装，exe 在目录里）
 dir /b dist
 endlocal

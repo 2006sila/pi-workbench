@@ -54,24 +54,37 @@ a = Analysis(  # noqa: F821
 
 pyz = PYZ(a.pure)  # noqa: F821
 
+# onedir 打包：产物是 dist\pi用学习工作台\ 目录（exe + 依赖都在里面）。
+# 为什么放弃单文件：单文件启动时 bootloader 要先把自己解压到临时目录，
+# 机器的 %TEMP% 被安全软件拦截时直接弹 "Could not create temporary directory!"
+# （实锤过：管理员能跑、普通用户不行）；固化解压目录写死本机路径，换台机器又坏。
+# onedir 完全没有自解压步骤，任何机器、任何权限下都不碰 %TEMP%。
+# 启动也更快（省掉每次解压 46MB）。整体拷贝目录即「安装」，删除目录即「卸载」。
 exe = EXE(  # noqa: F821
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
+    exclude_binaries=True,
     name='pi用学习工作台',
     icon=os.path.join(ROOT, 'app.ico'),
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
-    upx_exclude=[],
-    runtime_tmpdir=None,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+)
+
+coll = COLLECT(  # noqa: F821
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=False,
+    upx_exclude=[],
+    name='pi用学习工作台',
 )
