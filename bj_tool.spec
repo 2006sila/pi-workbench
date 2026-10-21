@@ -73,6 +73,10 @@ exe = EXE(  # noqa: F821
     strip=False,
     upx=False,
     console=False,
+    # 部署要写客户端的配置目录（~/.dsh、~/.pi/agent）与 Program Files 下的客户端，
+    # 一律以管理员启动最省事：UAC 一次，后面所有写入都不再撞权限层。
+    # （仍然保留运行时自证与「被拒再提权重试」的兜底。）
+    uac_admin=True,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,

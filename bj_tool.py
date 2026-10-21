@@ -37,6 +37,21 @@ _THEME_FILTER = None      # 系统主题监听器：必须持引用，否则可�
 IS_WINDOWS = os.name == 'nt'
 CREATE_NO_WINDOW = 0x08000000 if IS_WINDOWS else 0
 
+
+def is_elevated():
+    """当前进程是否以管理员令牌运行。
+
+    spec 里 uac_admin=True 会让 exe 启动即请求提权；这里再自证一次，
+    这样「计划任务 / 别的进程直接调用 / UAC 被策略放过」时界面也能说清楚当前是什么权限。
+    """
+    if not IS_WINDOWS:
+        return False
+    try:
+        import ctypes
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
 _SKILL_COUNT_CACHE = None      # 随包技能数缓存（bundled_skill_count 用）
 
 # 单任务超时上限（秒）。注入 65 个技能实测不到 1 分钟；体检要跑一次模型调用，
@@ -4670,6 +4685,14 @@ class SettingsPage(Page):
         pp = _mk_label(work_root(), 11, 'TEXT_MUTED', bold=False)
         pp.setMinimumHeight(18)
         cc2.addWidget(pp)
+        _adm = is_elevated()
+        perm = _mk_label('运行权限：' + ('管理员 ✓' if _adm
+                                       else '普通用户（写入可能被拒，建议右键「以管理员身份运行」）'),
+                         11, 'SUCCESS' if _adm else 'WARN', bold=False)
+        perm.setMinimumHeight(18)
+        perm.setToolTip('部署要写客户端的配置目录；exe 的 manifest 已声明 requireAdministrator，'
+                        '正常双击启动就会弹 UAC。')
+        cc2.addWidget(perm)
         c2.addLayout(cc2)
         c2.addStretch(1)
         b_open = QPushButton('打开')
@@ -5022,6 +5045,9 @@ class MainWindow(FramelessWindow):
         self._refresh_status()
         self._sync_theme_buttons()
         self._setup_tray()
+        self.page_log.append('[INFO] 运行权限：' + (
+            '管理员（可写客户端配置目录 / Program Files）' if is_elevated()
+            else '普通用户 —— 写入被拒时请右键「以管理员身份运行」，或用失败提示里的提权重试'))
 
         if not skip_auto and self._read_auto() and self._any_installed():
             QTimer.singleShot(400, self._auto_reinject)
