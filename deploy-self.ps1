@@ -103,7 +103,17 @@ Say-Plan ('[3/5] 部署：' + (Split-Path -Leaf $Built) + ' → ' + (Split-Path 
 if (-not $WhatIfOnly) {
     Copy-Item -LiteralPath $Built -Destination $dst -Force
     $new = Get-Item -LiteralPath $dst
-    $sha = (Get-FileHash -LiteralPath $dst -Algorithm SHA256).Hash.ToLowerInvariant()
+    # 不用 Get-FileHash：它属于 Microsoft.PowerShell.Utility —— 在 PS7 控制台里 spawn 5.1、
+    # 或 PSModulePath 被裁剪时会 CommandNotFound（实测过），导致「部署成功但退出码 1」。
+    # .NET 直接算，任何宿主/任何模块状态都可用。
+    $shaAlg = [System.Security.Cryptography.SHA256]::Create()
+    $fs = [System.IO.File]::OpenRead($dst)
+    try {
+        $sha = ([System.BitConverter]::ToString($shaAlg.ComputeHash($fs)) -replace '-', '').ToLowerInvariant()
+    } finally {
+        $fs.Dispose()
+        $shaAlg.Dispose()
+    }
     Say-Plan ('      ' + $new.Length + ' 字节，mtime ' + $new.LastWriteTime)
     Say-Plan ('      SHA256 ' + $sha)
 }

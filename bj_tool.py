@@ -28,8 +28,8 @@ from PySide6.QtWidgets import (
 
 APP_NAME = 'pi用学习工作台'
 APP_SUBTITLE = 'PiDeck / DeepSeek Harness 一键部署 · 注入即用 · 卸载即还原'
-APP_VERSION = 'V1.4.2'
-APP_BUILD = '2026-10-08 · v1.4.2 技能菜单：评分列 + 类目分片（为技能库规模化做准备）'
+APP_VERSION = 'V1.4.3'
+APP_BUILD = '2026-10-21 · v1.4.3 首页「客户端需重启才生效」提示 + 卸载按钮分离与后果确认'
 
 _ACTIVE_WINDOW = None
 _THEME_FILTER = None      # 系统主题监听器：必须持引用，否则可能被 GC 后悬垂
@@ -682,6 +682,102 @@ def list_procs(names):
             if ('"' + n + '.exe"') in low:
                 running.add(n)
     return running
+
+
+def _pids_for(names):
+    """按镜像名列 pid（tasklist CSV）。取不到返回空列表 —— 不引入 psutil。"""
+    if not IS_WINDOWS:
+        return []
+    try:
+        out = subprocess.run(
+            ['tasklist', '/FO', 'CSV', '/NH'],
+            capture_output=True, text=True, encoding='utf-8', errors='replace',
+            creationflags=CREATE_NO_WINDOW, timeout=15, check=False,
+        ).stdout or ''
+    except Exception:
+        return []
+    wanted = set()
+    for n in names or []:
+        low = str(n).lower()
+        wanted.add(low)
+        wanted.add(low + '.exe')
+    pids = []
+    for line in out.splitlines():
+        parts = [x.strip().strip('"') for x in line.split('","')]
+        if len(parts) < 2:
+            continue
+        if parts[0].strip('" ').lower() not in wanted:
+            continue
+        try:
+            pids.append(int(parts[1].strip('" ')))
+        except ValueError:
+            pass
+    return pids
+
+
+def proc_start_epoch(pid):
+    """进程启动时间（Unix 秒）。取不到返回 None（权限不足/已退出都算取不到）。"""
+    if not IS_WINDOWS:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        k32.OpenProcess.restype = wintypes.HANDLE
+        k32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        k32.GetProcessTimes.argtypes = (wintypes.HANDLE,
+                                        ctypes.POINTER(wintypes.FILETIME),
+                                        ctypes.POINTER(wintypes.FILETIME),
+                                        ctypes.POINTER(wintypes.FILETIME),
+                                        ctypes.POINTER(wintypes.FILETIME))
+        k32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not h:
+            return None
+        try:
+            created, exited, kern, user = (wintypes.FILETIME(), wintypes.FILETIME(),
+                                           wintypes.FILETIME(), wintypes.FILETIME())
+            if not k32.GetProcessTimes(h, ctypes.byref(created), ctypes.byref(exited),
+                                       ctypes.byref(kern), ctypes.byref(user)):
+                return None
+            ticks = (int(created.dwHighDateTime) << 32) | int(created.dwLowDateTime)
+            return ticks / 1e7 - 11644473600.0
+        finally:
+            k32.CloseHandle(h)
+    except Exception:
+        return None
+
+
+def client_restart_hint(target, st):
+    """判断「已注入但客户端没重启」。
+
+    DSH 只在客户端**启动后**的会话首次请求里读 ~/.dsh/AGENTS.md，且不监听外部改动；
+    所以客户端开着的时候注入，当前/新会话都不会生效，必须重启。
+    判据：状态清单 installedAt vs 客户端最老进程的启动时间。
+    客户端没在运行、或时间取不到 → 返回空（不猜、不误报）。
+    """
+    iso = str((st or {}).get('installedAt') or '')
+    if not iso:
+        return '', ''
+    try:
+        import datetime as _dt
+        deployed = _dt.datetime.fromisoformat(iso.replace('Z', '+00:00')).timestamp()
+    except Exception:
+        return '', ''
+    pids = _pids_for(target.get('procs') or [])
+    if not pids:
+        return '', ''
+    starts = [t for t in (proc_start_epoch(x) for x in pids) if t]
+    if not starts:
+        return '', ''
+    oldest = min(starts)
+    if oldest >= deployed - 1:
+        return '', ''
+    fmt = lambda e: _dt.datetime.fromtimestamp(e).strftime('%m-%d %H:%M:%S')
+    return ('⚠ 客户端需重启才生效',
+            '注入于 ' + fmt(deployed) + '，而客户端进程启动于 ' + fmt(oldest)
+            + '。DSH 只在启动时读取指令文件，请重启客户端后再开新会话。')
 
 
 def _proc_parent_map():
@@ -2200,6 +2296,14 @@ class TargetCard(QFrame):
         head.addWidget(self._chip)
         lay.addLayout(head)
 
+        # 「已注入但客户端没重启」提示：DSH 只在启动时读指令文件，客户端开着注入不会生效
+        self._warn = QLabel('')
+        self._warn.setWordWrap(True)
+        _set_px_font(self._warn, 11)
+        self._warn.setStyleSheet('color: ' + C['WARN'] + '; background: transparent; border: none;')
+        self._warn.setVisible(False)
+        lay.addWidget(self._warn)
+
         self._tpl = _mk_label('模板：—', 12, 'TEXT_SECONDARY', bold=False)
         lay.addWidget(self._tpl)
 
@@ -2234,10 +2338,6 @@ class TargetCard(QFrame):
         self.btn_restart.setStyleSheet(_btn_style('ghost'))
         self.btn_restart.setFixedHeight(36)
         btns.addWidget(self.btn_restart, 1)
-        self.btn_uninstall = QPushButton('卸载')
-        self.btn_uninstall.setStyleSheet(_btn_style('danger'))
-        self.btn_uninstall.setFixedHeight(36)
-        btns.addWidget(self.btn_uninstall, 1)
         # 通道体检：确认部署到底生效了没有（会真跑一次模型调用，所以单列一个按钮）
         self.btn_probe = QPushButton('体检')
         self.btn_probe.setStyleSheet(_btn_style('ghost'))
@@ -2249,6 +2349,21 @@ class TargetCard(QFrame):
         self.btn_versions.setFixedHeight(36)
         btns.addWidget(self.btn_versions, 1)
         lay.addLayout(btns)
+
+        # 卸载单独一行、靠右、小一号：它会连技能一起删，不能和「重新注入」挨着（误点代价太高）
+        btns2 = QHBoxLayout()
+        btns2.setSpacing(8)
+        btns2.addStretch(1)
+        self.btn_uninstall = QPushButton('卸载注入')
+        self.btn_uninstall.setStyleSheet(_btn_style('danger'))
+        self.btn_uninstall.setFixedHeight(28)
+        self.btn_uninstall.setMinimumWidth(96)
+        self.btn_uninstall.setCursor(Qt.PointingHandCursor)
+        self.btn_uninstall.setToolTip(
+            '移除指令集里的注入段 + 全部随本工具部署的技能（有备份会还原）。\n'
+            '卸载后所有新会话都不再有指令集与技能，需要重新注入。')
+        btns2.addWidget(self.btn_uninstall)
+        lay.addLayout(btns2)
         self._refresh_addons()
 
     def _refresh_addons(self):
@@ -2263,7 +2378,7 @@ class TargetCard(QFrame):
         self._addon_lbl.setText('<span style="color:' + C['TEXT_SECONDARY'] + ';">附加包：</span>'
                                 + '　'.join(parts))
 
-    def update_state(self, installed, version_label, skill_mode=None):
+    def update_state(self, installed, version_label, skill_mode=None, hint='', hint_detail=''):
         self._refresh_addons()
         mode_txt = ''
         if installed and skill_mode in ('full', 'menu'):
@@ -2282,6 +2397,14 @@ class TargetCard(QFrame):
             self._st.setStyleSheet('color: ' + C['TEXT_MUTED'] + ';')
             self._tpl.setText('模板：—')
             self.btn_go.setText('去部署')
+
+        # 「已注入但客户端没重启」—— 只在已注入且判断成立时出现
+        if installed and hint:
+            self._warn.setText(hint)
+            self._warn.setToolTip(hint_detail or hint)
+            self._warn.setVisible(True)
+        else:
+            self._warn.setVisible(False)
 
 
 class QuickCard(QPushButton):
@@ -5022,8 +5145,9 @@ class MainWindow(FramelessWindow):
             installed, st = self._target_install_state(target)
             ver = st.get('versionLabel') if st else None
             mode = st.get('skillMode') if st else None
+            hint, detail = client_restart_hint(target, st or {}) if installed else ('', '')
             any_installed = any_installed or installed
-            self.page_home.cards[target['key']].update_state(installed, ver, mode)
+            self.page_home.cards[target['key']].update_state(installed, ver, mode, hint, detail)
         if self._busy:
             self.page_home._chip_all.set_state('任务执行中…', C['WARN'])
         elif any_installed:
@@ -5392,14 +5516,25 @@ class MainWindow(FramelessWindow):
                               skill_mode=(st.get('skillMode') or 'full'))
 
     def _uninstall(self, target):
+        st = read_json(state_path(target['key'])) or {}
+        skills = [s for s in (st.get('installedSkills') or []) if s]
+        n = len(skills)
+        if n:
+            preview = '、'.join(skills[:3]) + (' 等 ' + str(n) + ' 个' if n > 3 else '')
+            skill_line = '· 删除 ' + str(n) + ' 个随本工具部署的技能（' + preview + '）'
+        else:
+            skill_line = '· 删除状态清单里记录的本工具技能（当前清单为空）'
         ans = QMessageBox.question(
             self, APP_NAME,
             '确认卸载 ' + target['card'] + ' 的注入？\n\n'
-            '· 从 ' + prompt_name(target) + ' 摘除本工具管理段，有备份则还原\n'
-            '· 只删除状态清单里记录的本工具技能\n'
-            '· 客户端自带技能与用户同名技能不受影响\n'
-            '· 若目标文件在部署后被外部改过，会先停下让你确认（不静默覆盖）\n\n'
-            '注意：卸载后需重启客户端才生效。',
+            '>>> 卸载会同时拿走这三样 <<<\n'
+            '· ' + prompt_name(target) + ' 里的整段注入（<!-- BEGIN pi-workbench … --> 块）\n'
+            + skill_line + '\n'
+            '· home 级 patch（cordis.patch.yml 里 agent-instructions 那条）\n\n'
+            '· 客户端自带技能与用户同名技能不受影响（有备份会还原）\n'
+            '· **卸载后所有新会话都不再有指令集与技能，要重新注入才会回来**\n'
+            '· 需重启客户端才生效\n\n'
+            '真要卸载吗？（只是想让改动生效的话，注入后重启客户端即可，不用卸载）',
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if ans != QMessageBox.Yes:
             return
