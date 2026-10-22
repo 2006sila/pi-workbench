@@ -120,7 +120,8 @@ for nm in (st().get('installedSkills') or []):
         if 'disable-model-invocation: true' in txt:
             flagged += 1
 ro4, tot4 = ro_stat()
-chk(c == 0 and flagged >= 60, 'menu-flag-under-readonly', 'exit=%d 已标记 %d 个' % (c, flagged))
+_n = len([d for d in os.listdir(SKILLS) if os.path.exists(os.path.join(SKILLS, d, 'SKILL.md'))])
+chk(c == 0 and flagged >= _n - 2, 'menu-flag-under-readonly', 'exit=%d 已标记 %d / 共 %d 个' % (c, flagged, _n))
 chk(ro4 == tot4 and tot4 > 100, 'menu-then-readonly', '只读 %d/%d' % (ro4, tot4))
 
 print('=== 6 卸载：先解锁再删，清干净 ===')

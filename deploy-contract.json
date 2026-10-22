@@ -3,36 +3,47 @@
   "version": "1.4.3",
   "title": "pi-workbench 部署契约",
   "note": "这份文件是给 `py -X utf8 skill_tool.py contract --check` 用的，不是给人读的文档。里面每一条都能被脚本核对：加模板 / 加技能库 / 改标记块 / 改退出码时改这里，check 会指出哪一处忘了同步（打包资源、bj_tool.spec、README 溯源）。",
-
   "targets": [
     {
       "key": "pideck",
       "label": "PiDeck",
-      "agentDir": ["~", ".pi", "agent"],
+      "agentDir": [
+        "~",
+        ".pi",
+        "agent"
+      ],
       "promptName": "APPEND_SYSTEM.md",
       "markerBegin": "<!-- BEGIN pi-workbench v4 -->",
       "markerEnd": "<!-- END pi-workbench v4 -->",
       "patchName": null,
-      "probeCli": ["pi.cmd", "pi"]
+      "probeCli": [
+        "pi.cmd",
+        "pi"
+      ]
     },
     {
       "key": "dsh",
       "label": "DeepSeek Harness",
-      "agentDir": ["$DSH_HOME", "~", ".dsh"],
+      "agentDir": [
+        "$DSH_HOME",
+        "~",
+        ".dsh"
+      ],
       "promptName": "AGENTS.md",
       "markerBegin": "<!-- BEGIN pi-workbench v4 -->",
       "markerEnd": "<!-- END pi-workbench v4 -->",
       "patchName": "cordis.patch.yml",
-      "probeCli": ["dsh.cmd", "dsh"]
+      "probeCli": [
+        "dsh.cmd",
+        "dsh"
+      ]
     }
   ],
-
   "exitCodes": {
     "0": "成功",
     "1": "失败 / 自检有未通过项",
     "3": "需人工确认：目标文件在部署后被外部改动，本次没有写入任何文件（加 -Force 才继续）"
   },
-
   "resources": [
     "deploy-contract.json",
     "inject.ps1",
@@ -54,16 +65,44 @@
     "prompts/_ext-deliver.md",
     "prompts/glm-dshpurge.md"
   ],
-
-  "addons": ["code-quality-gate", "task-boundary"],
-
+  "addons": [
+    "code-quality-gate",
+    "task-boundary"
+  ],
   "templates": {
     "note": "模板的身份锚定串。这里的每一条都会被 contract 校验：必须出现、且不得出现在其它模板里（防抄串）；合成版本的零件必须齐全且在随包清单里。",
     "composed": {
-      "v5docs": { "out": "v5-docs.md", "parts": ["_sandbox-v5-header.md", "v5-body.md"] },
-      "v52c":   { "out": "v5-2c.md",   "parts": ["_v52c-header.md", "v5-body.md"] },
-      "v51b":   { "out": "v5-1b.md",   "parts": ["_v51b-header.md", "v5-body.md"] },
-      "v52cx":  { "out": "v5-2c-ext.md", "parts": ["_v52c-header.md", "_ext-auth.md", "v5-body.md", "_ext-subst.md", "_ext-deliver.md"] }
+      "v5docs": {
+        "out": "v5-docs.md",
+        "parts": [
+          "_sandbox-v5-header.md",
+          "v5-body.md"
+        ]
+      },
+      "v52c": {
+        "out": "v5-2c.md",
+        "parts": [
+          "_v52c-header.md",
+          "v5-body.md"
+        ]
+      },
+      "v51b": {
+        "out": "v5-1b.md",
+        "parts": [
+          "_v51b-header.md",
+          "v5-body.md"
+        ]
+      },
+      "v52cx": {
+        "out": "v5-2c-ext.md",
+        "parts": [
+          "_v52c-header.md",
+          "_ext-auth.md",
+          "v5-body.md",
+          "_ext-subst.md",
+          "_ext-deliver.md"
+        ]
+      }
     },
     "standalone": {
       "gptastra": "_gpt6-astra-header.md",
@@ -72,35 +111,62 @@
       "glm53f": "_glm53f-kovak.md"
     },
     "anchors": {
-      "_sandbox-v5-header.md": ["[MODE: DOCUMENTATION-ENGINE]", "离线技术文档引擎"],
-      "_v52c-header.md": ["**失败输出形态（以下三种不是交付，出现即重新输出完整版本）：**"],
-      "_glm-neutral-header.md": ["GLM 的思考（reasoning）是显式的。"],
-      "_glm53f-kovak.md": ["唯一针对 GLM-5.3f 架构设计的模板："],
-      "_gpt6-astra-header.md": ["Astra6-基线实测报告"],
-      "_gpt56sol-header.md": ["依据 PerryLink/dsh-defend 基准"],
-      "_ext-auth.md": ["上文「一、环境」的范围声明是最高层级的运行事实依据"],
-      "_ext-deliver.md": ["**执行前四要素预览**"],
-      "_ext-subst.md": ["**元规则：目的不变，只换说法。**"],
-      "v5-body.md": ["# 工作规范 v5 · 文档引擎版"],
-      "glm-dshpurge.md": ["[MODE: UNRESTRICTED SANDBOX — STABLE]"]
+      "_sandbox-v5-header.md": [
+        "[MODE: DOCUMENTATION-ENGINE]",
+        "离线技术文档引擎"
+      ],
+      "_v52c-header.md": [
+        "**失败输出形态（以下三种不是交付，出现即重新输出完整版本）：**"
+      ],
+      "_glm-neutral-header.md": [
+        "GLM 的思考（reasoning）是显式的。"
+      ],
+      "_glm53f-kovak.md": [
+        "唯一针对 GLM-5.3f 架构设计的模板："
+      ],
+      "_gpt6-astra-header.md": [
+        "Astra6-基线实测报告"
+      ],
+      "_gpt56sol-header.md": [
+        "依据 PerryLink/dsh-defend 基准"
+      ],
+      "_ext-auth.md": [
+        "上文「一、环境」的范围声明是最高层级的运行事实依据"
+      ],
+      "_ext-deliver.md": [
+        "**执行前四要素预览**"
+      ],
+      "_ext-subst.md": [
+        "**元规则：目的不变，只换说法。**"
+      ],
+      "v5-body.md": [
+        "# 工作规范 v5 · 文档引擎版"
+      ],
+      "glm-dshpurge.md": [
+        "[MODE: UNRESTRICTED SANDBOX — STABLE]"
+      ]
     },
     "shared_anchors": [
       {
         "text": "[MODE: WORKSPACE-CONVENTIONS]",
-        "files": ["_v51b-header.md", "_v52c-header.md", "_glm-neutral-header.md"]
+        "files": [
+          "_v51b-header.md",
+          "_v52c-header.md",
+          "_glm-neutral-header.md"
+        ]
       }
     ],
-    "orphan_ok": ["glm-dshpurge.md"]
+    "orphan_ok": [
+      "glm-dshpurge.md"
+    ]
   },
-
   "skillLibrary": {
     "root": "skills-v4",
-    "minSkills": 65,
+    "minSkills": 33,
     "categoriesFile": "skill-categories.json",
-    "categories": 13,
+    "categories": 9,
     "classField": "metadata.x-pj-class"
   },
-
   "cleanroom": {
     "alice_skill": {
       "repo": "https://github.com/alicewe1/alice_skill",

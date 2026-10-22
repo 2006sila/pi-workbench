@@ -130,8 +130,8 @@ shutil.rmtree(SBX, ignore_errors=True)
 for d in (HOME, LOCAL, AGENT):
     os.makedirs(d, exist_ok=True)
 
-print('== 1. 真实技能库 · 极简模式（65 模块，阈值 12）==')
-code, out = run('-Target', 'dsh', '-SourcePrompt', SP, '-SkillMode', 'menu')
+print('== 1. 真实技能库 · 极简模式（33 模块；真实库最大类目 10 个，默认阈值 12 已不拆片，这里显式降到 5 验拆片）==')
+code, out = run('-Target', 'dsh', '-SourcePrompt', SP, '-SkillMode', 'menu', '-ShardThreshold', '5')
 chk(code == 0, '菜单模式部署成功', 'exit=%d' % code)
 mt = menu_text()
 chk(bool(mt), '菜单技能已生成', '%d 字符' % len(mt))
@@ -143,7 +143,7 @@ if secs:
     s0 = txt(os.path.join(SEC_DIR, secs[0]))
     chk('| 模块 | 评分 | 何时用 |' in s0, '分片表带评分列')
     sharded_ids = re.findall(r'^\| ' + chr(96) + r'([a-z0-9-]+)' + chr(96), s0, re.M)
-    chk(len(sharded_ids) >= 13, '分片列出模块 id', '%d 个' % len(sharded_ids))
+    chk(len(sharded_ids) >= 6, '分片列出模块 id', '%d 个' % len(sharded_ids))
     # 一个模块可能同时挂在两个类目里：只对「只属于这一类」的模块要求它不在菜单正文
     from collections import Counter as _C
     _cats = json.load(open(os.path.join(ROOT, 'skill-categories.json'), encoding='utf-8'))['categories']

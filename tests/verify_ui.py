@@ -148,7 +148,9 @@ app.processEvents()
 run_task()
 chk('极简部署：菜单技能就位', os.path.exists(menu))
 f1 = flagged()
-chk('极简部署：普通模块带标记', len(f1) >= 60, '带标记 %d 个' % len(f1))
+# 减 3 = 菜单技能 + 2 个附属包（code-quality-gate / task-boundary，menuKeepAdvertised 保持常驻）
+_n = len([d for d in os.listdir(sk) if os.path.exists(os.path.join(sk, d, 'SKILL.md'))])
+chk('极简部署：普通模块带标记', len(f1) >= _n - 3, '带标记 %d / 共 %d 个' % (len(f1), _n))
 chk('极简部署：附属模板保持常驻', 'code-quality-gate' not in f1 and 'task-boundary' not in f1)
 
 print('=== 5 切回完整：菜单技能删除 + 标记清零 ===')

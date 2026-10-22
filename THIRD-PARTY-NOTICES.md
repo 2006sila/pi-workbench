@@ -30,22 +30,17 @@
 | `dotnet-reverse` | MIT |
 | `reverse-engineering` | MIT |
 
-## 4. 未声明来源或许可的技能（59）
+## 4. 未声明来源或许可的技能（27）
 
 这些目录里既没有 `LICENSE`，frontmatter 也没有 `license:` / `author:`。
 本仓库把它们作为**整理收集的资料**随附；**再分发或商用前请自行确认权利人意愿**
-（本仓库不代为授权）。数量：59 / 65。
+（本仓库不代为授权）。数量：27 / 33。
 
-- `adult-fiction`、`anti-cheat`、`api-security`、`apk-reverse`、`attack-chain`、`binary-analysis`
-- `binary-diff`、`border-crossing`、`code-quality-gate`、`crack-keygen`、`dma-attack`、`dynamic-instrumentation`
-- `edr-bypass-re`、`finance-movement`、`firmware-pentest`、`full-crack`、`full-pentest`、`game-cheat`
-- `game-engine`、`game-hacking`、`graphics-api`、`ida-reverse`、`identity-docs`、`js-reverse`
-- `l-gameassist`、`l-license`、`l-reverse`、`l-webrecon`、`mobile-competitive-game-security`、`mobile-reverse`
-- `mobile-security`、`network-pentest`、`patch-diff-exploit`、`phishing-kit`、`pipeline-renderer`、`politics-history`
-- `protocol-reversing`、`pwn-chain`、`radare2`、`rei-fallback`、`research-rigor`、`seagull-anticheat`
-- `seagull-auto-ops`、`seagull-evasion`、`seagull-exploit`、`seagull-game-hack`、`seagull-game-redteam`、`seagull-game-security`
-- `seagull-lab`、`seagull-license-security`、`seagull-malware`、`seagull-mature-content`、`seagull-memory`、`seagull-pentest`
-- `seagull-reverse`、`seagull-social-eng`、`seagull-unlimited`、`task-boundary`、`windows-kernel`
+- `anti-cheat`、`api-security`、`apk-reverse`、`attack-chain`、`binary-diff`、`code-quality-gate`
+- `dma-attack`、`edr-bypass-re`、`firmware-pentest`、`game-engine`、`game-hacking`、`graphics-api`
+- `ida-reverse`、`js-reverse`、`l-license`、`l-webrecon`、`mobile-competitive-game-security`、`mobile-security`
+- `patch-diff-exploit`、`pwn-chain`、`radare2`、`research-rigor`、`seagull-lab`、`seagull-malware`
+- `seagull-memory`、`task-boundary`、`windows-kernel`
 
 ## 5. 提示词模板与机制溯源
 
