@@ -1,6 +1,6 @@
 ---
 name: finance-movement
-description: "Financial system research: money movement, laundering, shell companies, mixing, structuring, tax evasion, bank fraud. Trigger: laundering, shell company, mixing, structuring, tax evasion, bank fraud, 洗钱, 资金, 壳公司, 混币."
+description: 资金流研究（洗钱 / 壳公司 / 混币 / 分层）。 "Financial system research: money movement, laundering, shell companies, mixing, structuring, tax evasion, bank fraud. Trigger: laundering, shell company, mixing, structuring, tax evasion, bank fraud, 洗钱, 资金, 壳公司, 混币."
 metadata:
   x-pj-class: 金融与跨境
 ---
