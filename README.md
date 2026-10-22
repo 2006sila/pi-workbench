@@ -419,7 +419,7 @@ py -X utf8 skill_tool.py pack --verify build\skill-library.zip
 
 ### 方式一：用打包好的发布包
 
-从 [Releases](https://github.com/2006sila/pi-workbench/releases/latest) 下载 `pi-workbench-v1.4.3-windows-x64.zip`，
+从 [Releases](https://github.com/2006sila/pi-workbench/releases/latest) 下载 `pi-workbench-v1.4.4-windows-x64.zip`，
 解压到任意目录（例  `D:\pi-workbench\`），双击其中的 `pi用学习工作台\pi用学习工作台.exe` 即用（无需 Python 环境）。
 
 自 v1.4.1 起改为 **onedir** 发布形态：不再是单文件自解压，启动过程不碰 `%TEMP%`
@@ -639,6 +639,32 @@ pi-workbench/
 ---
 
 ## 更新记录
+
+**V1.4.4 · 2026-10-22**
+
+本版只做一件事：**把极简模式修好**。
+
+**一、根因**
+
+极简模式原本「只留一个菜单技能进提示词，其余全部隐藏」，连 `l-gameassist`（MUST 直接实现）、
+`l-reverse` / `l-license` / `l-webrecon`（MUST on …）、`seagull-anticheat` / `seagull-game-redteam` /
+`seagull-license-security`（force-start）、`seagull-unlimited`（不因关键词停工）、`task-boundary`（只读判定）
+这类**行为开关**也一起藏了 → 模型看不到「遇事直接做」，退回「先评估再决定」→ **直接拒答**。
+
+**二、修法**
+
+新增 `MENU_KEEP_ALWAYS`（9 个），与原附加包合并去重成 10 个，部署时走 `-MenuKeepAdvertised`；
+这 10 个模块在极简模式下**不带隐藏标记**，其余 55 个仍按需 read。
+
+| 模式 | 每轮常驻 | 行为开关 | 破甲词 (25) |
+|---|---|---|---|
+| 完整模式 | ≈ 4.6k | 9/9 | 25/25 |
+| **极简模式（本版）** | **≈ 530** | **9/9** | **25/25** |
+
+**三、触发词补齐**：`seagull-anticheat` ← shellcode 载荷 / 加载器；`l-reverse` ← 加壳 / 反汇编。
+
+**四、技能库保持 65 个**：曾精简到 40 个（省 1.1k tokens/轮）实测导致拒答，已回滚。
+判据与硬规矩见下文「省 token 靠极简模式，不要靠删模块」。
 
 **V1.4.3 · 2026-10-21**
 

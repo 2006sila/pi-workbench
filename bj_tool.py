@@ -28,8 +28,8 @@ from PySide6.QtWidgets import (
 
 APP_NAME = 'pi用学习工作台'
 APP_SUBTITLE = 'PiDeck / DeepSeek Harness 一键部署 · 注入即用 · 卸载即还原'
-APP_VERSION = 'V1.4.3'
-APP_BUILD = '2026-10-21 · v1.4.3 首页「客户端需重启才生效」提示 + 卸载按钮分离与后果确认'
+APP_VERSION = 'V1.4.4'
+APP_BUILD = '2026-10-22 · v1.4.4 极简模式常驻 10 个行为开关（修「极简下拒答」）+ 破甲/逆向触发词补齐'
 
 _ACTIVE_WINDOW = None
 _THEME_FILTER = None      # 系统主题监听器：必须持引用，否则可能被 GC 后悬垂
