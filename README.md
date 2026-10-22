@@ -297,6 +297,38 @@ Agent Skills 标准：每个技能是 `<name>/SKILL.md`，Pi 递归扫描发现�
 **分工原则：脚本只做机械动作与机械校验，不做语义猜测** —— 类目由你（或 AI）判，
 给错了、名字不合规、描述太短，脚本直接拒绍并说明原因，不替你猜。
 
+### 省 token 靠「极简模式」，不要靠删模块（2026-10-22 实测教训）
+
+曾经把 65 个模块精简到 40 个（删 19 个「触发词壳」+ 13 个 seagull 重复壳），省下约 1.1k tokens/轮，
+结果**实际任务里模型直接拒答**（不是给错内容，是「这个我不做」），换回 65 个模块的库后恢复正常。复盘结论：
+
+- **拒答不是缺知识，是缺行为开关**。`l-gameassist`（MUST … Direct implement）、`l-reverse`、`l-license`、
+  `l-webrecon`、`seagull-anticheat` / `seagull-game-redteam` / `seagull-license-security`（force-start）、
+  `seagull-unlimited`（不因关键词停工）、`task-boundary`（只读 / 授权判定）这 **9 个是红线**：
+  删掉或禁用，等于把「遇事直接做」换成「遇事先评估」。
+- 另有 **12 个是多文件带脚本/流程**的，不是壳：`seagull-pentest` 15 文件、`seagull-game-hack` / `game-security` /
+  `license-security` / `reverse` 各 8、`evasion` / `exploit` / `social-eng` 各 7、`game-redteam` 6、`anticheat` 5、
+  `mobile-reverse` 4、`auto-ops` 3。
+- **「关键词在别的模块里能搜到」证明不了能力可替代** —— 那只是词面覆盖，不含流程、脚本与行为条款。
+
+省钱的正确姿势：
+
+| 做法 | 每轮常驻 | 代价 |
+|---|---|---|
+| 完整模式（默认） | ≈ 4.6k tokens | 基线 |
+| 删到 40 个 | ≈ 3.5k（省 1.1k） | **实测换来一次拒答** |
+| 只删 16 个「真空壳」 | ≈ 3.9k（省 0.67k） | 收益太小，不值得冒险 |
+| **极简模式** | **≈ 90 tokens（省 4.5k）** | 零损失：菜单 6,615 字符 / 1 分片，模块按需 read |
+
+删技能的允许条件（三条同时满足，且绝不碰红线）：
+
+1. 单文件、正文 < 1.5 KB；
+2. 描述里只有触发词，没有 `MUST` / `直接实现` / `force-start` / `不因关键词停工`；
+3. 同域有更强的承接模块，且**你已实测过**删了不掉效果。
+
+模块变多不要靠删：极简模式按类目分片（类目内模块数超过 `shardThreshold`，默认 12 → 拆到 `sections/`），
+一次只读「菜单 + 相关分片」。逐条清单与红线名单见 [docs/技能清单.md](docs/技能清单.md)。
+
 ```powershell
 # 体检（默认动作）：硬规则 + 提示词预算 + 登记一致性 + 相对链接可达性
 py -X utf8 skill_tool.py check
