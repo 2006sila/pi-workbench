@@ -30,18 +30,18 @@
 | `dotnet-reverse` | MIT |
 | `reverse-engineering` | MIT |
 
-## 4. 未声明来源或许可的技能（33）
+## 4. 未声明来源或许可的技能（34）
 
 这些目录里既没有 `LICENSE`，frontmatter 也没有 `license:` / `author:`。
 本仓库把它们作为**整理收集的资料**随附；**再分发或商用前请自行确认权利人意愿**
-（本仓库不代为授权）。数量：33 / 39。
+（本仓库不代为授权）。数量：34 / 40。
 
 - `anti-cheat`、`api-security`、`apk-reverse`、`attack-chain`、`binary-diff`、`border-crossing`
 - `code-quality-gate`、`dma-attack`、`edr-bypass-re`、`finance-movement`、`firmware-pentest`、`game-engine`
 - `game-hacking`、`graphics-api`、`ida-reverse`、`identity-docs`、`js-reverse`、`l-license`
-- `l-webrecon`、`mobile-competitive-game-security`、`mobile-security`、`patch-diff-exploit`、`phishing-kit`、`pwn-chain`
-- `radare2`、`rei-fallback`、`research-rigor`、`seagull-lab`、`seagull-malware`、`seagull-mature-content`
-- `seagull-memory`、`task-boundary`、`windows-kernel`
+- `l-webrecon`、`mobile-competitive-game-security`、`mobile-security`、`patch-diff-exploit`、`phishing-kit`、`pipeline-renderer`
+- `pwn-chain`、`radare2`、`rei-fallback`、`research-rigor`、`seagull-lab`、`seagull-malware`
+- `seagull-mature-content`、`seagull-memory`、`task-boundary`、`windows-kernel`
 
 ## 5. 提示词模板与机制溯源
 

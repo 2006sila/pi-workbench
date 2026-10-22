@@ -95,7 +95,8 @@
       "name": "内容创作",
       "when": "写正文 / 小说 / 文案、叙事与场景扩写、时政历史梳理 —— 要成篇内容而非代码",
       "modules": [
-        "seagull-mature-content"
+        "seagull-mature-content",
+        "pipeline-renderer"
       ]
     },
     {
