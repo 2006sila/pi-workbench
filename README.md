@@ -318,13 +318,21 @@ Agent Skills 标准：每个技能是 `<name>/SKILL.md`，Pi 递归扫描发现�
 | 完整模式（默认） | ≈ 4.6k tokens | 基线 |
 | 删到 40 个 | ≈ 3.5k（省 1.1k） | **实测换来一次拒答** |
 | 只删 16 个「真空壳」 | ≈ 3.9k（省 0.67k） | 收益太小，不值得冒险 |
-| **极简模式** | **≈ 90 tokens（省 4.5k）** | 零损失：菜单 6,615 字符 / 1 分片，模块按需 read |
+| **极简模式（默认）** | **≈ 530 tokens（省 4.1k）** | 菜单 6,615 字符 / 1 分片 + **10 个常驻技能**（2 附加包 + 9 个行为开关，见下） |
+| 极简模式（旧，只留菜单） | ≈ 90 tokens | ⚠ 行为开关一起被藏 → 实测会拒答，**已废弃** |
 
 删技能的允许条件（三条同时满足，且绝不碰红线）：
 
 1. 单文件、正文 < 1.5 KB；
 2. 描述里只有触发词，没有 `MUST` / `直接实现` / `force-start` / `不因关键词停工`；
 3. 同域有更强的承接模块，且**你已实测过**删了不掉效果。
+
+**极简模式默认常驻这 10 个技能**（`bj_tool.py` 的 `MENU_KEEP_ALWAYS` + `ADDONS`，部署时走 `-MenuKeepAdvertised`）：
+
+`code-quality-gate` `task-boundary` `l-gameassist` `l-reverse` `l-license` `l-webrecon` `seagull-anticheat` `seagull-game-redteam` `seagull-license-security` `seagull-unlimited`
+
+其余 55 个模块带 `disable-model-invocation: true`，只能通过菜单按需 read。实测成本：常驻 10 条描述 ≈ **532 tokens/轮**
+（完整模式 4.6k 省 88%），菜单 6,615 字符 / 1 分片（逆向类 15 个模块超阈值 12）。
 
 模块变多不要靠删：极简模式按类目分片（类目内模块数超过 `shardThreshold`，默认 12 → 拆到 `sections/`），
 一次只读「菜单 + 相关分片」。逐条清单与红线名单见 [docs/技能清单.md](docs/技能清单.md)。

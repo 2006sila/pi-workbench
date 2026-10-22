@@ -90,7 +90,8 @@ c, o = run('-Target', 'dsh', '-SourcePrompt', SP, '-SkillsSource', SK,
            '-SkillMode', 'menu', '-MenuKeepAdvertised', 'code-quality-gate;task-boundary')
 s = st()
 chk(c == 0 and s.get('skillMode') == 'menu', 'deploy-menu-mode', 'exit=%d mode=%s' % (c, s.get('skillMode')))
-chk(s.get('menuKeepAdvertised') == 'code-quality-gate;task-boundary', 'keep-advertised-recorded',
+_keep = set((s.get('menuKeepAdvertised') or '').split(';')) - {''}
+chk({'code-quality-gate', 'task-boundary'} <= _keep, 'keep-advertised-recorded',
     'keep=%s' % s.get('menuKeepAdvertised'))
 chk(MENU in (s.get('installedSkills') or []), 'menu-in-installed-skills', '')
 chk(os.path.exists(os.path.join(SKILLS, MENU, 'SKILL.md')), 'menu-skill-on-disk', '')

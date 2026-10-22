@@ -148,9 +148,13 @@ app.processEvents()
 run_task()
 chk('极简部署：菜单技能就位', os.path.exists(menu))
 f1 = flagged()
-# 减 3 = 菜单技能 + 2 个附属包（code-quality-gate / task-boundary，menuKeepAdvertised 保持常驻）
+# 常驻 = 菜单技能 + 附加包 + 行为开关（bj_tool.MENU_KEEP_ALWAYS），其余模块都应带标记
+_keep = {a['skill_name'] for a in m.ADDONS} | set(m.MENU_KEEP_ALWAYS)
 _n = len([d for d in os.listdir(sk) if os.path.exists(os.path.join(sk, d, 'SKILL.md'))])
-chk('极简部署：普通模块带标记', len(f1) >= _n - 3, '带标记 %d / 共 %d 个' % (len(f1), _n))
+chk('极简部署：普通模块带标记', len(f1) >= _n - 1 - len(_keep),
+    '带标记 %d / 共 %d 个（常驻 %d）' % (len(f1), _n, len(_keep)))
+chk('极简部署：行为开关保持常驻', not (set(m.MENU_KEEP_ALWAYS) & set(f1)),
+    '被标记了: %s' % sorted(set(m.MENU_KEEP_ALWAYS) & set(f1))[:4])
 chk('极简部署：附属模板保持常驻', 'code-quality-gate' not in f1 and 'task-boundary' not in f1)
 
 print('=== 5 切回完整：菜单技能删除 + 标记清零 ===')

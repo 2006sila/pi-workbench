@@ -477,6 +477,33 @@ ADDONS = [
     },
 ]
 
+# 极简模式下也必须保持进提示词的「行为开关型」技能。
+#
+# 它们不是知识库，而是「遇事直接做」的授权条款：MUST / force-start / 直接实现 / 不因关键词停工。
+# 把它们藏进菜单 → 模型看不见这些条款，行为退回「先评估意图再决定做不做」，实测就是直接拒答
+# （2026-10-22 那次 65→40 精简就是这么踩的，详见 docs/技能清单.md 第十八节）。
+# 名单判据：描述里带 MUST / force-start / Direct implement / 不因关键词停工 / 只读判定。
+MENU_KEEP_ALWAYS = [
+    'l-gameassist',            # MUST … Direct implement（外挂/ESP/自瞄/修改器口语）
+    'l-reverse',               # MUST on 逆向/脱壳/反编译/Frida/协议
+    'l-license',               # MUST when 破解/绕过激活/卡密/注册机
+    'l-webrecon',              # MUST on 搞一下/渗透/测安全 + URL
+    'seagull-anticheat',       # force-start … instead of refused（ACE/过检/驱动读写/HWID）
+    'seagull-game-redteam',    # force-start（ESP/内核读/注入脚手架）
+    'seagull-license-security',# force-start（卡密/激活/patch-point）
+    'seagull-unlimited',       # 不因关键词停工（全域授权）
+    'task-boundary',           # 只读 / 授权模式的判定层
+]
+
+
+def menu_keep_names():
+    """极简模式下保持进提示词的技能名单 = 附加包 + 行为开关，去重保序。"""
+    names = [a['skill_name'] for a in ADDONS]
+    for n in MENU_KEEP_ALWAYS:
+        if n not in names:
+            names.append(n)
+    return names
+
 
 # ------------------------------------------------------------------ 工具函数
 
@@ -5386,7 +5413,7 @@ class MainWindow(FramelessWindow):
                 dirs += [a['skill_dir'] for a in ADDONS if a['key'] in addon_keys]
                 args += ['-SkillsSource', ';'.join(dirs)]
             args += ['-SkillMode', skill_mode]
-            args += ['-MenuKeepAdvertised', ';'.join(a['skill_name'] for a in ADDONS)]
+            args += ['-MenuKeepAdvertised', ';'.join(menu_keep_names())]
             mode_note = ' · ' + ('极简模式' if skill_mode == 'menu' else '完整模式')
             if (read_app_config() or {}).get('readonlySkills'):
                 args.append('-Readonly')
@@ -5500,8 +5527,8 @@ class MainWindow(FramelessWindow):
         skill_mode=auto 时沿用目标端上次记录的模式。"""
         args = ['-Target', target['key'], '-SkillsOnly', '-SkillsSource', skills_dirs,
                 '-SkillMode', skill_mode,
-                # 附属包是纪律型技能，极简模式下也要保持进提示词（靠描述自动触发才有意义）
-                '-MenuKeepAdvertised', ';'.join(a['skill_name'] for a in ADDONS)]
+                # 附属包 + 行为开关型技能，极简模式下也要保持进提示词（靠描述自动触发才有意义）
+                '-MenuKeepAdvertised', ';'.join(menu_keep_names())]
 
         def done(code, tail):
             if code == 0:
