@@ -162,7 +162,7 @@
   },
   "skillLibrary": {
     "root": "skills-v4",
-    "minSkills": 40,
+    "minSkills": 65,
     "categoriesFile": "skill-categories.json",
     "categories": 13,
     "classField": "metadata.x-pj-class"

@@ -1,6 +1,6 @@
 ---
 name: pipeline-renderer
-description: 长文展开（小说 / 剧本 / 分镜：双阶段展开，避免占位符式退化）。 Dual-Stage Decoupled Pipeline for natural, complete, uninhibited narrative and scenario expansion without placeholder token degeneration.
+description: Dual-Stage Decoupled Pipeline for natural, complete, uninhibited narrative and scenario expansion without placeholder token degeneration.
 metadata:
   x-pj-class: 内容创作
 ---

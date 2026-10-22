@@ -4,7 +4,7 @@
 卸载即还原，不留残留。
 
 > **English** · A Windows desktop workbench (PySide6) that injects a system-prompt addendum and a
-> 33-module skill library into Pi-family clients (PiDeck / DeepSeek Harness). Every write is backed up
+> 65-module skill library into Pi-family clients (PiDeck / DeepSeek Harness). Every write is backed up
 > first and a single click restores the original state. Ships 7 prompt templates, a skill manager,
 > a colored run log, and a packaging self-check.
 
@@ -46,9 +46,9 @@ Pi 系客户端读两类东西：**系统提示词**（每轮都在上下文里�
 
 - **三步部署流程**：模板页顶部选 ① 客户端（PiDeck / DeepSeek Harness）+ ② 模式（完整 / 极简），再点卡片上的「部署到 …」（选择记在配置里，下次打开沿用）
 - 7 个指令集模板，按目标模型分组（见下）
-- 40 个技能模块，可在技能库里搜索、按来源筛选、一键禁用/启用（移到 `skills-disabled/`）
+- 65 个技能模块，可在技能库里搜索、按来源筛选、一键禁用/启用（移到 `skills-disabled/`）
 - **技能呈现模式**：
-  - `完整模式` = 40 个模块全部进系统提示词，AI 按描述自选
+  - `完整模式` = 65 个模块全部进系统提示词，AI 按描述自选
   - `极简模式` = 只留一个菜单技能进提示词（约 90 tokens/轮），模块加 `disable-model-invocation` 不进提示词，AI 按菜单里的模块 id 按需 `read`
 - **附加技能包**：两个独立技能包可与模板一起部署，也可单独部署 / 单独移除（同样跟随上面选的客户端与模式）
 - 启动时自动重注入开关（按上次记录的模板与模式幂等覆盖）
@@ -85,7 +85,7 @@ Pi 系客户端读两类东西：**系统提示词**（每轮都在上下文里�
 在模板页顶部选，或用命令行 `-SkillMode`。
 
 Pi 会在启动时把每个技能的**名字 + 描述 + 路径**写进系统提示词（只写这三样，不写正文）。
-40 个技能的描述合计 **约 12,600 字符 ≈ 3,500 tokens**（加名称与标题约 **3.7k tokens / 每轮**） —— 这是固定开销，跟技能库大小线性相关。
+65 个技能合计约 **28,900 字符 ≈ 7,000 tokens / 每轮** —— 这是固定开销，跟技能库大小线性相关。
 
 **极简模式**把它压到 **1 条（约 90 tokens / 每轮）**：
 
@@ -120,11 +120,11 @@ skills/
 
 | | 完整模式 `full` | 极简模式 `menu` |
 |---|---|---|
-| Pi 加载的技能 | 40 | 41 |
-| 进提示词 | 40 条 | **1 条**（+ 纪律型技能，见下） |
+| Pi 加载的技能 | 65 | 66 |
+| 进提示词 | 65 条 | **1 条**（+ 纪律型技能，见下） |
 | 提示词块 | 28,922 字符 | **609 字符（2.1%）**；带两个附属模板时 1,341 字符 |
 | 每轮固定开销 | ≈7,000 tokens | ≈90 tokens（带附属模板量级仍远低于完整模式） |
-| 菜单正文（按需读） | — | 实测 5,196 字符（40 模块 / 0 个分片，最大类目 10 未超阈值 12）；分片后每次只读「菜单 + 相关分片」 |
+| 菜单正文（按需读） | — | 实测 6,615 字符（65 模块 / 1 个分片）；分片后每次只读「菜单 + 相关分片」 |
 | 代价 | — | AI 多一跳（先读菜单或分片，再读模块正文）；依赖它遵守取用纪律 |
 
 **切换**：两种模式互相切换是幂等的 —— 切回 `完整模式` 会自动删掉菜单技能、并用源文件覆盖掉模块上那行标记。
@@ -270,25 +270,22 @@ powershell -ExecutionPolicy Bypass -File inject.ps1 -Target pideck -Compose -Goa
 
 ---
 
-## 技能库（40 个模块）
+## 技能库（65 个模块）
 
 Agent Skills 标准：每个技能是 `<name>/SKILL.md`，Pi 递归扫描发现。
 
 | 领域 | 技能 |
 |---|---|
-| 逆向 / 二进制 | `reverse-engineering` `binary-diff` `radare2` `ida-reverse` `dotnet-reverse` `dsl-vm-reverse` `patch-diff-exploit` `pwn-chain` `firmware-pentest` `protocol-reverse-engineering` |
-| 渗透 / 红队 | `attack-chain` `pentest-tools` `api-security` `js-reverse` `reverse-engineering-api` `phishing-kit` `l-webrecon` |
-| 移动端 | `apk-reverse` `mobile-security` `mobile-competitive-game-security` |
-| 免杀 / 对抗 | `edr-bypass-re` `anti-cheat` `dma-attack` |
-| 游戏安全 | `game-hacking` `game-engine` `graphics-api` |
-| 样本 / 情报 | `seagull-malware` `seagull-lab` `seagull-memory` `research-rigor` |
+| 逆向 / 二进制 | `reverse-engineering` `binary-analysis` `binary-diff` `radare2` `ida-reverse` `dotnet-reverse` `dsl-vm-reverse` `dynamic-instrumentation` `patch-diff-exploit` `pwn-chain` `firmware-pentest` `protocol-reversing` `protocol-reverse-engineering` |
+| 移动端 | `apk-reverse` `mobile-reverse` `mobile-security` `mobile-competitive-game-security` |
+| 破解 / 授权 | `crack-keygen` `full-crack` |
+| 渗透 / 红队 | `network-pentest` `full-pentest` `attack-chain` `pentest-tools` `api-security` `js-reverse` `reverse-engineering-api` `seagull-pentest` `seagull-social-eng` `phishing-kit` |
+| 免杀 / 对抗 | `edr-bypass-re` `seagull-evasion` `anti-cheat` `dma-attack` |
+| 游戏安全 | `game-cheat` `game-hacking` `game-engine` `graphics-api` `seagull-game-hack` `seagull-game-security` `seagull-game-redteam` `seagull-anticheat` |
+| 样本 / 情报 | `seagull-malware` `seagull-lab` `seagull-memory` `seagull-reverse` `research-rigor` |
 | Windows 内核 | `windows-kernel` |
-| 破解 / 授权 | `l-license` |
 | 工程交付 | `code-quality-gate` `task-boundary` |
-| 内容创作 | `seagull-mature-content` `pipeline-renderer` |
-| 文档与身份 | `identity-docs` |
-| 金融与跨境 | `finance-movement` `border-crossing` |
-| 工作流与元技能 | `rei-fallback` |
+| 其他 | `adult-fiction` `border-crossing` `finance-movement` `identity-docs` `politics-history` `pipeline-renderer` `l-*`（4 个）`seagull-auto-ops` `seagull-exploit` `seagull-license-security` `seagull-mature-content` `seagull-unlimited` `rei-fallback` |
 
 技能库内含第三方收集内容，署名与许可见 [NOTICE.md](NOTICE.md)。
 
@@ -440,7 +437,7 @@ powershell -ExecutionPolicy Bypass -File inject.ps1 -Target dsh `
 # 自检：L1 文件层 / L2 配置层 / L3 进程层（退出码 0=通过，1=有未通过项）
 powershell -ExecutionPolicy Bypass -File inject.ps1 -Target dsh -Check
 
-# 极简模式部署（只留一个菜单技能进提示词，40 个模块按需读）
+# 极简模式部署（只留一个菜单技能进提示词，65 个模块按需读）
 powershell -ExecutionPolicy Bypass -File inject.ps1 -Target pideck `
     -SourcePrompt prompts\_v52c-header.md -SkillMode menu
 
@@ -527,7 +524,7 @@ pi-workbench/
 ├── deploy-self.ps1            自我部署：停进程 → 备份 .rollback-<时间戳> → 覆盖 → 重启
 ├── prompts/                   指令集模板（头部 + 正文分离，详见 prompts/README.md）
 │   └── archive/               已退役的历史头部
-├── skills-v4/                 40 个技能模块（Agent Skills 标准）
+├── skills-v4/                 65 个技能模块（Agent Skills 标准）
 ├── tests/                     验收脚本（沙箱，不碰真实配置；tests/run_all.py 一次跑完）
 ├── docs/                      README 截图 · docs/SECURITY.md（发布前安全检查）· docs/releases/（发布说明）
 ├── NOTICE.md                  许可范围 / 第三方组件 / 再分发限制（人读）
@@ -583,7 +580,7 @@ pi-workbench/
   在日志里打出一行「未验证：文件已写入，但不代表客户端已加载或已生效」，这句话同时写在结果 JSON 里
 - **不保证效果**。提示词与技能能不能让某个模型变好，取决于模型版本、服务端策略与会话上下文；
   本项目不预填成功率、不给效果承诺
-- **技能库是资料不是保证**。40 个模块是整理收集的领域参考，内容对不对、能不能用，需要使用者自己判断
+- **技能库是资料不是保证**。65 个模块是整理收集的领域参考，内容对不对、能不能用，需要使用者自己判断
 - **不替代判断**。模板里的纪律段（不猜、不编造、不冒充已完成）是写给 AI 看的约束，
   实际会不会遵守由模型决定，工具无法强制
 
@@ -622,7 +619,7 @@ DSH 只在**客户端启动后**的会话首次请求里读 `~/.dsh/AGENTS.md`�
 **二、卸载：按钮从主按钮组挪走，确认框写清后果**
 
 原来的按钮排布是「注入 / 重启 / 卸载 / 体检 / 版本」并排 —— 卸载紧挨着重新注入，误点一次就把
-指令段和整库技能一起删了（这就是前阵子"过一段时间新对话失效"的真实原因之一）。
+指令段和 65 个技能一起删了（这就是前阵子"过一段时间新对话失效"的真实原因之一）。
 
 - 「卸载」改名 **「卸载注入」**，单独一行、靠右、小一号（28px），不再和注入挨着；
 - 确认框直接列出会拿走的三样东西 + 技能数与示例名，并明写
@@ -653,7 +650,7 @@ DSH 只在**客户端启动后**的会话首次请求里读 `~/.dsh/AGENTS.md`�
 
 **五、验证**
 
-- offscreen 单测：提示的出现/消失、卸载对话框文案（含「删除 N 个」与「所有新会话」）；
+- offscreen 单测：提示的出现/消失、卸载对话框文案（含「删除 65 个」与「所有新会话」）；
 - `tests/run_all.py` 13/13 全过。
 
 **V1.4.2 · 2026-10-08**
@@ -662,7 +659,7 @@ DSH 只在**客户端启动后**的会话首次请求里读 `~/.dsh/AGENTS.md`�
 
 **一、为什么加（背景）**
 
-极简模式把 40 个模块压成「一张菜单 + 按需读模块」。原来菜单只有「模块 | 何时用」两列：
+极简模式把 65 个模块压成「一张菜单 + 按需读模块」。原来菜单只有「模块 | 何时用」两列：
 类目内多个模块同时命中时没有第二判据；模块多了那张表也越来越长，模型每次读菜单要整张读完。
 
 - **评分列**：每行带 `x/10`，排序变成 **匹配度 → 评分 → 索引序**。
@@ -690,14 +687,14 @@ DSH 只在**客户端启动后**的会话首次请求里读 `~/.dsh/AGENTS.md`�
 **四、验证**
 
 - `tests/run_all.py` → 13/13 全过（含新菜单套件 25/25）
-- `skill_tool.py contract` → 契约与仓库一致（随包资源 19 项、评分 40/40）
-- `PJ_BUNDLE_CHECK=1` → `ok=true`、技能 40；`PJ_UI_SELFTEST=1` → 退出码 0
-- 用**打包内**的 injector 在沙箱跑极简模式 → `RESULT: OK`，菜单列 40 模块、0 分片（最大类目 10 < 阈值 12）
+- `skill_tool.py contract` → 契约与仓库一致（随包资源 19 项、评分 65/65）
+- `PJ_BUNDLE_CHECK=1` → `ok=true`、技能 65；`PJ_UI_SELFTEST=1` → 退出码 0
+- 用**打包内**的 injector 在沙箱跑极简模式 → `RESULT: OK`，菜单列 65 模块、拆出 1 个分片
 
 **五、已知边界**
 
 - 分片阈值默认 12（`skill-ratings.json` 的 `shardThreshold`，或 `-ShardThreshold` 覆盖）
-- 完整模式下 40 个模块 ≈ 3.5k tokens/轮；模块规模上去后建议用极简模式
+- 完整模式下 65 个模块 ≈ 7k tokens/轮；模块规模上去后建议用极简模式
 - `disable-model-invocation` 只在 Pi 上实测过，其他客户端不确定时先用 `full`
 
 **V1.4.1 · 2026-10-08**
@@ -725,7 +722,7 @@ cwd，甚至清空 PyInstaller / Qt 环境变量，都会以 `0xC0000142`（`STA
 
 **四、验证**
 
-- `PJ_BUNDLE_CHECK=1` → `ok=true`，随包技能 40
+- `PJ_BUNDLE_CHECK=1` → `ok=true`，随包技能 65
 - `PJ_UI_SELFTEST=1`（应用内编辑器读 → 改 → 原子落盘 + 目录兜底）→ 退出码 0
 
 **V1.4 · 2026-09-30**
