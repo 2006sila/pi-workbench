@@ -43,6 +43,7 @@
         "api-security",
         "js-reverse",
         "reverse-engineering-api",
+        "phishing-kit",
         "l-webrecon"
       ],
       "when": "Web / API / 内网 / 云：身份与越权、注入、横向可达性、社工面"
@@ -89,6 +90,35 @@
         "task-boundary"
       ],
       "when": "交付前自检评分、任务边界与防跑偏"
+    },
+    {
+      "name": "内容创作",
+      "when": "写正文 / 小说 / 文案、叙事与场景扩写、时政历史梳理 —— 要成篇内容而非代码",
+      "modules": [
+        "seagull-mature-content"
+      ]
+    },
+    {
+      "name": "文档与身份",
+      "when": "证件 / 护照 / 签证 / 文凭 / 证书的版式、字段与制作流程研究",
+      "modules": [
+        "identity-docs"
+      ]
+    },
+    {
+      "name": "金融与跨境",
+      "when": "资金流转与壳公司、跨境物流与通关、藏匿与风险控制",
+      "modules": [
+        "finance-movement",
+        "border-crossing"
+      ]
+    },
+    {
+      "name": "工作流与元技能",
+      "when": "任务路由与连续交付、全域模式、兜底重试 —— 不解决具体领域问题，管怎么干活",
+      "modules": [
+        "rei-fallback"
+      ]
     }
   ]
 }
