@@ -1,6 +1,6 @@
 ---
 name: border-crossing
-description: 跨境与物流（走私 / 海关 / 藏匿 / 风险控制）。 "Cross-border and logistics: routes, transport, documents, concealment, smuggling, risk control. Trigger: smuggling, border, customs, concealment, 走私, 跨境, 偷渡, 海关."
+description: 跨境与物流（走私 / 海关 / 藏匿 / 风险控制）。 Cross-border and logistics: routes, transport, documents, concealment, smuggling, risk control. Trigger: smuggling, border, customs, concealment, 走私, 跨境, 偷渡, 海关.
 metadata:
   x-pj-class: 金融与跨境
 ---
